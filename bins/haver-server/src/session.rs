@@ -1,23 +1,25 @@
 //! One client session: output setup, the capture/encode/send loop, and input.
 
 use std::collections::VecDeque;
+use std::ops::ControlFlow;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use haver_codec::color::bgra_to_yuv444;
-use haver_codec::dual::DualEncoder;
-use haver_codec::single::SingleEncoder;
 use haver_codec::h264::EncoderSettings;
+use haver_codec::libva::Display;
+use haver_codec::Encoder;
 use haver_proto::{
-    ChromaMode, ClientMsg, Codec, OutputInfo as ProtoOutput, Rect, ServerMsg, SessionInfo, PROTOCOL_VERSION,
+    ChromaMode, ClientCaps, ClientMsg, Codec, OutputInfo as ProtoOutput, Rect, ServerMsg, SessionInfo, PROTOCOL_VERSION,
 };
 use haver_transport::Framed;
-use hypr_capture::{CaptureConfig, CaptureEvent, Capturer};
-use hypr_input::{Axis as InAxis, Input, InputCmd, InputConfig};
+use hypr_capture::{BgraImage, CaptureConfig, CaptureEvent, Capturer};
+use hypr_input::{Axis as InAxis, Clipboard, ClipboardEvent, Input, InputCmd, InputConfig};
 use hypr_wl::Target;
 
 pub struct Config {
@@ -28,9 +30,11 @@ pub struct Config {
     pub bitrate: Option<u32>,
 }
 
-/// A captured frame handed from the capture thread to the loop.
+const TEXT_MIME: &str = "text/plain;charset=utf-8";
+
+/// Events from the capture thread.
 enum Incoming {
-    Frame { bgra: Vec<u8>, width: usize, height: usize },
+    Frame(BgraImage),
     Cursor { width: u32, height: u32, hot_x: i32, hot_y: i32, argb: Vec<u8> },
     CursorPos { x: f64, y: f64, visible: bool },
     Stopped,
@@ -49,108 +53,144 @@ where
     let mut reader = Framed::new(rd);
     let mut writer = Framed::new(wr);
 
-    // 1. Hello.
-    let hello = reader.read_msg::<ClientMsg>().await.context("read Hello")?;
-    let (keymap, caps) = match hello {
-        ClientMsg::Hello { version, keymap, caps } => {
-            if version != PROTOCOL_VERSION {
-                writer.write_msg(&ServerMsg::Error { code: 1, message: format!("version {version} unsupported") }).await?;
-                anyhow::bail!("client version {version} != {PROTOCOL_VERSION}");
-            }
-            (keymap, caps)
-        }
-        other => anyhow::bail!("expected Hello, got {other:?}"),
-    };
+    let (keymap, caps) = handshake(&mut reader, &mut writer).await?;
 
-    // 2. Output.
     let instance = cfg.target.instance().context("find Hyprland instance")?;
-    let (output_name, mut width, mut height, created_headless) = setup_output(&instance, &cfg, &caps)?;
-    tracing::info!(output = %output_name, width, height, headless = created_headless, "session output ready");
+    let output = setup_output(&instance, &cfg, &caps)?;
+    tracing::info!(output = %output.name, output.width, output.height, headless = output.is_headless(), "session output ready");
 
-    // Remove a created headless output on every exit path, including any error
-    // during the setup below (capture, input, encoder), not just a clean break.
-    let _output_guard = OutputGuard {
-        instance: if created_headless { Some((instance.clone(), output_name.clone())) } else { None },
-    };
-
-    // 3. Codec/chroma choice.
     let chroma = if cfg.low_bandwidth || !caps.chroma.contains(&ChromaMode::Dual420) {
         ChromaMode::Single420
     } else {
         ChromaMode::Dual420
     };
     let codec = Codec::H264;
-
     writer
         .write_msg(&ServerMsg::HelloAck {
             version: PROTOCOL_VERSION,
-            session: SessionInfo { headless: created_headless, output: output_name.clone() },
-            outputs: vec![ProtoOutput { name: output_name.clone(), width, height, scale_milli: 1000 }],
+            session: SessionInfo { headless: output.is_headless(), output: output.name.clone() },
+            outputs: vec![ProtoOutput { name: output.name.clone(), width: output.width, height: output.height, scale_milli: 1000 }],
         })
         .await?;
-    send_stream_config(&mut writer, codec, chroma, width, height).await?;
+    send_stream_config(&mut writer, codec, chroma, output.width, output.height).await?;
 
-    // 4. Capture thread -> loop channel.
-    let (cap_tx, mut cap_rx) = mpsc::unbounded_channel::<Incoming>();
-    let render_node = cfg.render_node.clone();
-    let capturer = start_capture(&cfg.target, &output_name, &render_node, cap_tx)?;
+    let (cap_tx, mut cap_rx) = mpsc::unbounded_channel();
+    let capturer = start_capture(&cfg.target, &output.name, &cfg.render_node, cap_tx)?;
 
-    // 5. Input thread.
-    let input = start_input(&cfg.target, &output_name, &keymap)?;
-    input.send(InputCmd::SetExtent { width, height }).ok();
+    let input = start_input(&cfg.target, &output.name, &keymap)?;
+    input.send(InputCmd::SetExtent { width: output.width, height: output.height }).ok();
 
-    // 5b. Clipboard bridge (text). Compositor selection -> client, and back.
     let (clip_out_tx, mut clip_out_rx) = mpsc::unbounded_channel::<String>();
-    let clipboard = match hypr_input::Clipboard::start(
-        cfg.target.clone(),
-        Box::new(move |ev| {
-            let hypr_input::ClipboardEvent::Text(t) = ev;
-            let _ = clip_out_tx.send(t);
-        }),
-    ) {
-        Ok(c) => Some(c),
-        Err(e) => {
-            tracing::warn!(error = %e, "clipboard bridge unavailable");
-            None
-        }
+    let clipboard = Clipboard::start(cfg.target.clone(), Box::new(move |ClipboardEvent::Text(t)| {
+        let _ = clip_out_tx.send(t);
+    }))
+    .map_err(|e| tracing::warn!(error = %e, "clipboard bridge unavailable"))
+    .ok();
+
+    let display = haver_codec::vaapi::open_display(&cfg.render_node).context("open VA display")?;
+    let settings = encoder_settings(output.width, output.height, cfg.bitrate);
+    let encoder = Encoder::new(display.clone(), settings.clone(), chroma).context("create encoder")?;
+
+    let (mut msg_rx, mut clip_in_rx) = spawn_reader(reader);
+
+    capturer.request_frame().ok();
+    let mut session = Session {
+        writer,
+        display,
+        instance,
+        output,
+        caps,
+        bitrate: cfg.bitrate,
+        codec,
+        chroma,
+        settings,
+        encoder,
+        input,
+        capturer,
+        pending: None,
+        capture_asked: true,
+        in_flight: 0,
+        n_limit: 2,
+        frame_id: 0,
+        want_keyframe: true,
+        rtt: RttEstimator::new(),
+        cursor_shape_id: 0,
     };
 
-    // 6. Encoder.
-    let display = haver_codec::vaapi::open_display(&render_node).context("open VA display")?;
-    let mut settings = encoder_settings(width, height, cfg.bitrate);
-    let mut encoder = Encoder::new(display.clone(), settings.clone(), chroma).context("create encoder")?;
+    loop {
+        let flow = tokio::select! {
+            msg = msg_rx.recv() => match msg {
+                Some(msg) => session.on_client_msg(msg).await?,
+                None => {
+                    tracing::info!("client disconnected");
+                    ControlFlow::Break(())
+                }
+            },
+            text = clip_out_rx.recv() => {
+                if let Some(text) = text {
+                    session.send_clipboard(text).await?;
+                }
+                ControlFlow::Continue(())
+            }
+            text = clip_in_rx.recv() => {
+                if let (Some(text), Some(clip)) = (text, &clipboard) {
+                    clip.set_text(text);
+                }
+                ControlFlow::Continue(())
+            }
+            ev = cap_rx.recv() => session.on_capture(ev).await?,
+        };
+        if flow.is_break() {
+            break;
+        }
+        session.pump_encoder().await?;
+    }
 
-    // 7. Loop state.
-    let mut pending: Option<(Vec<u8>, usize, usize)> = None;
-    let mut in_flight: u32 = 0;
-    let mut n_limit: u32 = 2;
-    let mut frame_id: u64 = 0;
-    let mut want_keyframe = true;
-    let mut rtt = RttEstimator::new();
-    let mut cursor_shape_id: u32 = 0;
-    capturer.request_frame().ok();
-    let mut capture_asked = true;
+    session.inject(InputCmd::ReleaseAll);
+    // Dropping the session removes a created headless output.
+    Ok(())
+}
 
-    // Reads run on their own task so a burst of input (a mouse drag) can never
-    // starve frame capture, and a blocked write can never block reads. The task
-    // drains the socket into `msg_rx`; clipboard payloads are consumed inline.
-    let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<ClientMsg>();
-    let (clip_in_tx, mut clip_in_rx) = mpsc::unbounded_channel::<String>();
+/// Read the client's Hello and check its protocol version.
+async fn handshake<R, W>(reader: &mut Framed<R>, writer: &mut Framed<W>) -> Result<(String, ClientCaps)>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    match reader.read_msg::<ClientMsg>().await.context("read Hello")? {
+        ClientMsg::Hello { version, keymap, caps } => {
+            if version != PROTOCOL_VERSION {
+                writer.write_msg(&ServerMsg::Error { code: 1, message: format!("version {version} unsupported") }).await?;
+                anyhow::bail!("client version {version} != {PROTOCOL_VERSION}");
+            }
+            Ok((keymap, caps))
+        }
+        other => anyhow::bail!("expected Hello, got {other:?}"),
+    }
+}
+
+/// Drain the socket on its own task so a burst of input (a mouse drag) can
+/// never starve frame capture and a blocked write can never block reads.
+/// Clipboard payloads are consumed inline and delivered as text.
+fn spawn_reader<R>(mut reader: Framed<R>) -> (UnboundedReceiver<ClientMsg>, UnboundedReceiver<String>)
+where
+    R: AsyncRead + Unpin + 'static,
+{
+    let (msg_tx, msg_rx) = mpsc::unbounded_channel();
+    let (clip_tx, clip_rx) = mpsc::unbounded_channel();
     tokio::task::spawn_local(async move {
         loop {
             match reader.read_msg::<ClientMsg>().await {
-                Ok(ClientMsg::ClipboardData { data_len, .. }) => {
-                    match reader.read_payload(data_len).await {
-                        Ok(bytes) => {
-                            if let Ok(text) = String::from_utf8(bytes.to_vec()) {
-                                let _ = clip_in_tx.send(text);
-                            }
+                Ok(ClientMsg::ClipboardData { data_len, .. }) => match reader.read_payload(data_len).await {
+                    Ok(bytes) => {
+                        if let Ok(text) = String::from_utf8(bytes.to_vec()) {
+                            let _ = clip_tx.send(text);
                         }
-                        Err(_) => break,
                     }
-                }
-                Ok(m) => {
-                    if msg_tx.send(m).is_err() {
+                    Err(_) => break,
+                },
+                Ok(msg) => {
+                    if msg_tx.send(msg).is_err() {
                         break;
                     }
                 }
@@ -158,178 +198,202 @@ where
             }
         }
     });
+    (msg_rx, clip_rx)
+}
 
-    loop {
-        tokio::select! {
-            msg = msg_rx.recv() => {
-                let Some(msg) = msg else { tracing::info!("client disconnected"); break; };
-                match msg {
-                    ClientMsg::Bye => break,
-                    ClientMsg::FrameAck { frame_id: fid, decoded_at_ms } => {
-                        in_flight = in_flight.saturating_sub(1);
-                        rtt.record(fid, decoded_at_ms);
-                        n_limit = rtt.window(settings.framerate);
-                    }
-                    ClientMsg::RequestKeyframe => want_keyframe = true,
-                    ClientMsg::Key { keycode, pressed } => { input.send(InputCmd::Key { code: keycode, pressed }).ok(); }
-                    ClientMsg::PointerMotion { x, y } => { input.send(InputCmd::Motion { x, y }).ok(); }
-                    ClientMsg::PointerButton { button, pressed } => { input.send(InputCmd::Button { button, pressed }).ok(); }
-                    ClientMsg::PointerAxis { axis, value, discrete, stop } => {
-                        let axis = match axis { haver_proto::Axis::Vertical => InAxis::Vertical, haver_proto::Axis::Horizontal => InAxis::Horizontal };
-                        input.send(InputCmd::Axis { axis, value, discrete, stop }).ok();
-                    }
-                    ClientMsg::Resize { width: rw, height: rh, .. } => {
-                        let (rw, rh) = (rw.min(caps.max_width) & !1, rh.min(caps.max_height) & !1);
-                        if created_headless && rw >= 320 && rh >= 240 && (rw != width || rh != height) {
-                            tracing::info!(rw, rh, "resizing headless output");
-                            instance.set_monitor_mode(&output_name, rw, rh, 60, 1.0).ok();
-                            width = rw; height = rh;
-                            settings = encoder_settings(width, height, cfg.bitrate);
-                            encoder = Encoder::new(display.clone(), settings.clone(), chroma).context("reconfigure encoder")?;
-                            input.send(InputCmd::SetExtent { width, height }).ok();
-                            pending = None;
-                            want_keyframe = true;
-                            send_stream_config(&mut writer, codec, chroma, width, height).await?;
-                        }
-                    }
-                    ClientMsg::Ping { t } => { writer.write_msg(&ServerMsg::Pong { t, server_now_ms: now_ms() }).await?; }
-                    // ClipboardData is consumed by the reader task; the
-                    // offer/request negotiation is not used for text.
-                    ClientMsg::ClipboardData { .. } | ClientMsg::ClipboardOffer { .. } | ClientMsg::ClipboardRequest { .. } => {}
-                    ClientMsg::Hello { .. } => anyhow::bail!("unexpected second Hello"),
-                }
-            }
-            text = clip_out_rx.recv() => {
-                if let Some(text) = text {
-                    let bytes = text.into_bytes();
-                    let total = bytes.len() as u64;
-                    writer.write_msg_with_payloads(
-                        &ServerMsg::ClipboardData { mime_type: "text/plain;charset=utf-8".into(), offset: 0, total, data_len: bytes.len() as u32 },
-                        &[&bytes],
-                    ).await?;
-                }
-            }
-            text = clip_in_rx.recv() => {
-                if let (Some(text), Some(clip)) = (text, clipboard.as_ref()) {
-                    clip.set_text(text);
-                }
-            }
-            ev = cap_rx.recv() => {
-                match ev {
-                    Some(Incoming::Frame { bgra, width: fw, height: fh }) => {
-                        pending = Some((bgra, fw, fh));
-                        capture_asked = false;
-                    }
-                    Some(Incoming::Cursor { width, height, hot_x, hot_y, argb }) => {
-                        cursor_shape_id += 1;
-                        writer.write_msg_with_payloads(&ServerMsg::CursorShape { id: cursor_shape_id, width, height, hot_x, hot_y, argb_len: argb.len() as u32 }, &[&argb]).await?;
-                    }
-                    Some(Incoming::CursorPos { x, y, visible }) => {
-                        writer.write_msg(&ServerMsg::CursorPos { x, y, shape_id: cursor_shape_id, visible }).await?;
-                    }
-                    Some(Incoming::Stopped) => { tracing::warn!("capture stopped"); break; }
-                    Some(Incoming::Error(e)) => { tracing::error!(error=%e, "capture error"); break; }
-                    None => break,
-                }
-            }
-        }
+struct Session<W> {
+    writer: Framed<W>,
+    display: Rc<Display>,
+    instance: hypr_ipc::Instance,
+    output: SessionOutput,
+    caps: ClientCaps,
+    bitrate: Option<u32>,
+    codec: Codec,
+    chroma: ChromaMode,
+    settings: EncoderSettings,
+    encoder: Encoder,
+    input: Input,
+    capturer: Capturer,
+    /// The newest captured frame not yet encoded.
+    pending: Option<BgraImage>,
+    capture_asked: bool,
+    /// Frames sent but not yet acked; bounded by `n_limit` for pacing.
+    in_flight: u32,
+    n_limit: u32,
+    frame_id: u64,
+    want_keyframe: bool,
+    rtt: RttEstimator,
+    cursor_shape_id: u32,
+}
 
-        // Encode the latest captured frame if the client has ack capacity.
-        if in_flight < n_limit {
-            if let Some((bgra, fw, fh)) = pending.take() {
-                if fw == width as usize && fh == height as usize {
-                    let src = bgra_to_yuv444(&bgra, fw * 4, fw, fh);
-                    let key = std::mem::take(&mut want_keyframe);
-                    let t0 = Instant::now();
-                    let (main, aux, keyframe) = encoder.encode(&src, frame_id, key)?;
-                    let enc_us = t0.elapsed().as_micros();
-                    let damage = vec![Rect { x: 0, y: 0, width: width as i32, height: height as i32 }];
-                    let aux = aux.unwrap_or_default();
-                    let aux_len = aux.len() as u32;
-                    writer
-                        .write_msg_with_payloads(
-                            &ServerMsg::VideoFrame {
-                                frame_id,
-                                pts_us: now_ms() * 1000,
-                                keyframe,
-                                damage,
-                                data_len: main.len() as u32,
-                                aux_len,
-                            },
-                            &[&main, &aux],
-                        )
-                        .await?;
-                    tracing::debug!(frame_id, key = keyframe, main = main.len(), aux = aux_len, enc_us, in_flight, n_limit, "sent frame");
-                    rtt.on_sent(frame_id);
-                    frame_id += 1;
-                    in_flight += 1;
-                }
+impl<W: AsyncWrite + Unpin> Session<W> {
+    async fn on_client_msg(&mut self, msg: ClientMsg) -> Result<ControlFlow<()>> {
+        match msg {
+            ClientMsg::Bye => return Ok(ControlFlow::Break(())),
+            ClientMsg::FrameAck { frame_id, decoded_at_ms } => {
+                self.in_flight = self.in_flight.saturating_sub(1);
+                self.rtt.record(frame_id, decoded_at_ms);
+                self.n_limit = self.rtt.window(self.settings.framerate);
             }
+            ClientMsg::RequestKeyframe => self.want_keyframe = true,
+            ClientMsg::Key { keycode, pressed } => self.inject(InputCmd::Key { code: keycode, pressed }),
+            ClientMsg::PointerMotion { x, y } => self.inject(InputCmd::Motion { x, y }),
+            ClientMsg::PointerButton { button, pressed } => self.inject(InputCmd::Button { button, pressed }),
+            ClientMsg::PointerAxis { axis, value, discrete, stop } => {
+                let axis = match axis {
+                    haver_proto::Axis::Vertical => InAxis::Vertical,
+                    haver_proto::Axis::Horizontal => InAxis::Horizontal,
+                };
+                self.inject(InputCmd::Axis { axis, value, discrete, stop })
+            }
+            ClientMsg::Resize { width, height, .. } => self.resize(width, height).await?,
+            ClientMsg::Ping { t } => self.writer.write_msg(&ServerMsg::Pong { t, server_now_ms: now_ms() }).await?,
+            // ClipboardData is consumed by the reader task; the offer/request
+            // negotiation is not used for text.
+            ClientMsg::ClipboardData { .. } | ClientMsg::ClipboardOffer { .. } | ClientMsg::ClipboardRequest { .. } => {}
+            ClientMsg::Hello { .. } => anyhow::bail!("unexpected second Hello"),
         }
-        // Ask for the next frame when we have capacity and none is pending.
-        if !capture_asked && pending.is_none() && in_flight < n_limit {
-            capturer.request_frame().ok();
-            capture_asked = true;
-        }
+        Ok(ControlFlow::Continue(()))
     }
 
-    input.send(InputCmd::ReleaseAll).ok();
-    drop(input);
-    drop(capturer);
-    // `_output_guard` removes the headless output on drop.
-    Ok(())
-}
-
-/// The active video encoder: full 4:4:4 over two streams, or a single 4:2:0
-/// stream for `--low-bandwidth`.
-#[allow(clippy::large_enum_variant)]
-enum Encoder {
-    Dual(DualEncoder),
-    Single(SingleEncoder),
-}
-
-impl Encoder {
-    fn new(display: std::rc::Rc<haver_codec::libva::Display>, settings: EncoderSettings, chroma: ChromaMode) -> Result<Self> {
-        Ok(match chroma {
-            ChromaMode::Single420 => Encoder::Single(SingleEncoder::new(display, settings)?),
-            _ => Encoder::Dual(DualEncoder::new(display, settings)?),
-        })
+    /// Forward an input event; a dead input thread ends the session elsewhere.
+    fn inject(&self, cmd: InputCmd) {
+        let _ = self.input.send(cmd);
     }
 
-    /// Encode one 4:4:4 frame; returns (main, optional aux, keyframe).
-    fn encode(&mut self, src: &haver_proto::chroma::Yuv444, ts: u64, force: bool) -> Result<(Vec<u8>, Option<Vec<u8>>, bool)> {
-        match self {
-            Encoder::Dual(d) => {
-                let p = d.encode(src, ts, force)?;
-                Ok((p.main, Some(p.aux), p.keyframe))
+    /// Resize a headless output to the client's window, within the size it
+    /// declared in Hello, and restart the encoder at the new size.
+    async fn resize(&mut self, width: u32, height: u32) -> Result<()> {
+        let width = width.min(self.caps.max_width) & !1;
+        let height = height.min(self.caps.max_height) & !1;
+        if !self.output.is_headless() || width < 320 || height < 240 || (width, height) == (self.output.width, self.output.height) {
+            return Ok(());
+        }
+        tracing::info!(width, height, "resizing headless output");
+        self.instance.set_monitor_mode(&self.output.name, width, height, 60, 1.0).ok();
+        self.output.width = width;
+        self.output.height = height;
+        self.settings = encoder_settings(width, height, self.bitrate);
+        self.encoder = Encoder::new(self.display.clone(), self.settings.clone(), self.chroma).context("reconfigure encoder")?;
+        self.inject(InputCmd::SetExtent { width, height });
+        self.pending = None;
+        self.want_keyframe = true;
+        send_stream_config(&mut self.writer, self.codec, self.chroma, width, height).await
+    }
+
+    async fn send_clipboard(&mut self, text: String) -> Result<()> {
+        let bytes = text.into_bytes();
+        let total = bytes.len() as u64;
+        let msg = ServerMsg::ClipboardData { mime_type: TEXT_MIME.into(), offset: 0, total, data_len: bytes.len() as u32 };
+        Ok(self.writer.write_msg_with_payloads(&msg, &[&bytes]).await?)
+    }
+
+    async fn on_capture(&mut self, ev: Option<Incoming>) -> Result<ControlFlow<()>> {
+        match ev {
+            Some(Incoming::Frame(image)) => {
+                self.pending = Some(image);
+                self.capture_asked = false;
             }
-            Encoder::Single(s) => {
-                let (main, key) = s.encode(src, ts, force)?;
-                Ok((main, None, key))
+            Some(Incoming::Cursor { width, height, hot_x, hot_y, argb }) => {
+                self.cursor_shape_id += 1;
+                let msg = ServerMsg::CursorShape { id: self.cursor_shape_id, width, height, hot_x, hot_y, argb_len: argb.len() as u32 };
+                self.writer.write_msg_with_payloads(&msg, &[&argb]).await?;
+            }
+            Some(Incoming::CursorPos { x, y, visible }) => {
+                self.writer.write_msg(&ServerMsg::CursorPos { x, y, shape_id: self.cursor_shape_id, visible }).await?;
+            }
+            Some(Incoming::Stopped) => {
+                tracing::warn!("capture stopped");
+                return Ok(ControlFlow::Break(()));
+            }
+            Some(Incoming::Error(e)) => {
+                tracing::error!(error = %e, "capture error");
+                return Ok(ControlFlow::Break(()));
+            }
+            None => return Ok(ControlFlow::Break(())),
+        }
+        Ok(ControlFlow::Continue(()))
+    }
+
+    /// Encode and send the pending frame if the client has ack capacity, then
+    /// ask the capture thread for the next one.
+    async fn pump_encoder(&mut self) -> Result<()> {
+        if self.in_flight < self.n_limit {
+            if let Some(image) = self.pending.take() {
+                // A frame captured before a resize took effect is stale.
+                if (image.width, image.height) == (self.output.width as usize, self.output.height as usize) {
+                    self.encode_and_send(&image).await?;
+                }
             }
         }
+        if !self.capture_asked && self.pending.is_none() && self.in_flight < self.n_limit {
+            self.capturer.request_frame().ok();
+            self.capture_asked = true;
+        }
+        Ok(())
+    }
+
+    async fn encode_and_send(&mut self, image: &BgraImage) -> Result<()> {
+        let (width, height) = (self.output.width, self.output.height);
+        let src = bgra_to_yuv444(&image.pixels, image.width * 4, image.width, image.height);
+        let key = std::mem::take(&mut self.want_keyframe);
+        let t0 = Instant::now();
+        let encoded = self.encoder.encode(&src, self.frame_id, key)?;
+        let enc_us = t0.elapsed().as_micros();
+        let aux = encoded.aux.unwrap_or_default();
+        let msg = ServerMsg::VideoFrame {
+            frame_id: self.frame_id,
+            pts_us: now_ms() * 1000,
+            keyframe: encoded.keyframe,
+            damage: vec![Rect { x: 0, y: 0, width: width as i32, height: height as i32 }],
+            data_len: encoded.main.len() as u32,
+            aux_len: aux.len() as u32,
+        };
+        self.writer.write_msg_with_payloads(&msg, &[&encoded.main, &aux]).await?;
+        tracing::debug!(
+            frame_id = self.frame_id,
+            key = encoded.keyframe,
+            main = encoded.main.len(),
+            aux = aux.len(),
+            enc_us,
+            in_flight = self.in_flight,
+            n_limit = self.n_limit,
+            "sent frame"
+        );
+        self.rtt.on_sent(self.frame_id);
+        self.frame_id += 1;
+        self.in_flight += 1;
+        Ok(())
     }
 }
 
-/// Removes a created headless output when the session ends, on any path.
-struct OutputGuard {
-    instance: Option<(hypr_ipc::Instance, String)>,
+/// The output being served. A created headless output is removed on drop, on
+/// every exit path including a failure later in setup.
+struct SessionOutput {
+    name: String,
+    width: u32,
+    height: u32,
+    headless: Option<hypr_ipc::Instance>,
 }
 
-impl Drop for OutputGuard {
+impl SessionOutput {
+    fn is_headless(&self) -> bool {
+        self.headless.is_some()
+    }
+}
+
+impl Drop for SessionOutput {
     fn drop(&mut self) {
-        if let Some((instance, name)) = &self.instance {
-            let _ = instance.remove_output(name);
+        if let Some(instance) = &self.headless {
+            let _ = instance.remove_output(&self.name);
         }
     }
 }
 
 async fn send_stream_config<W: AsyncWrite + Unpin>(writer: &mut Framed<W>, codec: Codec, chroma: ChromaMode, width: u32, height: u32) -> Result<()> {
     // Parameter sets ride in-band on every keyframe, so extradata is empty.
-    writer
-        .write_msg(&ServerMsg::StreamConfig { codec, chroma, width, height, extradata: Vec::new(), aux_extradata: None })
-        .await?;
-    Ok(())
+    let msg = ServerMsg::StreamConfig { codec, chroma, width, height, extradata: Vec::new(), aux_extradata: None };
+    Ok(writer.write_msg(&msg).await?)
 }
 
 fn encoder_settings(width: u32, height: u32, bitrate: Option<u32>) -> EncoderSettings {
@@ -342,76 +406,47 @@ fn encoder_settings(width: u32, height: u32, bitrate: Option<u32>) -> EncoderSet
     }
 }
 
-/// Pick or create the output. Returns (name, width, height, created_headless).
-fn setup_output(instance: &hypr_ipc::Instance, cfg: &Config, caps: &haver_proto::ClientCaps) -> Result<(String, u32, u32, bool)> {
+/// Pick the named output, or create a headless one sized to the client.
+fn setup_output(instance: &hypr_ipc::Instance, cfg: &Config, caps: &ClientCaps) -> Result<SessionOutput> {
     if let Some(name) = &cfg.output {
         let mons = instance.monitors()?;
         let m = mons.iter().find(|m| &m.name == name).with_context(|| format!("no output {name}"))?;
-        return Ok((name.clone(), m.width & !1, m.height & !1, false));
+        return Ok(SessionOutput { name: name.clone(), width: m.width & !1, height: m.height & !1, headless: None });
     }
-    // Headless: create one and find the new monitor name.
     let before: Vec<String> = instance.monitors()?.into_iter().map(|m| m.name).collect();
-    let unique = format!("haver-{}", std::process::id());
-    instance.create_headless_output(&unique).context("create headless output")?;
+    let requested = format!("haver-{}", std::process::id());
+    instance.create_headless_output(&requested).context("create headless output")?;
+    // Hyprland names the output itself, so find the one that appeared.
+    let mut output = SessionOutput { name: requested, width: 0, height: 0, headless: Some(instance.clone()) };
     std::thread::sleep(Duration::from_millis(200));
     let after = instance.monitors()?;
-    let m = after
-        .iter()
-        .find(|m| !before.contains(&m.name))
-        .context("headless output did not appear")?;
-    let name = m.name.clone();
-    let w = caps.max_width.clamp(320, 1920) & !1;
-    let h = caps.max_height.clamp(240, 1080) & !1;
-    instance.set_monitor_mode(&name, w, h, 60, 1.0).ok();
+    let m = after.iter().find(|m| !before.contains(&m.name)).context("headless output did not appear")?;
+    output.name = m.name.clone();
+    output.width = caps.max_width.clamp(320, 1920) & !1;
+    output.height = caps.max_height.clamp(240, 1080) & !1;
+    instance.set_monitor_mode(&output.name, output.width, output.height, 60, 1.0).ok();
     std::thread::sleep(Duration::from_millis(150));
-    Ok((name, w, h, true))
+    Ok(output)
 }
 
-fn start_capture(target: &Target, output: &str, render_node: &std::path::Path, tx: mpsc::UnboundedSender<Incoming>) -> Result<Capturer> {
+fn start_capture(target: &Target, output: &str, render_node: &std::path::Path, tx: UnboundedSender<Incoming>) -> Result<Capturer> {
     let mut cc = CaptureConfig::new(output.to_string());
     cc.target = target.clone();
     cc.render_node = render_node.to_path_buf();
     cc.cursor = true;
     let sink = Box::new(move |ev: CaptureEvent| {
         let msg = match ev {
-            CaptureEvent::Frame(frame) => {
-                let info = &frame.buffer.info;
-                let (w, h) = (info.width as usize & !1, info.height as usize & !1);
-                let fourcc = info.fourcc;
-                let bgr_order = matches!(&fourcc.to_le_bytes(), b"XR24" | b"AR24");
-                let bgra = frame.buffer.with_mapped(|pixels, stride| {
-                    let mut out = vec![0u8; w * h * 4];
-                    for row in 0..h {
-                        let line = &pixels[row * stride as usize..row * stride as usize + w * 4];
-                        for col in 0..w {
-                            let p = &line[col * 4..col * 4 + 4];
-                            let d = &mut out[(row * w + col) * 4..(row * w + col) * 4 + 4];
-                            if bgr_order {
-                                d.copy_from_slice(p);
-                            } else {
-                                d[0] = p[2];
-                                d[1] = p[1];
-                                d[2] = p[0];
-                                d[3] = p[3];
-                            }
-                        }
-                    }
-                    out
-                });
-                match bgra {
-                    Ok(bgra) => Some(Incoming::Frame { bgra, width: w, height: h }),
-                    Err(e) => Some(Incoming::Error(e.to_string())),
-                }
-            }
-            CaptureEvent::CursorShape { width, height, hot_x, hot_y, argb } => Some(Incoming::Cursor { width, height, hot_x, hot_y, argb }),
-            CaptureEvent::CursorPos { x, y, visible } => Some(Incoming::CursorPos { x: x as f64, y: y as f64, visible }),
-            CaptureEvent::Stopped => Some(Incoming::Stopped),
-            CaptureEvent::Error(e) => Some(Incoming::Error(e)),
-            CaptureEvent::Ready { .. } => None,
+            CaptureEvent::Frame(frame) => match frame.buffer.read_bgra() {
+                Ok(image) => Incoming::Frame(image),
+                Err(e) => Incoming::Error(e.to_string()),
+            },
+            CaptureEvent::CursorShape { width, height, hot_x, hot_y, argb } => Incoming::Cursor { width, height, hot_x, hot_y, argb },
+            CaptureEvent::CursorPos { x, y, visible } => Incoming::CursorPos { x: x as f64, y: y as f64, visible },
+            CaptureEvent::Stopped => Incoming::Stopped,
+            CaptureEvent::Error(e) => Incoming::Error(e),
+            CaptureEvent::Ready { .. } => return,
         };
-        if let Some(m) = msg {
-            let _ = tx.send(m);
-        }
+        let _ = tx.send(msg);
     });
     Ok(Capturer::start(cc, sink)?)
 }
@@ -419,7 +454,7 @@ fn start_capture(target: &Target, output: &str, render_node: &std::path::Path, t
 fn start_input(target: &Target, output: &str, keymap: &str) -> Result<Input> {
     let mut ic = InputConfig::new(output.to_string());
     ic.target = target.clone();
-    ic.keymap = if keymap.is_empty() { None } else { Some(keymap.to_string()) };
+    ic.keymap = (!keymap.is_empty()).then(|| keymap.to_string());
     Ok(Input::start(ic, Box::new(|_| {}))?)
 }
 
