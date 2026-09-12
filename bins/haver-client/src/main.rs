@@ -1,15 +1,18 @@
 //! haver-client: a GTK4/libadwaita window that connects to a haver server,
 //! decodes the video, shows it, and forwards keyboard and pointer input.
 //!
-//! Decode runs on a worker thread (see `net`); this file is the UI. All GL
-//! `unsafe` here: decoded frames arrive as BGRA and become a `gdk::MemoryTexture`.
+//! Decode runs on a worker thread (see `net`); this file is the UI. It has no
+//! `unsafe`: all GL/EGL lives in the haver-gl crate, called from the GLArea
+//! render callback.
 
 mod keymap;
 mod net;
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Receiver};
+use std::sync::Arc;
 use std::time::Duration;
 
 use adw::prelude::*;
@@ -42,7 +45,8 @@ struct Cli {
     headless: bool,
 }
 
-/// GPU display: a GLArea whose render callback recombines dmabuf planes.
+/// GPU display: a GLArea whose render callback recombines dmabuf planes, or
+/// blits CPU BGRA when dmabuf import is unavailable.
 struct GlView {
     area: gtk::GLArea,
     frame: Rc<RefCell<Option<net::DecodedFrame>>>,
@@ -50,14 +54,13 @@ struct GlView {
 
 /// Everything the UI shares with its callbacks.
 struct App {
-    /// The widget input controllers attach to and we measure (GLArea or Picture).
+    /// The GLArea, upcast; input controllers attach to it and we measure it.
     video: gtk::Widget,
-    /// CPU display path (BGRA -> MemoryTexture), when the GPU path is off.
-    picture: Option<gtk::Picture>,
-    /// GPU display path, when EGL dmabuf import is available.
-    gl: Option<GlView>,
-    /// Whether the worker should hand us dmabuf planes (GPU) or BGRA (CPU).
-    gpu: bool,
+    gl: GlView,
+    /// Shared with the worker: true = it sends dmabuf planes (GPU path), false =
+    /// BGRA (CPU). The GLArea render callback clears it if GPU rendering fails,
+    /// so a wrong capability guess self-corrects at run time.
+    gpu: Arc<AtomicBool>,
     stats: gtk::Label,
     status: gtk::Label,
     stream_size: Rc<RefCell<(u32, u32)>>,
@@ -94,32 +97,42 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
     header.pack_start(&connect_btn);
     header.pack_end(&fullscreen_btn);
 
-    // Probe once whether this machine's EGL can import dmabufs; if so the GPU
-    // display path (GLArea + recombine shader) is used, else the CPU path.
-    let gpu = haver_gl::supports_dmabuf_import();
-    tracing::info!(gpu, "display path");
+    // Probe whether EGL here can import dmabufs; that decides the initial path.
+    // The video widget is always a GLArea: it recombines dmabuf planes on the
+    // GPU when possible, and blits CPU BGRA otherwise. The `gpu` flag (shared
+    // with the worker) is cleared by the render callback if GPU rendering fails,
+    // so a wrong guess falls back to the CPU path at run time without a black
+    // screen.
+    let node = haver_codec::vaapi::render_node(None);
+    let gpu = Arc::new(AtomicBool::new(haver_gl::supports_dmabuf_import(&node)));
+    tracing::info!(gpu = gpu.load(Ordering::Relaxed), "initial display path");
 
     let stats = gtk::Label::builder().halign(gtk::Align::Start).valign(gtk::Align::Start).css_classes(["stats"]).visible(false).build();
     let status = gtk::Label::builder().label("Not connected").build();
 
-    let (video, picture, gl): (gtk::Widget, Option<gtk::Picture>, Option<GlView>) = if gpu {
-        let area = gtk::GLArea::builder().hexpand(true).vexpand(true).build();
-        let renderer: Rc<RefCell<Option<haver_gl::Renderer>>> = Rc::new(RefCell::new(None));
-        let frame: Rc<RefCell<Option<net::DecodedFrame>>> = Rc::new(RefCell::new(None));
-        {
-            let renderer = renderer.clone();
-            let frame = frame.clone();
-            area.connect_render(move |area, _| {
-                render_gl(area, &renderer, &frame);
-                glib::Propagation::Stop
-            });
-        }
-        let gl = GlView { area: area.clone(), frame };
-        (area.upcast(), None, Some(gl))
-    } else {
-        let p = gtk::Picture::builder().hexpand(true).vexpand(true).content_fit(gtk::ContentFit::Contain).build();
-        (p.clone().upcast(), Some(p), None)
-    };
+    let area = gtk::GLArea::builder().hexpand(true).vexpand(true).build();
+    let renderer: Rc<RefCell<Option<haver_gl::Renderer>>> = Rc::new(RefCell::new(None));
+    let frame: Rc<RefCell<Option<net::DecodedFrame>>> = Rc::new(RefCell::new(None));
+    {
+        let renderer = renderer.clone();
+        let frame = frame.clone();
+        let gpu = gpu.clone();
+        area.connect_render(move |area, _| {
+            render_gl(area, &renderer, &frame, &gpu);
+            glib::Propagation::Stop
+        });
+    }
+    {
+        // Drop the renderer when the GL context goes away, deleting its objects
+        // on the correct (current) context.
+        let renderer = renderer.clone();
+        area.connect_unrealize(move |area| {
+            area.make_current();
+            renderer.borrow_mut().take();
+        });
+    }
+    let gl = GlView { area: area.clone(), frame };
+    let video: gtk::Widget = area.upcast();
 
     let overlay = gtk::Overlay::new();
     overlay.set_child(Some(&video));
@@ -133,7 +146,6 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
 
     let ui = Rc::new(App {
         video: video.clone(),
-        picture,
         gl,
         gpu,
         stats: stats.clone(),
@@ -183,6 +195,7 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
                     Endpoint::Ssh(t)
                 }
             };
+            *ui.retries.borrow_mut() = 0;
             start_session(ui.clone(), endpoint);
         });
     }
@@ -203,7 +216,10 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
             cb.read_text_async(gtk::gio::Cancellable::NONE, move |res| {
                 if let Ok(Some(text)) = res {
                     let text = text.to_string();
+                    // One-shot echo guard: suppress only the value we just set
+                    // from the remote, so a later genuine local re-copy is sent.
                     if ui.last_remote_clip.borrow().as_deref() == Some(text.as_str()) {
+                        ui.last_remote_clip.borrow_mut().take();
                         return;
                     }
                     if text.len() as u64 > haver_proto::CLIPBOARD_MAX {
@@ -237,7 +253,7 @@ fn start_session(ui: Rc<App>, endpoint: Endpoint) {
     *ui.endpoint.borrow_mut() = Some(endpoint.clone());
     ui.status.set_text("Connecting…");
 
-    let gpu = ui.gpu;
+    let gpu = ui.gpu.clone();
     std::thread::Builder::new()
         .name("haver-net".into())
         .spawn(move || {
@@ -270,25 +286,18 @@ fn schedule_reconnect(ui: Rc<App>) {
 fn poll_frames(ui: Rc<App>, rx: Receiver<DecodedFrame>) {
     glib::timeout_add_local(Duration::from_millis(8), move || {
         let mut latest = None;
-        while let Ok(f) = rx.try_recv() {
-            latest = Some(f);
+        loop {
+            match rx.try_recv() {
+                Ok(f) => latest = Some(f),
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                // The worker ended; stop this per-session timer so it does not
+                // accumulate across reconnects.
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => return glib::ControlFlow::Break,
+            }
         }
         if let Some(f) = latest {
-            match (&ui.gl, &ui.picture) {
-                (Some(gl), _) => {
-                    // GPU path: hand the planes to the render callback and redraw.
-                    *gl.frame.borrow_mut() = Some(f);
-                    gl.area.queue_render();
-                }
-                (None, Some(picture)) => {
-                    if let DecodedFrame::Rgba { width, height, bgra } = f {
-                        let bytes = glib::Bytes::from(&bgra);
-                        let texture = gdk::MemoryTexture::new(width as i32, height as i32, gdk::MemoryFormat::B8g8r8a8, &bytes, width * 4);
-                        picture.set_paintable(Some(&texture));
-                    }
-                }
-                _ => {}
-            }
+            *ui.gl.frame.borrow_mut() = Some(f);
+            ui.gl.area.queue_render();
         }
         glib::ControlFlow::Continue
     });
@@ -305,13 +314,22 @@ fn nv12_planes(frame: &haver_codec::frame::Nv12Frame) -> (haver_gl::DmabufPlane<
     )
 }
 
-/// Render one dmabuf-planes frame in the GLArea's current context.
-fn render_gl(area: &gtk::GLArea, renderer: &Rc<RefCell<Option<haver_gl::Renderer>>>, frame: &Rc<RefCell<Option<net::DecodedFrame>>>) {
+/// Render the latest frame in the GLArea's current context. Draws dmabuf planes
+/// on the GPU when possible; if that is unavailable or fails, clears the shared
+/// `gpu` flag (so the worker switches to sending BGRA) and blits CPU BGRA.
+fn render_gl(area: &gtk::GLArea, renderer: &Rc<RefCell<Option<haver_gl::Renderer>>>, frame: &Rc<RefCell<Option<net::DecodedFrame>>>, gpu: &Arc<AtomicBool>) {
     use haver_gl::FramePlanes;
 
     if renderer.borrow().is_none() {
         match haver_gl::Renderer::new() {
-            Ok(r) => *renderer.borrow_mut() = Some(r),
+            Ok(r) => {
+                if !r.can_dmabuf() {
+                    // The real context cannot import dmabufs; fall back so the
+                    // worker sends BGRA instead of planes.
+                    gpu.store(false, Ordering::Relaxed);
+                }
+                *renderer.borrow_mut() = Some(r);
+            }
             Err(e) => {
                 tracing::error!(error = %e, "GL renderer init failed");
                 return;
@@ -321,20 +339,24 @@ fn render_gl(area: &gtk::GLArea, renderer: &Rc<RefCell<Option<haver_gl::Renderer
     let renderer = renderer.borrow();
     let Some(renderer) = renderer.as_ref() else { return };
     let frame = frame.borrow();
-    let Some(net::DecodedFrame::Planes { width, height, main, aux }) = frame.as_ref() else { return };
+    let Some(frame) = frame.as_ref() else { return };
 
-    let (main_y, main_uv) = nv12_planes(main);
-    let planes = FramePlanes {
-        main_y,
-        main_uv,
-        aux: aux.as_ref().map(|a| nv12_planes(a)),
-        width: *width as u32,
-        height: *height as u32,
-    };
     let scale = area.scale_factor();
     let (fb_w, fb_h) = (area.width() * scale, area.height() * scale);
-    if let Err(e) = renderer.draw(&planes, fb_w, fb_h) {
-        tracing::warn!(error = %e, "GL draw failed");
+    match frame {
+        net::DecodedFrame::Planes { width, height, main, aux } => {
+            let (main_y, main_uv) = nv12_planes(main);
+            let planes = FramePlanes { main_y, main_uv, aux: aux.as_ref().map(|a| nv12_planes(a)), width: *width as u32, height: *height as u32 };
+            if let Err(e) = renderer.draw_planes(&planes, fb_w, fb_h) {
+                tracing::warn!(error = %e, "GL plane draw failed; falling back to CPU");
+                gpu.store(false, Ordering::Relaxed);
+            }
+        }
+        net::DecodedFrame::Rgba { width, height, bgra } => {
+            if let Err(e) = renderer.draw_rgba(bgra, *width as i32, *height as i32, fb_w, fb_h) {
+                tracing::warn!(error = %e, "GL blit failed");
+            }
+        }
     }
 }
 

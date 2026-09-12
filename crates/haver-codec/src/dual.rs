@@ -106,6 +106,17 @@ impl DualDecoder {
         for f in self.aux.decode(timestamp, aux)? {
             self.aux_ready.insert(f.timestamp, f.frame);
         }
+        // If one stream stalls, its partner's map must not grow without bound
+        // (each pinned frame holds a pooled dmabuf). Keep only the newest few.
+        const MAX_UNPAIRED: usize = 4;
+        while self.main_ready.len() > MAX_UNPAIRED {
+            let oldest = *self.main_ready.keys().next().expect("non-empty");
+            self.main_ready.remove(&oldest);
+        }
+        while self.aux_ready.len() > MAX_UNPAIRED {
+            let oldest = *self.aux_ready.keys().next().expect("non-empty");
+            self.aux_ready.remove(&oldest);
+        }
         let ts = self.main_ready.keys().find(|k| self.aux_ready.contains_key(k)).copied();
         if let Some(ts) = ts {
             // Drop any older unpaired frames; their partner was lost.

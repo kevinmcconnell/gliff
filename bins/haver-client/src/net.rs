@@ -7,6 +7,7 @@
 
 use std::sync::mpsc::{Sender as StdSender, SyncSender};
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use haver_codec::color::yuv444_to_bgra;
@@ -86,8 +87,9 @@ pub enum Endpoint {
 
 pub struct Worker {
     pub endpoint: Endpoint,
-    /// Use the GPU dmabuf display path when the client supports it.
-    pub gpu: bool,
+    /// Shared with the UI: true = send dmabuf planes (GPU), false = BGRA (CPU).
+    /// The GLArea render callback clears it if dmabuf rendering fails at run time.
+    pub gpu: Arc<AtomicBool>,
     /// Bounded so a stalled UI thread cannot make the decoder buffer frames
     /// without limit; when full, the newest frame is dropped (latest-wins).
     pub frames: SyncSender<DecodedFrame>,
@@ -113,11 +115,11 @@ impl Worker {
                     let stream = tokio::net::TcpStream::connect(addr).await?;
                     stream.set_nodelay(true)?;
                     let (rd, wr) = tokio::io::split(stream);
-                    session(rd, wr, self.frames, self.status, self.input, self.gpu).await
+                    session(rd, wr, self.frames, self.status, self.input, self.gpu.clone()).await
                 }
                 Endpoint::Ssh(ref target) => {
                     let ssh = spawn_ssh(target)?;
-                    session(ssh.stdout, ssh.stdin, self.frames, self.status, self.input, self.gpu).await
+                    session(ssh.stdout, ssh.stdin, self.frames, self.status, self.input, self.gpu.clone()).await
                 }
             }
         });
@@ -135,7 +137,7 @@ async fn session<R, W>(
     frames: SyncSender<DecodedFrame>,
     status: StdSender<Status>,
     mut input: UnboundedReceiver<(ClientMsg, Vec<u8>)>,
-    gpu: bool,
+    gpu: Arc<AtomicBool>,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin + 'static,
@@ -212,7 +214,8 @@ where
                 let aux = if aux_len > 0 { reader.read_payload(aux_len).await?.to_vec() } else { Vec::new() };
                 bytes_since += (data_len + aux_len) as u64;
                 let t0 = std::time::Instant::now();
-                let decoded = if gpu {
+                let use_gpu = gpu.load(Ordering::Relaxed);
+                let decoded = if use_gpu {
                     decoder.decode_planes(frame_id, &main, &aux)
                 } else {
                     decoder.decode_rgba(frame_id, &main, &aux)
@@ -223,7 +226,7 @@ where
                 match decoded {
                     Ok(Some(frame)) => {
                         if !logged_first {
-                            tracing::info!(gpu, "first frame decoded and displayed");
+                            tracing::info!(use_gpu, "first frame decoded and displayed");
                             logged_first = true;
                         }
                         // Latest-wins: drop this frame if the UI hasn't drained.

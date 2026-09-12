@@ -61,7 +61,7 @@ xkbcommon = "0.9"
 drm-fourcc = "2"
 gbm = "0.15"
 drm = "0.14"
-nix = { version = "0.30", features = ["fs", "socket", "uio"] }
+nix = { version = "0.30", features = ["fs", "socket", "uio", "poll"] }
 rustix = { version = "1", features = ["fs", "mm"] }
 
 cros-codecs = { version = "0.0.6", features = ["vaapi"] }

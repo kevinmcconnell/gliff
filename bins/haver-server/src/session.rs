@@ -67,6 +67,12 @@ where
     let (output_name, mut width, mut height, created_headless) = setup_output(&instance, &cfg, &caps)?;
     tracing::info!(output = %output_name, width, height, headless = created_headless, "session output ready");
 
+    // Remove a created headless output on every exit path, including any error
+    // during the setup below (capture, input, encoder), not just a clean break.
+    let _output_guard = OutputGuard {
+        instance: if created_headless { Some((instance.clone(), output_name.clone())) } else { None },
+    };
+
     // 3. Codec/chroma choice.
     let chroma = if cfg.low_bandwidth || !caps.chroma.contains(&ChromaMode::Dual420) {
         ChromaMode::Single420
@@ -152,11 +158,6 @@ where
             }
         }
     });
-
-    // Remove the headless output on any exit path, not just the clean one.
-    let _output_guard = OutputGuard {
-        instance: if created_headless { Some((instance.clone(), output_name.clone())) } else { None },
-    };
 
     loop {
         tokio::select! {

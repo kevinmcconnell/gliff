@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Write};
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -203,18 +203,53 @@ impl State {
         drop(write_fd);
         let _ = self.conn.flush();
         // Read the sender's bytes off the Wayland thread so a slow provider
-        // cannot stall dispatch.
+        // cannot stall dispatch. Bounded by a poll timeout and a size cap so a
+        // dead provider that never writes cannot leak the thread and fd.
         let tx = self.cmd_tx.clone();
         std::thread::spawn(move || {
-            let mut file = File::from(read_fd);
-            let mut buf = Vec::new();
-            if file.read_to_end(&mut buf).is_ok() {
-                if let Ok(text) = String::from_utf8(buf) {
-                    let _ = tx.send(Cmd::Received(text));
-                }
+            if let Some(text) = read_selection(read_fd) {
+                let _ = tx.send(Cmd::Received(text));
             }
         });
     }
+
+    /// Destroy and forget every tracked offer (called when the selection
+    /// changes or clears, so offer proxies and map entries do not accumulate).
+    fn clear_offers(&mut self) {
+        for (off, _) in self.offers.drain() {
+            off.destroy();
+        }
+    }
+}
+
+/// Read a clipboard selection from a pipe with a bounded wait and size cap.
+fn read_selection(read_fd: OwnedFd) -> Option<String> {
+    use nix::poll::{PollFd, PollFlags, PollTimeout};
+    let mut file = File::from(read_fd);
+    let mut buf = Vec::new();
+    let max = 32 * 1024 * 1024;
+    loop {
+        {
+            let borrowed = file.as_fd();
+            let mut fds = [PollFd::new(borrowed, PollFlags::POLLIN)];
+            match nix::poll::poll(&mut fds, PollTimeout::from(1000u16)) {
+                Ok(0) | Err(_) => return None, // timed out or errored: give up
+                Ok(_) => {}
+            }
+        }
+        let mut chunk = [0u8; 64 * 1024];
+        match file.read(&mut chunk) {
+            Ok(0) => break, // EOF
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.len() > max {
+                    return None;
+                }
+            }
+            Err(_) => return None,
+        }
+    }
+    String::from_utf8(buf).ok()
 }
 
 impl Dispatch<WlRegistry, GlobalListContents> for State {
@@ -239,8 +274,18 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for State {
             device::Event::DataOffer { id } => {
                 s.offers.insert(id, Vec::new());
             }
-            device::Event::Selection { id: Some(off) } => s.receive_offer(&off),
-            device::Event::Finished => s.quit = true,
+            device::Event::Selection { id } => {
+                if let Some(off) = &id {
+                    s.receive_offer(off);
+                }
+                // The current offer has been received (or there is none); all
+                // tracked offers are now stale, so destroy them.
+                s.clear_offers();
+            }
+            device::Event::Finished => {
+                s.clear_offers();
+                s.quit = true;
+            }
             _ => {}
         }
     }
