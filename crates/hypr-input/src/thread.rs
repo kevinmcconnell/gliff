@@ -3,11 +3,8 @@ use std::fs::File;
 use std::io::Write;
 use std::os::fd::AsFd;
 use std::sync::mpsc;
-use std::time::Duration;
 
 use calloop::channel::{self, Sender};
-use calloop::EventLoop;
-use calloop_wayland_source::WaylandSource;
 use nix::sys::memfd::{memfd_create, MFdFlags};
 use wayland_client::globals::GlobalListContents;
 use wayland_client::protocol::wl_output::{self, WlOutput};
@@ -22,7 +19,7 @@ use wayland_protocols_wlr::virtual_pointer::v1::client::zwlr_virtual_pointer_v1:
 
 use crate::keymap::KeyState;
 use crate::{Axis, Error, EventSink, InputCmd, InputConfig, InputEvent, Result};
-use hypr_wl::{now_ms, Outputs, Seat};
+use hypr_wl::{now_ms, LoopState, Outputs, Seat};
 
 const KEYMAP_FORMAT_XKB_V1: u32 = 1;
 
@@ -50,9 +47,10 @@ pub fn spawn(
         .name("hypr-input".into())
         .spawn(move || {
             let mut sink = sink;
+            // `run` reports the error through the sink itself; this send only
+            // matters when it failed before signalling ready.
             if let Err(e) = run(cfg, &mut sink, rx, ready_tx.clone()) {
                 let _ = ready_tx.send(Err(Error::Input(e.to_string())));
-                sink(InputEvent::Error(e.to_string()));
             }
         })?;
     Ok((tx, join))
@@ -124,25 +122,7 @@ fn input_loop(
     tracing::info!(output = %info.name, extent = ?state.extent, "input ready");
     state.emit(InputEvent::Ready);
     let _ = ready_tx.send(Ok(()));
-
-    let mut event_loop: EventLoop<State> = EventLoop::try_new().map_err(|e| Error::Input(e.to_string()))?;
-    let handle = event_loop.handle();
-    WaylandSource::new(conn, queue).insert(handle.clone()).map_err(|e| Error::Input(e.to_string()))?;
-    handle
-        .insert_source(rx, |evt, _, state: &mut State| match evt {
-            channel::Event::Msg(cmd) => state.on_cmd(cmd),
-            channel::Event::Closed => state.quit = true,
-        })
-        .map_err(|e| Error::Input(e.to_string()))?;
-    let signal = event_loop.get_signal();
-    event_loop
-        .run(Duration::from_millis(500), state, |state| {
-            if state.quit {
-                signal.stop();
-            }
-        })
-        .map_err(|e| Error::Input(e.to_string()))?;
-    Ok(())
+    Ok(hypr_wl::run_loop(conn, queue, rx, state)?)
 }
 
 impl State {
@@ -160,6 +140,23 @@ impl State {
         self.keyboard.keymap(KEYMAP_FORMAT_XKB_V1, file.as_fd(), size);
         Ok(())
     }
+
+    fn release_all(&mut self) {
+        let t = now_ms();
+        for code in std::mem::take(&mut self.pressed_keys) {
+            self.keyboard.key(t, code, 0);
+        }
+        self.keys.reset();
+        self.keyboard.modifiers(0, 0, 0, 0);
+        for b in std::mem::take(&mut self.pressed_buttons) {
+            self.pointer.button(t, b, wl_pointer::ButtonState::Released);
+        }
+        self.pointer.frame();
+    }
+}
+
+impl LoopState for State {
+    type Cmd = InputCmd;
 
     fn on_cmd(&mut self, cmd: InputCmd) {
         let t = now_ms();
@@ -220,22 +217,17 @@ impl State {
             },
             InputCmd::SetExtent { width, height } => self.extent = (width.max(1), height.max(1)),
             InputCmd::ReleaseAll => self.release_all(),
-            InputCmd::Stop => self.quit = true,
+            InputCmd::Stop => self.stop(),
         }
         let _ = self.conn.flush();
     }
 
-    fn release_all(&mut self) {
-        let t = now_ms();
-        for code in std::mem::take(&mut self.pressed_keys) {
-            self.keyboard.key(t, code, 0);
-        }
-        self.keys.reset();
-        self.keyboard.modifiers(0, 0, 0, 0);
-        for b in std::mem::take(&mut self.pressed_buttons) {
-            self.pointer.button(t, b, wl_pointer::ButtonState::Released);
-        }
-        self.pointer.frame();
+    fn stop(&mut self) {
+        self.quit = true;
+    }
+
+    fn stop_requested(&self) -> bool {
+        self.quit
     }
 }
 

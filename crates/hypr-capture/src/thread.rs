@@ -3,11 +3,8 @@
 use std::fs::File;
 use std::os::fd::AsFd;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use calloop::channel::{self, Sender};
-use calloop::EventLoop;
-use calloop_wayland_source::WaylandSource;
 use drm_fourcc::{DrmFourcc, DrmModifier};
 use gbm::{BufferObjectFlags, Device};
 use wayland_client::globals::GlobalListContents;
@@ -41,7 +38,7 @@ use crate::{
     CaptureBuffer, CaptureConfig, CaptureEvent, CapturedFrame, DmabufInfo, Error, EventSink, OutputInfo, Plane, Rect,
     Result,
 };
-use hypr_wl::{Outputs, Seat, Target};
+use hypr_wl::{LoopState, Outputs, Seat, Target};
 
 pub enum Cmd {
     RequestFrame,
@@ -120,12 +117,10 @@ pub fn spawn(cfg: CaptureConfig, sink: EventSink) -> Result<(Sender<Cmd>, std::t
         .name("hypr-capture".into())
         .spawn(move || {
             let mut sink = sink;
-            match run(cfg, &mut sink, tx2, rx, ready_tx.clone()) {
-                Ok(()) => {}
-                Err(e) => {
-                    let _ = ready_tx.send(Err(Error::Capture(e.to_string())));
-                    sink(CaptureEvent::Error(e.to_string()));
-                }
+            // `run` reports the error through the sink itself; this send only
+            // matters when it failed before signalling ready.
+            if let Err(e) = run(cfg, &mut sink, tx2, rx, ready_tx.clone()) {
+                let _ = ready_tx.send(Err(Error::Capture(e.to_string())));
             }
         })?;
     match ready_rx.recv() {
@@ -230,25 +225,7 @@ fn run_loop(
         state.start_cursor_session();
     }
     let _ = ready_tx.send(Ok(()));
-
-    let mut event_loop: EventLoop<State> = EventLoop::try_new().map_err(|e| Error::Capture(e.to_string()))?;
-    let handle = event_loop.handle();
-    WaylandSource::new(conn, queue).insert(handle.clone()).map_err(|e| Error::Capture(e.to_string()))?;
-    handle
-        .insert_source(rx, |evt, _, state: &mut State| match evt {
-            channel::Event::Msg(cmd) => state.on_cmd(cmd),
-            channel::Event::Closed => state.quit = true,
-        })
-        .map_err(|e| Error::Capture(e.to_string()))?;
-    let signal = event_loop.get_signal();
-    event_loop
-        .run(Duration::from_millis(500), state, |state| {
-            if state.quit {
-                signal.stop();
-            }
-        })
-        .map_err(|e| Error::Capture(e.to_string()))?;
-    Ok(())
+    Ok(hypr_wl::run_loop(conn, queue, rx, state)?)
 }
 
 pub fn list_outputs(target: &Target) -> Result<Vec<OutputInfo>> {
@@ -271,10 +248,8 @@ pub fn list_outputs(target: &Target) -> Result<Vec<OutputInfo>> {
     Ok(s.outputs.infos())
 }
 
-impl State {
-    fn emit(&mut self, ev: CaptureEvent) {
-        (self.sink)(ev);
-    }
+impl LoopState for State {
+    type Cmd = Cmd;
 
     fn on_cmd(&mut self, cmd: Cmd) {
         match cmd {
@@ -290,8 +265,22 @@ impl State {
                 }
                 self.maybe_capture();
             }
-            Cmd::Stop => self.quit = true,
+            Cmd::Stop => self.stop(),
         }
+    }
+
+    fn stop(&mut self) {
+        self.quit = true;
+    }
+
+    fn stop_requested(&self) -> bool {
+        self.quit
+    }
+}
+
+impl State {
+    fn emit(&mut self, ev: CaptureEvent) {
+        (self.sink)(ev);
     }
 
     fn teardown(&mut self) {

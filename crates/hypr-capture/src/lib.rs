@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use calloop::channel::Sender;
+use drm_fourcc::DrmFourcc;
 use gbm::{BufferObject, Device};
 
 pub use hypr_wl::{OutputInfo, Target};
@@ -123,6 +124,37 @@ impl CaptureBuffer {
             .map_err(|e| Error::Gbm(format!("map: {e}")))?;
         Ok(mapped)
     }
+
+    /// Copy the pixels out as packed BGRA, whatever 32-bit RGB layout the
+    /// compositor chose. The image is cropped to even dimensions, which the
+    /// 4:2:0 codec path needs.
+    pub fn read_bgra(&self) -> Result<BgraImage> {
+        let width = self.info.width as usize & !1;
+        let height = self.info.height as usize & !1;
+        let bgra_in_memory = matches!(DrmFourcc::try_from(self.info.fourcc), Ok(DrmFourcc::Xrgb8888 | DrmFourcc::Argb8888));
+        let pixels = self.with_mapped(|mapped, stride| {
+            let mut out = vec![0u8; width * height * 4];
+            for (dst, src) in out.chunks_exact_mut(width * 4).zip(mapped.chunks(stride as usize)) {
+                if bgra_in_memory {
+                    dst.copy_from_slice(&src[..width * 4]);
+                } else {
+                    for (d, p) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+                        d.copy_from_slice(&[p[2], p[1], p[0], p[3]]);
+                    }
+                }
+            }
+            out
+        })?;
+        Ok(BgraImage { width, height, pixels })
+    }
+}
+
+/// Packed BGRA pixels, `width * 4` bytes per row.
+#[derive(Debug, Clone)]
+pub struct BgraImage {
+    pub width: usize,
+    pub height: usize,
+    pub pixels: Vec<u8>,
 }
 
 /// A frame handed to the consumer. Dropping it returns the buffer to the ring.

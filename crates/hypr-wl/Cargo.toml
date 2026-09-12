@@ -13,4 +13,6 @@ thiserror.workspace = true
 tracing.workspace = true
 wayland-client.workspace = true
 wayland-backend.workspace = true
+calloop.workspace = true
+calloop-wayland-source.workspace = true
 hypr-ipc.workspace = true

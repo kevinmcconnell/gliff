@@ -8,11 +8,8 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, OwnedFd};
 use std::sync::mpsc;
-use std::time::Duration;
 
 use calloop::channel::{self, Sender};
-use calloop::EventLoop;
-use calloop_wayland_source::WaylandSource;
 use nix::unistd::pipe;
 use wayland_client::globals::GlobalListContents;
 use wayland_client::protocol::wl_registry::WlRegistry;
@@ -24,7 +21,7 @@ use wayland_protocols::ext::data_control::v1::client::ext_data_control_offer_v1:
 use wayland_protocols::ext::data_control::v1::client::ext_data_control_source_v1::{self as source, ExtDataControlSourceV1};
 
 use crate::{Error, Result};
-use hypr_wl::{Outputs, Seat, Target};
+use hypr_wl::{LoopState, Outputs, Seat, Target};
 
 /// Text mime types we offer and accept, best first.
 const TEXT_MIMES: &[&str] = &["text/plain;charset=utf-8", "text/plain", "UTF8_STRING", "STRING"];
@@ -137,28 +134,14 @@ fn run(target: Target, sink: &mut ClipboardSink, cmd_tx: Sender<Cmd>, rx: channe
     state.device = Some(device);
     let _ = ready_tx.send(Ok(()));
 
-    let mut event_loop: EventLoop<State> = EventLoop::try_new().map_err(|e| Error::Input(e.to_string()))?;
-    let handle = event_loop.handle();
-    WaylandSource::new(conn, queue).insert(handle.clone()).map_err(|e| Error::Input(e.to_string()))?;
-    handle
-        .insert_source(rx, |evt, _, state: &mut State| match evt {
-            channel::Event::Msg(cmd) => state.on_cmd(cmd),
-            channel::Event::Closed => state.quit = true,
-        })
-        .map_err(|e| Error::Input(e.to_string()))?;
-    let signal = event_loop.get_signal();
-    event_loop
-        .run(Duration::from_millis(500), &mut state, |state| {
-            if state.quit {
-                signal.stop();
-            }
-        })
-        .map_err(|e| Error::Input(e.to_string()))?;
+    let result = hypr_wl::run_loop(conn, queue, rx, &mut state);
     std::mem::swap(&mut state.sink, sink);
-    Ok(())
+    Ok(result?)
 }
 
-impl State {
+impl LoopState for State {
+    type Cmd = Cmd;
+
     fn on_cmd(&mut self, cmd: Cmd) {
         match cmd {
             Cmd::SetText(text) => self.set_selection(text),
@@ -167,11 +150,21 @@ impl State {
                     (self.sink)(ClipboardEvent::Text(text));
                 }
             }
-            Cmd::Stop => self.quit = true,
+            Cmd::Stop => self.stop(),
         }
         let _ = self.conn.flush();
     }
 
+    fn stop(&mut self) {
+        self.quit = true;
+    }
+
+    fn stop_requested(&self) -> bool {
+        self.quit
+    }
+}
+
+impl State {
     fn set_selection(&mut self, text: String) {
         if let Some((old, _)) = self.our_source.take() {
             old.destroy();

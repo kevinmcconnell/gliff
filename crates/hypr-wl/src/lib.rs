@@ -3,7 +3,11 @@
 
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::time::Duration;
 
+use calloop::channel::{self, Channel};
+use calloop::EventLoop;
+use calloop_wayland_source::WaylandSource;
 use wayland_client::globals::{registry_queue_init, GlobalList, GlobalListContents};
 use wayland_client::protocol::wl_output::{self, WlOutput};
 use wayland_client::protocol::wl_registry::WlRegistry;
@@ -244,6 +248,40 @@ impl Seat {
     pub fn wl_seat(&self) -> Result<&WlSeat> {
         self.seat.as_ref().ok_or(Error::MissingGlobal("wl_seat"))
     }
+}
+
+/// A thread state driven by [`run_loop`]: Wayland events dispatch into it and
+/// commands from the owning thread arrive through [`LoopState::on_cmd`].
+pub trait LoopState: 'static {
+    type Cmd;
+    fn on_cmd(&mut self, cmd: Self::Cmd);
+    /// Ask the loop to end; also called when the command channel closes
+    /// (the owner dropped its handle).
+    fn stop(&mut self);
+    fn stop_requested(&self) -> bool;
+}
+
+/// Run a calloop loop over the Wayland queue and the command channel until
+/// the state reports it has stopped.
+pub fn run_loop<S: LoopState>(conn: Connection, queue: EventQueue<S>, rx: Channel<S::Cmd>, state: &mut S) -> Result<()> {
+    let wayland = |e: &dyn std::fmt::Display| Error::Wayland(e.to_string());
+    let mut event_loop: EventLoop<S> = EventLoop::try_new().map_err(|e| wayland(&e))?;
+    let handle = event_loop.handle();
+    WaylandSource::new(conn, queue).insert(handle.clone()).map_err(|e| wayland(&e))?;
+    handle
+        .insert_source(rx, |evt, _, state: &mut S| match evt {
+            channel::Event::Msg(cmd) => state.on_cmd(cmd),
+            channel::Event::Closed => state.stop(),
+        })
+        .map_err(|e| wayland(&e))?;
+    let signal = event_loop.get_signal();
+    event_loop
+        .run(Duration::from_millis(500), state, |state| {
+            if state.stop_requested() {
+                signal.stop();
+            }
+        })
+        .map_err(|e| wayland(&e))
 }
 
 /// Milliseconds since an arbitrary monotonic origin, for input timestamps.
