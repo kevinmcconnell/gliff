@@ -89,6 +89,7 @@ pub fn split_yuv444(src: &Yuv444) -> (Nv12, Nv12) {
 /// Recombine a main and auxiliary NV12 frame into 4:4:4. Inverse of `split_yuv444`.
 pub fn recombine_yuv444(main: &Nv12, aux: &Nv12) -> Yuv444 {
     let (w, h) = (main.width, main.height);
+    assert!(w % 2 == 0 && h % 2 == 0, "dimensions must be even");
     let mut out = Yuv444::new(w, h);
     out.y.copy_from_slice(&main.y);
 

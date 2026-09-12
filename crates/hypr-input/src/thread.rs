@@ -59,7 +59,7 @@ pub fn spawn(
 }
 
 fn run(cfg: InputConfig, sink: &mut EventSink, rx: channel::Channel<InputCmd>, ready_tx: mpsc::Sender<Result<()>>) -> Result<()> {
-    let (conn, globals, mut queue) = hypr_wl::init::<State>(&cfg.target)?;
+    let (conn, globals, queue) = hypr_wl::init::<State>(&cfg.target)?;
     let qh = queue.handle();
     let kb_mgr: ZwpVirtualKeyboardManagerV1 =
         globals.bind(&qh, 1..=1, ()).map_err(|_| hypr_wl::Error::MissingGlobal("zwp_virtual_keyboard_manager_v1"))?;
@@ -88,12 +88,36 @@ fn run(cfg: InputConfig, sink: &mut EventSink, rx: channel::Channel<InputCmd>, r
         quit: false,
     };
     std::mem::swap(&mut state.sink, sink);
-    queue.roundtrip(&mut state)?;
-    queue.roundtrip(&mut state)?;
+    let result = input_loop(&mut state, conn, queue, rx, ready_tx, &cfg, &qh, &ptr_mgr, &seat_proxy);
+    if let Err(e) = &result {
+        state.emit(InputEvent::Error(e.to_string()));
+    }
+    state.release_all();
+    state.keyboard.destroy();
+    state.pointer.destroy();
+    let _ = state.conn.flush();
+    std::mem::swap(&mut state.sink, sink);
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn input_loop(
+    state: &mut State,
+    conn: Connection,
+    mut queue: wayland_client::EventQueue<State>,
+    rx: channel::Channel<InputCmd>,
+    ready_tx: mpsc::Sender<Result<()>>,
+    cfg: &InputConfig,
+    qh: &QueueHandle<State>,
+    ptr_mgr: &ZwlrVirtualPointerManagerV1,
+    seat_proxy: &WlSeat,
+) -> Result<()> {
+    queue.roundtrip(state)?;
+    queue.roundtrip(state)?;
 
     let (output, info) = state.outputs.find(&cfg.output)?;
     state.extent = info.logical_size();
-    let bound = ptr_mgr.create_virtual_pointer_with_output(Some(&seat_proxy), Some(&output), &qh, ());
+    let bound = ptr_mgr.create_virtual_pointer_with_output(Some(seat_proxy), Some(&output), qh, ());
     let old = std::mem::replace(&mut state.pointer, bound);
     old.destroy();
     state.upload_keymap()?;
@@ -112,17 +136,12 @@ fn run(cfg: InputConfig, sink: &mut EventSink, rx: channel::Channel<InputCmd>, r
         .map_err(|e| Error::Input(e.to_string()))?;
     let signal = event_loop.get_signal();
     event_loop
-        .run(Duration::from_millis(500), &mut state, |state| {
+        .run(Duration::from_millis(500), state, |state| {
             if state.quit {
                 signal.stop();
             }
         })
         .map_err(|e| Error::Input(e.to_string()))?;
-    state.release_all();
-    state.keyboard.destroy();
-    state.pointer.destroy();
-    let _ = state.conn.flush();
-    std::mem::swap(&mut state.sink, sink);
     Ok(())
 }
 
@@ -158,8 +177,8 @@ impl State {
             }
             InputCmd::Motion { x, y } => {
                 let (w, h) = self.extent;
-                let xi = x.clamp(0.0, w as f64).round() as u32;
-                let yi = y.clamp(0.0, h as f64).round() as u32;
+                let xi = x.clamp(0.0, (w.saturating_sub(1)) as f64).round() as u32;
+                let yi = y.clamp(0.0, (h.saturating_sub(1)) as f64).round() as u32;
                 self.pointer.motion_absolute(t, xi, yi, w, h);
                 self.pointer.frame();
             }

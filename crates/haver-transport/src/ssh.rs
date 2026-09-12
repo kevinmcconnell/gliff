@@ -46,6 +46,7 @@ pub fn spawn_ssh(target: &SshTarget) -> std::io::Result<SshStream> {
     cmd.stdin(std::process::Stdio::piped());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::inherit());
+    cmd.kill_on_drop(true);
     let mut child = cmd.spawn()?;
     let stdin = child.stdin.take().expect("piped stdin");
     let stdout = child.stdout.take().expect("piped stdout");

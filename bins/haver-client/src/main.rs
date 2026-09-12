@@ -8,7 +8,7 @@ mod net;
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::mpsc::{channel, sync_channel, Receiver};
 use std::time::Duration;
 
 use adw::prelude::*;
@@ -150,7 +150,7 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
 }
 
 fn start_session(ui: Rc<App>, endpoint: Endpoint) {
-    let (frame_tx, frame_rx) = channel::<DecodedFrame>();
+    let (frame_tx, frame_rx) = sync_channel::<DecodedFrame>(2);
     let (status_tx, status_rx) = channel::<Status>();
     let (input_tx, input_rx) = unbounded_channel::<ClientMsg>();
     *ui.input_tx.borrow_mut() = Some(input_tx);

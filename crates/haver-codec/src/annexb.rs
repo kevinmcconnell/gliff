@@ -56,6 +56,25 @@ pub fn nal_header_offsets(data: &[u8]) -> Vec<usize> {
     out
 }
 
+/// Replace any NAL header byte that a driver left as `0x00` with `header`,
+/// scanning forward and resuming *after* each header we fix. Fixing a header
+/// removes the false start code its zero byte could otherwise form with the
+/// following RBSP, so we never rewrite genuine slice data.
+pub fn fix_zeroed_nal_headers(data: &mut [u8], header: u8) {
+    let mut i = 0;
+    while i + 3 < data.len() {
+        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+            let h = i + 3;
+            if data[h] == 0x00 {
+                data[h] = header;
+            }
+            i = h + 1;
+        } else {
+            i += 1;
+        }
+    }
+}
+
 pub fn contains_idr(data: &[u8]) -> bool {
     nal_units(data).any(|(t, _)| t == NAL_IDR)
 }
@@ -83,5 +102,18 @@ mod tests {
         assert_eq!(units, vec![(NAL_SPS, 3), (NAL_PPS, 2), (NAL_IDR, 3)]);
         assert!(contains_idr(&stream));
         assert_eq!(parameter_sets(&stream), vec![0, 0, 0, 1, 0x67, 1, 2, 0, 0, 0, 1, 0x68, 3]);
+    }
+
+    #[test]
+    fn fixup_only_touches_headers_not_rbsp() {
+        // A slice whose header the driver zeroed, whose RBSP begins 00 01 00
+        // (a false start code once the header is 0). A precomputed-offset
+        // approach would rewrite the RBSP byte; the forward pass must not.
+        let mut s = vec![0, 0, 1, 0x67, 9, 0, 0, 1, 0x00, 0x00, 0x01, 0x00, 0x88];
+        let before = s.clone();
+        fix_zeroed_nal_headers(&mut s, 0x65);
+        assert_eq!(s[8], 0x65);
+        assert_eq!(s[11], before[11]);
+        assert_eq!(&s[..8], &before[..8]);
     }
 }

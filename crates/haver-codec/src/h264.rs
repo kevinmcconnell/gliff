@@ -193,11 +193,11 @@ impl H264Encoder {
         // not supply a packed slice header. Fill it: IDR slices are type 5,
         // referenced P slices type 1, both with nal_ref_idc = 3 here.
         let header = if keyframe { 0x65u8 } else { 0x61u8 };
-        for off in annexb::nal_header_offsets(&data) {
-            if data[off] == 0x00 {
-                data[off] = header;
-            }
-        }
+        // Single forward pass: fix each zeroed header, then resume scanning
+        // after it. Fixing the header restores the byte the encoder's
+        // emulation-prevention assumed, so a later slice's RBSP cannot be
+        // mistaken for a start code and clobbered.
+        annexb::fix_zeroed_nal_headers(&mut data, header);
         let ps = annexb::parameter_sets(&data);
         if !ps.is_empty() {
             self.parameter_sets = ps;

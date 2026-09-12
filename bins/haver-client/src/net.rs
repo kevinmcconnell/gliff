@@ -5,7 +5,7 @@
 //! cros-codecs' decoder is `!Send`, so it lives entirely on this worker thread;
 //! only plain byte buffers cross to the GTK thread.
 
-use std::sync::mpsc::Sender as StdSender;
+use std::sync::mpsc::{Sender as StdSender, SyncSender};
 
 use haver_codec::color::yuv444_to_bgra;
 use haver_codec::dual::DualDecoder;
@@ -13,7 +13,7 @@ use haver_codec::vaapi;
 use haver_proto::{ChromaMode, ClientCaps, ClientMsg, Codec, ServerMsg, PROTOCOL_VERSION};
 use haver_transport::{spawn_ssh, Framed, SshTarget};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 
 /// A decoded frame ready to display, as tightly packed BGRA.
 pub struct DecodedFrame {
@@ -38,7 +38,9 @@ pub enum Endpoint {
 
 pub struct Worker {
     pub endpoint: Endpoint,
-    pub frames: StdSender<DecodedFrame>,
+    /// Bounded so a stalled UI thread cannot make the decoder buffer frames
+    /// without limit; when full, the newest frame is dropped (latest-wins).
+    pub frames: SyncSender<DecodedFrame>,
     pub status: StdSender<Status>,
     pub input: UnboundedReceiver<ClientMsg>,
 }
@@ -80,13 +82,13 @@ impl Worker {
 async fn session<R, W>(
     rd: R,
     wr: W,
-    frames: StdSender<DecodedFrame>,
+    frames: SyncSender<DecodedFrame>,
     status: StdSender<Status>,
     mut input: UnboundedReceiver<ClientMsg>,
 ) -> anyhow::Result<()>
 where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin + 'static,
+    W: AsyncWrite + Unpin + 'static,
 {
     let mut reader = Framed::new(rd);
     let mut writer = Framed::new(wr);
@@ -115,76 +117,97 @@ where
     tracing::info!(width, height, "connected");
     let mut logged_first = false;
 
+    // Writes run on their own task, fed by `out_tx`, so reads (draining video)
+    // never block on a write and the two peers cannot deadlock. Both the reader
+    // loop (acks, keyframe requests) and the UI thread (input) feed `out_tx`.
+    let (out_tx, mut out_rx) = unbounded_channel::<ClientMsg>();
+    tokio::task::spawn_local(async move {
+        while let Some(m) = out_rx.recv().await {
+            if writer.write_msg(&m).await.is_err() {
+                break;
+            }
+        }
+    });
+    // Forward UI input into the same write channel.
+    {
+        let out_tx = out_tx.clone();
+        tokio::task::spawn_local(async move {
+            while let Some(m) = input.recv().await {
+                if out_tx.send(m).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
     let mut frames_since = 0u32;
     let mut bytes_since = 0u64;
     let mut decode_ms_acc = 0f32;
     let mut last_report = std::time::Instant::now();
 
     loop {
-        tokio::select! {
-            msg = reader.read_msg::<ServerMsg>() => {
-                let msg = match msg {
-                    Ok(m) => m,
-                    Err(haver_transport::Error::Closed) => break,
-                    Err(e) => return Err(e.into()),
-                };
-                match msg {
-                    ServerMsg::VideoFrame { frame_id, keyframe: _, data_len, aux_len, .. } => {
-                        let main = reader.read_payload(data_len).await?;
-                        let aux = if aux_len > 0 { reader.read_payload(aux_len).await?.to_vec() } else { Vec::new() };
-                        bytes_since += (data_len + aux_len) as u64;
-                        let t0 = std::time::Instant::now();
-                        let decoded = decoder.decode(frame_id, &main, &aux);
-                        let dec_ms = t0.elapsed().as_secs_f32() * 1000.0;
-                        // Ack immediately so the server keeps pacing.
-                        writer.write_msg(&ClientMsg::FrameAck { frame_id, decoded_at_ms: now_ms() }).await?;
-                        match decoded {
-                            Ok(Some(yuv)) => {
-                                let bgra = yuv444_to_bgra(&yuv);
-                                if !logged_first { tracing::info!(w = yuv.width, h = yuv.height, "first frame decoded and displayed"); logged_first = true; }
-                                let _ = frames.send(DecodedFrame { width: yuv.width, height: yuv.height, bgra });
-                                frames_since += 1;
-                                decode_ms_acc += dec_ms;
-                            }
-                            Ok(None) => {}
-                            Err(e) => {
-                                tracing::warn!(error = %e, "decode error; requesting keyframe");
-                                writer.write_msg(&ClientMsg::RequestKeyframe).await?;
-                            }
+        let msg = match reader.read_msg::<ServerMsg>().await {
+            Ok(m) => m,
+            Err(haver_transport::Error::Closed) => break,
+            Err(e) => return Err(e.into()),
+        };
+        match msg {
+            ServerMsg::VideoFrame { frame_id, keyframe: _, data_len, aux_len, .. } => {
+                let main = reader.read_payload(data_len).await?;
+                let aux = if aux_len > 0 { reader.read_payload(aux_len).await?.to_vec() } else { Vec::new() };
+                bytes_since += (data_len + aux_len) as u64;
+                let t0 = std::time::Instant::now();
+                let decoded = decoder.decode(frame_id, &main, &aux);
+                let dec_ms = t0.elapsed().as_secs_f32() * 1000.0;
+                // Ack immediately so the server keeps pacing.
+                let _ = out_tx.send(ClientMsg::FrameAck { frame_id, decoded_at_ms: now_ms() });
+                match decoded {
+                    Ok(Some(yuv)) => {
+                        let bgra = yuv444_to_bgra(&yuv);
+                        if !logged_first {
+                            tracing::info!(w = yuv.width, h = yuv.height, "first frame decoded and displayed");
+                            logged_first = true;
                         }
+                        // Latest-wins: drop this frame if the UI hasn't drained.
+                        let _ = frames.try_send(DecodedFrame { width: yuv.width, height: yuv.height, bgra });
+                        frames_since += 1;
+                        decode_ms_acc += dec_ms;
                     }
-                    ServerMsg::StreamConfig { width: w, height: h, .. } => {
-                        width = w as usize;
-                        height = h as usize;
-                        let display = vaapi::open_display(&vaapi::render_node(None))?;
-                        decoder = DualDecoder::new(display, width, height)?;
-                        let _ = status.send(Status::Connected { width: w, height: h });
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(error = %e, "decode error; requesting keyframe");
+                        let _ = out_tx.send(ClientMsg::RequestKeyframe);
                     }
-                    ServerMsg::CursorShape { argb_len, .. } => { let _ = reader.read_payload(argb_len).await?; }
-                    ServerMsg::ClipboardData { data_len, .. } => { let _ = reader.read_payload(data_len).await?; }
-                    ServerMsg::CursorPos { .. } | ServerMsg::Pong { .. } => {}
-                    ServerMsg::Error { code, message } => anyhow::bail!("server error {code}: {message}"),
-                    ServerMsg::HelloAck { .. } | ServerMsg::ClipboardOffer { .. } | ServerMsg::ClipboardRequest { .. } => {}
-                }
-                if last_report.elapsed().as_secs_f32() >= 1.0 {
-                    let secs = last_report.elapsed().as_secs_f32();
-                    let _ = status.send(Status::Stats {
-                        fps: frames_since as f32 / secs,
-                        mbit: bytes_since as f32 * 8.0 / 1_000_000.0 / secs,
-                        decode_ms: if frames_since > 0 { decode_ms_acc / frames_since as f32 } else { 0.0 },
-                    });
-                    frames_since = 0;
-                    bytes_since = 0;
-                    decode_ms_acc = 0.0;
-                    last_report = std::time::Instant::now();
                 }
             }
-            cmd = input.recv() => {
-                match cmd {
-                    Some(ClientMsg::Bye) | None => { let _ = writer.write_msg(&ClientMsg::Bye).await; break; }
-                    Some(m) => { writer.write_msg(&m).await?; }
-                }
+            ServerMsg::StreamConfig { width: w, height: h, .. } => {
+                width = w as usize;
+                height = h as usize;
+                let display = vaapi::open_display(&vaapi::render_node(None))?;
+                decoder = DualDecoder::new(display, width, height)?;
+                let _ = status.send(Status::Connected { width: w, height: h });
             }
+            ServerMsg::CursorShape { argb_len, .. } => {
+                let _ = reader.read_payload(argb_len).await?;
+            }
+            ServerMsg::ClipboardData { data_len, .. } => {
+                let _ = reader.read_payload(data_len).await?;
+            }
+            ServerMsg::CursorPos { .. } | ServerMsg::Pong { .. } => {}
+            ServerMsg::Error { code, message } => anyhow::bail!("server error {code}: {message}"),
+            ServerMsg::HelloAck { .. } | ServerMsg::ClipboardOffer { .. } | ServerMsg::ClipboardRequest { .. } => {}
+        }
+        if last_report.elapsed().as_secs_f32() >= 1.0 {
+            let secs = last_report.elapsed().as_secs_f32();
+            let _ = status.send(Status::Stats {
+                fps: frames_since as f32 / secs,
+                mbit: bytes_since as f32 * 8.0 / 1_000_000.0 / secs,
+                decode_ms: if frames_since > 0 { decode_ms_acc / frames_since as f32 } else { 0.0 },
+            });
+            frames_since = 0;
+            bytes_since = 0;
+            decode_ms_acc = 0.0;
+            last_report = std::time::Instant::now();
         }
     }
     Ok(())

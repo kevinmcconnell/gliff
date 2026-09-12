@@ -108,15 +108,37 @@ where
     capturer.request_frame().ok();
     let mut capture_asked = true;
 
+    // Reads run on their own task so a burst of input (a mouse drag) can never
+    // starve frame capture, and a blocked write can never block reads. The task
+    // drains the socket into `msg_rx`; clipboard payloads are consumed inline.
+    let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<ClientMsg>();
+    tokio::task::spawn_local(async move {
+        loop {
+            match reader.read_msg::<ClientMsg>().await {
+                Ok(ClientMsg::ClipboardData { data_len, .. }) => {
+                    if reader.read_payload(data_len).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(m) => {
+                    if msg_tx.send(m).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // Remove the headless output on any exit path, not just the clean one.
+    let _output_guard = OutputGuard {
+        instance: if created_headless { Some((instance.clone(), output_name.clone())) } else { None },
+    };
+
     loop {
         tokio::select! {
-            biased;
-            msg = reader.read_msg::<ClientMsg>() => {
-                let msg = match msg {
-                    Ok(m) => m,
-                    Err(haver_transport::Error::Closed) => { tracing::info!("client disconnected"); break; }
-                    Err(e) => { tracing::warn!(error=%e, "read error"); break; }
-                };
+            msg = msg_rx.recv() => {
+                let Some(msg) = msg else { tracing::info!("client disconnected"); break; };
                 match msg {
                     ClientMsg::Bye => break,
                     ClientMsg::FrameAck { frame_id: fid, decoded_at_ms } => {
@@ -147,8 +169,7 @@ where
                         }
                     }
                     ClientMsg::Ping { t } => { writer.write_msg(&ServerMsg::Pong { t, server_now_ms: now_ms() }).await?; }
-                    ClientMsg::ClipboardData { data_len, .. } => { let _ = reader.read_payload(data_len).await?; }
-                    ClientMsg::ClipboardOffer { .. } | ClientMsg::ClipboardRequest { .. } => { /* clipboard: not yet wired */ }
+                    ClientMsg::ClipboardData { .. } | ClientMsg::ClipboardOffer { .. } | ClientMsg::ClipboardRequest { .. } => { /* clipboard: not yet wired */ }
                     ClientMsg::Hello { .. } => anyhow::bail!("unexpected second Hello"),
                 }
             }
@@ -214,10 +235,21 @@ where
     input.send(InputCmd::ReleaseAll).ok();
     drop(input);
     drop(capturer);
-    if created_headless {
-        instance.remove_output(&output_name).ok();
-    }
+    // `_output_guard` removes the headless output on drop.
     Ok(())
+}
+
+/// Removes a created headless output when the session ends, on any path.
+struct OutputGuard {
+    instance: Option<(hypr_ipc::Instance, String)>,
+}
+
+impl Drop for OutputGuard {
+    fn drop(&mut self) {
+        if let Some((instance, name)) = &self.instance {
+            let _ = instance.remove_output(name);
+        }
+    }
 }
 
 async fn send_stream_config<W: AsyncWrite + Unpin>(writer: &mut Framed<W>, codec: Codec, chroma: ChromaMode, width: u32, height: u32) -> Result<()> {

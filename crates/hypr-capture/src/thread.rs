@@ -45,7 +45,7 @@ use hypr_wl::{Outputs, Seat, Target};
 
 pub enum Cmd {
     RequestFrame,
-    Release(usize),
+    Release { index: usize, generation: u64 },
     Stop,
 }
 
@@ -90,6 +90,7 @@ struct State {
     session: Option<ExtImageCopyCaptureSessionV1>,
     constraints: Constraints,
     ring: Vec<RingSlot>,
+    ring_generation: u64,
     ring_format: Option<(u32, u64)>,
     in_flight: Option<(ExtImageCopyCaptureFrameV1, usize)>,
     pending_damage: Vec<Rect>,
@@ -141,7 +142,7 @@ fn run(
     rx: channel::Channel<Cmd>,
     ready_tx: std::sync::mpsc::Sender<Result<()>>,
 ) -> Result<()> {
-    let (conn, globals, mut queue) = hypr_wl::init::<State>(&cfg.target)?;
+    let (conn, globals, queue) = hypr_wl::init::<State>(&cfg.target)?;
     let qh = queue.handle();
     let dmabuf: ZwpLinuxDmabufV1 = globals.bind(&qh, 3..=5, ()).map_err(|_| hypr_wl::Error::MissingGlobal("zwp_linux_dmabuf_v1"))?;
     let source_mgr: ExtOutputImageCaptureSourceManagerV1 = globals
@@ -172,6 +173,7 @@ fn run(
         session: None,
         constraints: Constraints::default(),
         ring: Vec::new(),
+        ring_generation: 0,
         ring_format: None,
         in_flight: None,
         pending_damage: Vec::new(),
@@ -193,8 +195,28 @@ fn run(
     };
     std::mem::swap(&mut state.sink, sink);
 
-    queue.roundtrip(&mut state)?;
-    queue.roundtrip(&mut state)?;
+    // From here the real sink lives in `state.sink`. Run the body, then always
+    // swap it back out and emit any error through it, so a failure after
+    // `ready_tx` (which the owner has already consumed) still reaches the owner.
+    let result = run_loop(&mut state, conn, queue, rx, ready_tx);
+    if let Err(e) = &result {
+        state.emit(CaptureEvent::Error(e.to_string()));
+    }
+    state.teardown();
+    std::mem::swap(&mut state.sink, sink);
+    result
+}
+
+fn run_loop(
+    state: &mut State,
+    conn: Connection,
+    mut queue: wayland_client::EventQueue<State>,
+    rx: channel::Channel<Cmd>,
+    ready_tx: std::sync::mpsc::Sender<Result<()>>,
+) -> Result<()> {
+    let qh = state.qh.clone();
+    queue.roundtrip(state)?;
+    queue.roundtrip(state)?;
     let (output, info) = state.outputs.find(&state.cfg.output)?;
     tracing::info!(output = %info.name, w = info.width, h = info.height, scale = info.scale, "capturing output");
     state.output = Some((output.clone(), info));
@@ -220,14 +242,12 @@ fn run(
         .map_err(|e| Error::Capture(e.to_string()))?;
     let signal = event_loop.get_signal();
     event_loop
-        .run(Duration::from_millis(500), &mut state, |state| {
+        .run(Duration::from_millis(500), state, |state| {
             if state.quit {
                 signal.stop();
             }
         })
         .map_err(|e| Error::Capture(e.to_string()))?;
-    state.teardown();
-    std::mem::swap(&mut state.sink, sink);
     Ok(())
 }
 
@@ -262,9 +282,11 @@ impl State {
                 self.want_frame = true;
                 self.maybe_capture();
             }
-            Cmd::Release(idx) => {
-                if let Some(slot) = self.ring.get_mut(idx) {
-                    slot.busy = false;
+            Cmd::Release { index, generation } => {
+                if generation == self.ring_generation {
+                    if let Some(slot) = self.ring.get_mut(index) {
+                        slot.busy = false;
+                    }
                 }
                 self.maybe_capture();
             }
@@ -285,6 +307,9 @@ impl State {
         }
         if let Some(s) = self.cursor_session.take() {
             s.destroy();
+        }
+        if let Some(p) = self.pointer.take() {
+            p.release();
         }
         for slot in self.ring.drain(..) {
             slot.wl_buffer.destroy();
@@ -317,6 +342,7 @@ impl State {
     }
 
     fn allocate_ring(&mut self) -> Result<()> {
+        self.ring_generation += 1;
         let (fourcc, modifiers) = self.choose_format().ok_or_else(|| {
             Error::Capture(format!("no usable dmabuf format offered (got {:x?})", self.constraints.formats))
         })?;
@@ -358,6 +384,7 @@ impl State {
             chosen_modifier = Some(modifier);
             let buffer = Arc::new(CaptureBuffer {
                 index,
+                generation: self.ring_generation,
                 info: DmabufInfo { fd, width: w, height: h, fourcc, modifier, planes },
                 bo: Mutex::new(bo),
                 device: Arc::clone(&self.device),
@@ -493,9 +520,11 @@ impl State {
                         self.emit(CaptureEvent::Stopped);
                     }
                     _ => {
-                        // Constraints changed or a transient error: the session
-                        // sends new constraints and `done`, which retries.
+                        // A transient failure need not be followed by fresh
+                        // constraints, so re-drive capture now rather than
+                        // waiting for a `done` that may never come.
                         self.want_frame = true;
+                        self.maybe_capture();
                     }
                 }
             }
@@ -573,7 +602,10 @@ impl State {
                 if let Some(f) = self.cursor_frame.take() {
                     f.destroy();
                 }
-                tracing::debug!(?reason, "cursor frame failed; waiting for new constraints");
+                tracing::debug!(?reason, "cursor frame failed; retrying");
+                if !matches!(reason, wayland_client::WEnum::Value(frame_proto::FailureReason::Stopped)) {
+                    self.capture_cursor();
+                }
             }
             _ => {}
         }

@@ -97,6 +97,9 @@ pub struct DmabufInfo {
 /// A buffer in the capture ring. Shared with consumers through an `Arc`.
 pub struct CaptureBuffer {
     pub index: usize,
+    /// Ring generation this buffer belongs to; bumped on every reallocation so
+    /// a release from a pre-resize frame cannot free a current buffer.
+    pub generation: u64,
     pub info: DmabufInfo,
     bo: Mutex<BufferObject<()>>,
     device: Arc<Mutex<Device<File>>>,
@@ -145,7 +148,7 @@ impl std::fmt::Debug for CapturedFrame {
 impl Drop for CapturedFrame {
     fn drop(&mut self) {
         if let Some(tx) = self.release.take() {
-            let _ = tx.send(thread::Cmd::Release(self.buffer.index));
+            let _ = tx.send(thread::Cmd::Release { index: self.buffer.index, generation: self.buffer.generation });
         }
     }
 }

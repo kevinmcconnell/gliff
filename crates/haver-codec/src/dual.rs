@@ -4,6 +4,7 @@
 //! stream carries the chroma the main stream dropped. Both run through their
 //! own encoder with identical settings and keyframe cadence.
 
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use cros_codecs::libva::Display;
@@ -24,6 +25,7 @@ pub struct DualPacket {
 pub struct DualEncoder {
     main: H264Encoder,
     aux: H264Encoder,
+    pending_keyframe: bool,
 }
 
 impl DualEncoder {
@@ -32,7 +34,7 @@ impl DualEncoder {
         // The auxiliary stream is pure chroma; keep its settings identical so
         // keyframes line up. Its QP/bitrate can be tuned later.
         let aux = H264Encoder::new(display, settings)?;
-        Ok(Self { main, aux })
+        Ok(Self { main, aux, pending_keyframe: false })
     }
 
     pub fn main_extradata(&self) -> &[u8] {
@@ -43,15 +45,17 @@ impl DualEncoder {
         self.aux.parameter_sets()
     }
 
+    /// Force both streams to emit an IDR on the next encoded frame.
     pub fn request_keyframe(&mut self) {
-        // Both streams force an IDR on the next frame via the encode flag.
+        self.pending_keyframe = true;
     }
 
     /// Encode one 4:4:4 frame into two H.264 access units.
     pub fn encode(&mut self, src: &Yuv444, timestamp: u64, force_keyframe: bool) -> Result<DualPacket> {
+        let force = force_keyframe || std::mem::take(&mut self.pending_keyframe);
         let (m, a) = split_yuv444(src);
-        let mp = self.main.encode_planes(&m.y, m.width, &m.uv, m.width, timestamp, force_keyframe)?;
-        let ap = self.aux.encode_planes(&a.y, a.width, &a.uv, a.width, timestamp, force_keyframe)?;
+        let mp = self.main.encode_planes(&m.y, m.width, &m.uv, m.width, timestamp, force)?;
+        let ap = self.aux.encode_planes(&a.y, a.width, &a.uv, a.width, timestamp, force)?;
         Ok(DualPacket { timestamp, keyframe: mp.keyframe, main: mp.data, aux: ap.data })
     }
 }
@@ -61,6 +65,11 @@ pub struct DualDecoder {
     aux: H264Decoder,
     width: usize,
     height: usize,
+    // Ready main/aux NV12 frames not yet paired, keyed by their timestamp. The
+    // two decoders are independent and may return a frame on different calls,
+    // so we pair by timestamp rather than by arrival order.
+    main_ready: BTreeMap<u64, Nv12>,
+    aux_ready: BTreeMap<u64, Nv12>,
 }
 
 impl DualDecoder {
@@ -72,19 +81,33 @@ impl DualDecoder {
             aux: H264Decoder::new(display, b, 2)?,
             width,
             height,
+            main_ready: BTreeMap::new(),
+            aux_ready: BTreeMap::new(),
         })
     }
 
-    /// Decode one dual access unit into a 4:4:4 frame, if both streams produced one.
+    /// Decode one dual access unit. Returns a 4:4:4 frame once both streams have
+    /// produced the frame for a matching timestamp.
     pub fn decode(&mut self, timestamp: u64, main: &[u8], aux: &[u8]) -> Result<Option<Yuv444>> {
-        let m = self.main.decode(timestamp, main)?;
-        let a = self.aux.decode(timestamp, aux)?;
-        let (Some(mf), Some(af)) = (m.into_iter().next(), a.into_iter().next()) else {
-            return Ok(None);
-        };
-        let main_nv12 = read_nv12(&mf, self.width, self.height)?;
-        let aux_nv12 = read_nv12(&af, self.width, self.height)?;
-        Ok(Some(recombine_yuv444(&main_nv12, &aux_nv12)))
+        for f in self.main.decode(timestamp, main)? {
+            let nv12 = read_nv12(&f, self.width, self.height)?;
+            self.main_ready.insert(f.timestamp, nv12);
+        }
+        for f in self.aux.decode(timestamp, aux)? {
+            let nv12 = read_nv12(&f, self.width, self.height)?;
+            self.aux_ready.insert(f.timestamp, nv12);
+        }
+        // Pair the lowest timestamp present in both maps.
+        let ts = self.main_ready.keys().find(|k| self.aux_ready.contains_key(k)).copied();
+        if let Some(ts) = ts {
+            // Drop any older unpaired frames; their partner was lost.
+            self.main_ready.retain(|k, _| *k >= ts);
+            self.aux_ready.retain(|k, _| *k >= ts);
+            let m = self.main_ready.remove(&ts).expect("present");
+            let a = self.aux_ready.remove(&ts).expect("present");
+            return Ok(Some(recombine_yuv444(&m, &a)));
+        }
+        Ok(None)
     }
 }
 
