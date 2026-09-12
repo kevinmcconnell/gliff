@@ -123,12 +123,9 @@ tested against wl-clipboard).
 
 Not yet built, roughly in priority order:
 
-1. **Server-side `GlSplitter`.** The client GL recombine is built (`haver-gl`);
-   the server still colour-converts and splits on the CPU. A server GL split is
-   possible but bounded on AMD: the radeonsi VA encoder will not import a dmabuf
-   as input, so a GL split there still needs one `vaPutImage` upload (it removes
-   the CPU colour pass but is not fully zero-copy). It is verifiable headlessly
-   via the pipeline PSNR, unlike the client path which needs a display.
+1. **Server-side GPU colour (VPP for Single420).** See the measurements and
+   decision above: kept on CPU for now; VPP is a documented, verified-feasible
+   future addition for the low-bandwidth path.
 2. **Native single-stream 4:4:4, and AV1/HEVC.** Probe-gated; this GPU exposes
    no such VA-API encode entrypoint, so they cannot be validated here. Needs an
    Intel or newer GPU.
@@ -139,3 +136,59 @@ Not yet built, roughly in priority order:
 
 See `docs/hardware-quirks.md` for driver-specific behaviour and the low-severity
 items surfaced by code review.
+
+## GPU acceleration: measurements and the path decision
+
+The CPU colour/split passes are the work a GPU path removes. Measured on the
+AMD Ryzen 9955HX iGPU (Mesa radeonsi), rayon-parallel, via `haver-probe bench`:
+
+| Stage | 1280x720 | 1920x1080 | 3840x2160 |
+|---|---|---|---|
+| BGRA→YUV444 (server) | 0.7 ms | 1.0 ms | 6.2 ms |
+| split 4:4:4→2×NV12 (server, Dual420) | 0.3 ms | 0.6 ms | 3.0 ms |
+| subsample 4:4:4→NV12 (server, Single420) | 0.2 ms | 0.5 ms | 3.0 ms |
+| recombine 2×NV12→4:4:4 (client) | 0.3 ms | 0.6 ms | 3.0 ms |
+| YUV444→BGRA (client) | 0.7 ms | 1.5 ms | 5.5 ms |
+
+So at 1080p60 the CPU cost is ~1.6 ms/frame server and ~2.1 ms client — a
+modest slice of the 16.6 ms budget. At 4K it is ~9 ms server and ~8.5 ms client,
+a real bottleneck (and these are parallel wall-clock times, so more core-time).
+
+**Client display path — two approaches, both built.** GPU (GL recombine shader
+in `haver-gl`) when EGL dmabuf import is available, else CPU. The GPU path is
+auto-selected, self-corrects to CPU at run time if GL rendering fails, and
+removes all client pixel work. This is the broadest, highest-value win and is
+verified running on radeonsi (visual confirmation pending a real display).
+
+**Server path — CPU only, by measured decision.** We evaluated three options:
+
+1. **CPU (built).** Universal; cost as measured above.
+2. **VA-API VPP.** `haver-probe`/ffmpeg confirmed radeonsi VPP does BGRA→NV12,
+   into a VA-native surface the encoder reads with no copy — a full GPU path
+   *for Single420 only*. VPP is a colour-convert/scaler and **cannot do the
+   AVC444 split**, so it does nothing for the default Dual420 path. It also is
+   not reachable through the vendored cros-libva 0.0.12: its bindings omit the
+   VPP structs (they need `va_vpp.h` added and bindings regenerated, plus the
+   `proc_pipeline` wrapper ported and a VPP context wired).
+3. **GL split on the server.** Would help Dual420, but radeonsi refuses an
+   imported dmabuf as encoder input, so it still needs one `vaPutImage` upload,
+   and it doubles the GL `unsafe` surface.
+
+Decision: keep **CPU on the server** and the **GPU/CPU pair on the client** — a
+subset, not all three. VPP is worth adding only if the low-bandwidth (Single420)
+path becomes important or 4K server CPU is a problem; it is verified feasible on
+radeonsi and documented here as a scoped future addition (add `va_vpp.h` to the
+vendored cros-libva wrapper, port `proc_pipeline`, feed the VPP output surface to
+the existing surface-input encoder for a zero-copy Single420 path).
+
+## Dependencies and binaries
+
+The binaries are dynamically linked (not static): `haver-server`/`haver-probe`
+need ~11 system libraries (libva, libgbm, libdrm, libwayland-client,
+libxkbcommon, libc) and libva `dlopen`s the GPU's VA driver; `haver-client`
+additionally pulls the full GTK4 runtime (~137 libraries). A normal
+Omarchy/Hyprland desktop already has all of these (they are the PKGBUILD
+`depends`). Full static linking is impractical: libva loads its driver by
+`dlopen`, and Mesa EGL/GBM and GTK/GObject are not built for static linking.
+The crate graph is ~167 crates, normal for a GTK4 + async + bindgen-FFI stack;
+it stays lean by avoiding GStreamer/ffmpeg and using its own protocol.

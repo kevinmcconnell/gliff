@@ -99,6 +99,11 @@ enum Cmd {
         #[arg(long, default_value_t = 3)]
         secs: u64,
     },
+    /// Micro-benchmark the CPU colour/split stages the GPU path would replace
+    Bench {
+        #[arg(long, default_value_t = 100)]
+        iters: usize,
+    },
     /// Run every non-interactive check
     All,
 }
@@ -119,6 +124,7 @@ fn main() -> Result<()> {
         Cmd::Pipeline { output } => pipeline(&target, &node, output)?,
         Cmd::ServeTest { connect, frames } => serve_test(&node, &connect, frames)?,
         Cmd::Clipboard { set, secs } => clipboard(&target, set, secs)?,
+        Cmd::Bench { iters } => bench(iters)?,
         Cmd::All => {
             protocols(&target)?;
             outputs(&target)?;
@@ -606,5 +612,37 @@ fn clipboard(target: &Target, set: Option<String>, secs: u64) -> Result<()> {
         status(got, "observed a clipboard selection");
     }
     drop(clip);
+    Ok(())
+}
+
+fn bench(iters: usize) -> Result<()> {
+    use haver_codec::color::{bgra_to_yuv444, yuv444_to_bgra};
+    use haver_proto::chroma::{recombine_yuv444, split_yuv444, yuv444_to_nv12};
+    use std::time::Instant;
+    for (w, h) in [(1280usize, 720usize), (1920, 1080), (3840, 2160)] {
+        // A representative BGRA frame.
+        let mut bgra = vec![0u8; w * h * 4];
+        for (i, px) in bgra.chunks_exact_mut(4).enumerate() {
+            px[0] = (i & 0xff) as u8;
+            px[1] = ((i >> 3) & 0xff) as u8;
+            px[2] = ((i >> 6) & 0xff) as u8;
+            px[3] = 255;
+        }
+        let time = |label: &str, n: usize, mut f: Box<dyn FnMut()>| {
+            let t = Instant::now();
+            for _ in 0..n {
+                f();
+            }
+            let ms = t.elapsed().as_secs_f64() * 1000.0 / n as f64;
+            println!("  {w}x{h} {label:<28} {ms:6.2} ms/frame  ({:.0} fps cap)", 1000.0 / ms.max(0.001));
+        };
+        let src = bgra_to_yuv444(&bgra, w * 4, w, h);
+        let (m, a) = split_yuv444(&src);
+        time("bgra->yuv444 (server)", iters, { let bgra = bgra.clone(); Box::new(move || { let _ = bgra_to_yuv444(&bgra, w * 4, w, h); }) });
+        time("split 4:4:4->2xNV12 (server)", iters, { let src = src.clone(); Box::new(move || { let _ = split_yuv444(&src); }) });
+        time("subsample 4:4:4->NV12 (single)", iters, { let src = src.clone(); Box::new(move || { let _ = yuv444_to_nv12(&src); }) });
+        time("recombine 2xNV12->444 (client)", iters, { let m = m.clone(); let a = a.clone(); Box::new(move || { let _ = recombine_yuv444(&m, &a); }) });
+        time("yuv444->bgra (client)", iters, { let src = src.clone(); Box::new(move || { let _ = yuv444_to_bgra(&src); }) });
+    }
     Ok(())
 }
