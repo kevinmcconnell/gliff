@@ -13,7 +13,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Receiver};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use adw::prelude::*;
 use clap::Parser;
@@ -43,6 +43,13 @@ struct Cli {
     /// Pass --headless to the remote server.
     #[arg(long, default_value_t = true)]
     headless: bool,
+    /// Hotkey that releases captured shortcuts and hands the keyboard back to
+    /// the local compositor. Forms: a chord like `shift+escape`, `ctrl+alt+q`
+    /// or `super+escape`; `double-<key>` for a double-tap (e.g.
+    /// `double-escape`); or `none` to disable. The screen recaptures when you
+    /// click it again.
+    #[arg(long, default_value = "shift+escape")]
+    release_hotkey: String,
 }
 
 /// GPU display: a GLArea whose render callback recombines dmabuf planes, or
@@ -157,7 +164,11 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         last_remote_clip: Rc::new(RefCell::new(None)),
     });
 
-    install_input_handlers(&ui, &video, &window);
+    let hotkey = ReleaseHotkey::parse(&cli.release_hotkey).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "invalid --release-hotkey; shortcut release disabled");
+        ReleaseHotkey::None
+    });
+    install_input_handlers(&ui, &video, &window, hotkey);
 
     // Fullscreen toggle.
     {
@@ -444,15 +455,142 @@ fn send_payload(ui: &App, msg: ClientMsg, payload: Vec<u8>) {
     }
 }
 
-fn install_input_handlers(ui: &Rc<App>, video: &gtk::Widget, window: &adw::ApplicationWindow) {
+/// How the user releases captured shortcuts back to the local compositor.
+#[derive(Clone)]
+enum ReleaseHotkey {
+    None,
+    DoubleTap { keyval: gdk::Key, within: Duration },
+    Chord { mods: gdk::ModifierType, keyval: gdk::Key },
+}
+
+const CHORD_MODS: gdk::ModifierType = gdk::ModifierType::CONTROL_MASK
+    .union(gdk::ModifierType::ALT_MASK)
+    .union(gdk::ModifierType::SHIFT_MASK)
+    .union(gdk::ModifierType::SUPER_MASK);
+
+impl ReleaseHotkey {
+    fn parse(spec: &str) -> Result<Self, String> {
+        let s = spec.trim();
+        if s.is_empty() || s.eq_ignore_ascii_case("none") {
+            return Ok(Self::None);
+        }
+        let lower = s.to_ascii_lowercase();
+        if let Some(rest) = lower.strip_prefix("double-").or_else(|| lower.strip_prefix("double:")) {
+            return Ok(Self::DoubleTap { keyval: key_from_name(rest)?, within: Duration::from_millis(400) });
+        }
+        let mut mods = gdk::ModifierType::empty();
+        let mut keyval = None;
+        for tok in s.split('+') {
+            match tok.trim().to_ascii_lowercase().as_str() {
+                "" => {}
+                "ctrl" | "control" => mods |= gdk::ModifierType::CONTROL_MASK,
+                "alt" => mods |= gdk::ModifierType::ALT_MASK,
+                "shift" => mods |= gdk::ModifierType::SHIFT_MASK,
+                "super" | "logo" | "win" | "meta" => mods |= gdk::ModifierType::SUPER_MASK,
+                other => keyval = Some(key_from_name(other)?),
+            }
+        }
+        match keyval {
+            Some(keyval) => Ok(Self::Chord { mods, keyval }),
+            None => Err(format!("no key in release hotkey '{spec}'")),
+        }
+    }
+
+    /// True if this press is the release trigger. For a double-tap it records
+    /// the tap time and returns true only on the quick second press, so the
+    /// first tap still reaches the remote.
+    fn matches(&self, keyval: gdk::Key, state: gdk::ModifierType, last_tap: &RefCell<Option<Instant>>) -> bool {
+        match self {
+            Self::None => false,
+            Self::Chord { mods, keyval: k } => keyval == *k && (state & CHORD_MODS) == *mods,
+            Self::DoubleTap { keyval: k, within } => {
+                if keyval != *k {
+                    return false;
+                }
+                let now = Instant::now();
+                let mut lt = last_tap.borrow_mut();
+                match *lt {
+                    Some(prev) if now.duration_since(prev) <= *within => {
+                        *lt = None;
+                        true
+                    }
+                    _ => {
+                        *lt = Some(now);
+                        false
+                    }
+                }
+            }
+        }
+    }
+
+    fn describe(&self) -> String {
+        let name = |k: &gdk::Key| {
+            let n = k.name().map(|s| s.to_string()).unwrap_or_else(|| "?".into());
+            if n == "Escape" { "Esc".into() } else { n }
+        };
+        match self {
+            Self::None => "release disabled".into(),
+            Self::DoubleTap { keyval, .. } => format!("double-tap {}", name(keyval)),
+            Self::Chord { mods, keyval } => {
+                let mut parts = Vec::new();
+                if mods.contains(gdk::ModifierType::CONTROL_MASK) { parts.push("Ctrl".to_string()); }
+                if mods.contains(gdk::ModifierType::ALT_MASK) { parts.push("Alt".to_string()); }
+                if mods.contains(gdk::ModifierType::SHIFT_MASK) { parts.push("Shift".to_string()); }
+                if mods.contains(gdk::ModifierType::SUPER_MASK) { parts.push("Super".to_string()); }
+                parts.push(name(keyval));
+                parts.join("+")
+            }
+        }
+    }
+}
+
+/// Resolve a key name to a `gdk::Key`, accepting lower-case and a few aliases.
+fn key_from_name(name: &str) -> Result<gdk::Key, String> {
+    let n = name.trim();
+    let alias = match n.to_ascii_lowercase().as_str() {
+        "esc" => Some("Escape"),
+        "enter" | "return" => Some("Return"),
+        "space" => Some("space"),
+        _ => None,
+    };
+    let title = {
+        let mut c = n.chars();
+        c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
+    };
+    for cand in alias.iter().copied().chain([n, title.as_str()]) {
+        if !cand.is_empty() {
+            if let Some(k) = gdk::Key::from_name(cand) {
+                return Ok(k);
+            }
+        }
+    }
+    Err(format!("unknown key '{name}'"))
+}
+
+/// Give the keyboard back to the local compositor by dropping video focus,
+/// which fires the focus-leave handler that restores system shortcuts.
+fn release_capture(ui: &App, window: &adw::ApplicationWindow) {
+    gtk::prelude::GtkWindowExt::set_focus(window, gtk::Widget::NONE);
+    ui.status.set_text("Shortcuts released — click the screen to capture again");
+}
+
+fn install_input_handlers(ui: &Rc<App>, video: &gtk::Widget, window: &adw::ApplicationWindow, hotkey: ReleaseHotkey) {
     video.set_focusable(true);
     video.set_can_focus(true);
 
     // Keyboard: hardware keycode minus 8 is the evdev code.
     let key = gtk::EventControllerKey::new();
+    let last_tap: Rc<RefCell<Option<Instant>>> = Rc::new(RefCell::new(None));
     {
         let ui = ui.clone();
-        key.connect_key_pressed(move |_, _keyval, keycode, _state| {
+        let window = window.clone();
+        let hotkey = hotkey.clone();
+        let last_tap = last_tap.clone();
+        key.connect_key_pressed(move |_, keyval, keycode, state| {
+            if hotkey.matches(keyval, state, &last_tap) {
+                release_capture(&ui, &window);
+                return glib::Propagation::Stop;
+            }
             send(&ui, ClientMsg::Key { keycode: keycode.saturating_sub(8), pressed: true });
             glib::Propagation::Stop
         });
@@ -543,9 +681,17 @@ fn install_input_handlers(ui: &Rc<App>, video: &gtk::Widget, window: &adw::Appli
     let focus = gtk::EventControllerFocus::new();
     {
         let window = window.clone();
+        let ui = ui.clone();
+        let hint = match &hotkey {
+            ReleaseHotkey::None => None,
+            hk => Some(format!("Shortcuts captured — {} to release", hk.describe())),
+        };
         focus.connect_enter(move |_| {
             if let Some(toplevel) = window.surface().and_downcast::<gdk::Toplevel>() {
                 toplevel.inhibit_system_shortcuts(None::<&gdk::Event>);
+            }
+            if let Some(hint) = &hint {
+                ui.status.set_text(hint);
             }
         });
     }
@@ -569,5 +715,57 @@ fn evdev_button(n: u32) -> u32 {
         8 => 0x116, // BTN_SIDE (back)
         9 => 0x115, // BTN_EXTRA (forward)
         _ => 0x110,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[test]
+    fn parse_chord_and_double_and_none() {
+        assert!(matches!(ReleaseHotkey::parse("none").unwrap(), ReleaseHotkey::None));
+        assert!(matches!(ReleaseHotkey::parse("").unwrap(), ReleaseHotkey::None));
+
+        match ReleaseHotkey::parse("shift+escape").unwrap() {
+            ReleaseHotkey::Chord { mods, keyval } => {
+                assert_eq!(mods, gdk::ModifierType::SHIFT_MASK);
+                assert_eq!(keyval, gdk::Key::Escape);
+            }
+            _ => panic!("expected chord"),
+        }
+
+        match ReleaseHotkey::parse("Ctrl+Alt+q").unwrap() {
+            ReleaseHotkey::Chord { mods, .. } => {
+                assert!(mods.contains(gdk::ModifierType::CONTROL_MASK));
+                assert!(mods.contains(gdk::ModifierType::ALT_MASK));
+            }
+            _ => panic!("expected chord"),
+        }
+
+        assert!(matches!(ReleaseHotkey::parse("double-escape").unwrap(), ReleaseHotkey::DoubleTap { .. }));
+        assert!(ReleaseHotkey::parse("ctrl+alt").is_err());
+    }
+
+    #[test]
+    fn chord_matches_only_with_exact_mods() {
+        let hk = ReleaseHotkey::parse("shift+escape").unwrap();
+        let lt = RefCell::new(None);
+        assert!(hk.matches(gdk::Key::Escape, gdk::ModifierType::SHIFT_MASK, &lt));
+        // Bare Escape, no Shift: not a match (so it reaches the remote).
+        assert!(!hk.matches(gdk::Key::Escape, gdk::ModifierType::empty(), &lt));
+        // Extra lock bits are ignored.
+        assert!(hk.matches(gdk::Key::Escape, gdk::ModifierType::SHIFT_MASK | gdk::ModifierType::LOCK_MASK, &lt));
+    }
+
+    #[test]
+    fn double_tap_needs_two_quick_presses() {
+        let hk = ReleaseHotkey::parse("double-escape").unwrap();
+        let lt = RefCell::new(None);
+        let none = gdk::ModifierType::empty();
+        assert!(!hk.matches(gdk::Key::Escape, none, &lt)); // first tap forwarded
+        assert!(hk.matches(gdk::Key::Escape, none, &lt)); // quick second releases
+        assert!(!hk.matches(gdk::Key::Escape, none, &lt)); // counter reset
     }
 }

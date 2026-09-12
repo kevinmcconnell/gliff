@@ -134,8 +134,8 @@ Not yet built, roughly in priority order:
    Intel or newer GPU.
 3. **Verified ssh path** from a cold machine, including the `WAYLAND_DISPLAY` /
    `XDG_RUNTIME_DIR` environment setup, and a systemd user unit if wanted.
-4. **Polish**: multi-output selection UI, a configurable escape key for shortcut
-   inhibit, image clipboard, and `tc netem` tuning of the adaptive ack window.
+4. **Polish**: multi-output selection UI, image clipboard, and `tc netem` tuning
+   of the adaptive ack window.
 
 See `docs/hardware-quirks.md` for driver-specific behaviour and the low-severity
 items surfaced by code review.

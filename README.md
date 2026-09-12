@@ -16,7 +16,8 @@ Working and validated on AMD (Ryzen Granite Ridge, Mesa radeonsi):
   a `--low-bandwidth` single 4:2:0 stream.
 - The full server pipeline (capture -> 4:4:4 -> two H.264 streams -> protocol)
   and a GTK4 client that decodes, recombines, displays, forwards input, shows
-  the remote cursor, inhibits system shortcuts, and auto-reconnects. Validated
+  the remote cursor, inhibits system shortcuts (release with `Shift+Esc`, set by
+  `--release-hotkey`), and auto-reconnects. Validated
   over localhost against a nested Hyprland: connect, stream, resize, ack pacing,
   both chroma modes.
 
