@@ -12,13 +12,13 @@ use wayland_client::globals::GlobalListContents;
 use wayland_client::protocol::wl_registry::WlRegistry;
 use wayland_client::{Connection, Dispatch, QueueHandle};
 
-use haver_codec::frame::{FrameAllocator, FramePool};
-use haver_codec::color::{bgra_to_yuv444, psnr as bgra_psnr, yuv444_to_bgra};
+use haver_codec::color::{bgra_to_yuv444, psnr, yuv444_to_bgra};
 use haver_codec::dual::{DualDecoder, DualEncoder};
-use haver_codec::gl_split::GlDualEncoder;
+use haver_codec::frame::{FrameAllocator, FramePool};
+use haver_codec::gl_split::{nv12_planes, GlDualEncoder};
 use haver_codec::h264::{EncoderSettings, H264Decoder, H264Encoder};
-use haver_codec::vaapi;
-use hypr_capture::{CaptureConfig, CaptureEvent, Capturer};
+use haver_codec::{vaapi, Decoder};
+use hypr_capture::{BgraImage, CaptureConfig, CaptureEvent, Capturer};
 use hypr_input::{keys, Input, InputConfig, InputEvent};
 use hypr_wl::Target;
 
@@ -221,7 +221,7 @@ fn fill_synthetic(frame: &mut haver_codec::frame::Nv12Frame, w: u32, h: u32, t: 
     frame.with_planes_mut(|y, uv, py, puv| {
         for row in 0..h as usize {
             for col in 0..w as usize {
-        let base = 16.0 + 200.0 * (col as f64 / w as f64);
+                let base = 16.0 + 200.0 * (col as f64 / w as f64);
                 let wave = 16.0 * ((row as f64 / 24.0 + shift).sin());
                 y[row * py + col] = (base + wave).clamp(16.0, 235.0) as u8;
             }
@@ -236,13 +236,10 @@ fn fill_synthetic(frame: &mut haver_codec::frame::Nv12Frame, w: u32, h: u32, t: 
     Ok(())
 }
 
-fn psnr(a: &[u8], b: &[u8]) -> f64 {
-    let mse: f64 = a.iter().zip(b).map(|(x, y)| (*x as f64 - *y as f64).powi(2)).sum::<f64>() / a.len() as f64;
-    if mse == 0.0 {
-        99.0
-    } else {
-        10.0 * (255.0f64 * 255.0 / mse).log10()
-    }
+/// The colour bytes of a BGRA buffer, skipping the alpha/X byte whose captured
+/// value is undefined.
+fn rgb_channels(bgra: &[u8]) -> Vec<u8> {
+    bgra.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect()
 }
 
 fn roundtrip(node: &std::path::Path, width: u32, height: u32, frames: usize, bitrate: Option<u32>) -> Result<()> {
@@ -262,12 +259,7 @@ fn roundtrip(node: &std::path::Path, width: u32, height: u32, frames: usize, bit
     for i in 0..frames {
         let mut frame = pool.try_alloc()?;
         fill_synthetic(&mut frame, width, height, i)?;
-        let mut source_y = vec![0u8; (width * height) as usize];
-        frame.with_planes(|y, _, py, _| {
-            for row in 0..height as usize {
-                source_y[row * width as usize..(row + 1) * width as usize].copy_from_slice(&y[row * py..row * py + width as usize]);
-            }
-        })?;
+        let source_y = frame.read_nv12(width as usize, height as usize)?.y;
         let force = i == frames / 2;
         let (yb, uvb, yp, uvp) = frame.with_planes(|y, uv, py, puv| (y.to_vec(), uv.to_vec(), py, puv))?;
         let t0 = std::time::Instant::now();
@@ -291,12 +283,7 @@ fn roundtrip(node: &std::path::Path, width: u32, height: u32, frames: usize, bit
         }
         for d in out {
             decoded += 1;
-            let mut y_out = vec![0u8; (width * height) as usize];
-            d.frame.with_planes(|y, _, py, _| {
-                for row in 0..height as usize {
-                    y_out[row * width as usize..(row + 1) * width as usize].copy_from_slice(&y[row * py..row * py + width as usize]);
-                }
-            })?;
+            let y_out = d.frame.read_nv12(width as usize, height as usize)?.y;
             min_psnr = min_psnr.min(psnr(&source_y, &y_out));
             if d.timestamp != i as u64 {
                 println!("  WARN decoded timestamp {} for input {i}: decoder is not zero-latency", d.timestamp);
@@ -329,23 +316,7 @@ fn pipeline(target: &Target, node: &std::path::Path, output: Option<String>, gl:
     while std::time::Instant::now() < deadline {
         match rx.recv_timeout(Duration::from_millis(200)) {
             Ok(CaptureEvent::Frame(frame)) => {
-                let info = &frame.buffer.info;
-                let (w, h) = (info.width as usize & !1, info.height as usize & !1);
-                let fourcc = info.fourcc;
-                let bgra = frame.buffer.with_mapped(|pixels, stride| {
-                    let mut out = vec![0u8; w * h * 4];
-                    let bgr_order = matches!(&fourcc.to_le_bytes(), b"XR24" | b"AR24");
-                    for row in 0..h {
-                        let line = &pixels[row * stride as usize..row * stride as usize + w * 4];
-                        for col in 0..w {
-                            let p = &line[col * 4..col * 4 + 4];
-                            let d = &mut out[(row * w + col) * 4..(row * w + col) * 4 + 4];
-                            if bgr_order { d.copy_from_slice(p); } else { d[0]=p[2]; d[1]=p[1]; d[2]=p[0]; d[3]=p[3]; }
-                        }
-                    }
-                    out
-                })?;
-                captured = Some((w, h, bgra, frame.buffer.clone()));
+                captured = Some((frame.buffer.read_bgra()?, frame.buffer.clone()));
                 break;
             }
             Ok(CaptureEvent::Error(e)) => bail!("capture error: {e}"),
@@ -355,7 +326,8 @@ fn pipeline(target: &Target, node: &std::path::Path, output: Option<String>, gl:
         }
     }
     drop(capturer);
-    let (w, h, bgra, buffer) = captured.ok_or_else(|| anyhow!("no frame captured (a headless output renders reliably; a physical KVM output may not)"))?;
+    let (BgraImage { width: w, height: h, pixels: bgra }, buffer) =
+        captured.ok_or_else(|| anyhow!("no frame captured (a headless output renders reliably; a physical KVM output may not)"))?;
     println!("  captured {w}x{h} from {output}");
 
     if gl {
@@ -376,14 +348,10 @@ fn pipeline(target: &Target, node: &std::path::Path, output: Option<String>, gl:
     let out444 = decoder.decode(0, &packet.main, &packet.aux).context("decode")?.ok_or_else(|| anyhow!("dual decode produced no frame"))?;
     let dec_ms = t1.elapsed().as_secs_f64() * 1000.0;
 
-    let y_psnr = bgra_psnr(&src444.y, &out444.y);
-    let u_psnr = bgra_psnr(&src444.u, &out444.u);
-    let v_psnr = bgra_psnr(&src444.v, &out444.v);
-    let out_bgra = yuv444_to_bgra(&out444);
-    // Compare colour channels only; the captured X byte is undefined.
-    let rgb: Vec<u8> = bgra.iter().enumerate().filter(|(i, _)| i % 4 != 3).map(|(_, b)| *b).collect();
-    let rgb_out: Vec<u8> = out_bgra.iter().enumerate().filter(|(i, _)| i % 4 != 3).map(|(_, b)| *b).collect();
-    let rgb_psnr = bgra_psnr(&rgb, &rgb_out);
+    let y_psnr = psnr(&src444.y, &out444.y);
+    let u_psnr = psnr(&src444.u, &out444.u);
+    let v_psnr = psnr(&src444.v, &out444.v);
+    let rgb_psnr = psnr(&rgb_channels(&bgra), &rgb_channels(&yuv444_to_bgra(&out444)));
     println!("  decoded {dec_ms:.1} ms; PSNR Y {y_psnr:.1} U {u_psnr:.1} V {v_psnr:.1} dB, end-to-end RGB {rgb_psnr:.1} dB");
     status(y_psnr > 35.0 && u_psnr > 35.0 && v_psnr > 35.0, "Dual420 4:4:4 round-trip on a captured frame");
     if !(y_psnr > 35.0 && u_psnr > 35.0 && v_psnr > 35.0) {
@@ -397,7 +365,6 @@ fn pipeline_gl(node: &std::path::Path, w: usize, h: usize, bgra: &[u8], buffer: 
     use haver_proto::chroma::{recombine_yuv444, split_yuv444, Nv12};
     use std::time::Instant;
 
-    let (w, h) = (w & !1, h & !1);
     let info = &buffer.info;
     let src_fourcc = drm_fourcc::DrmFourcc::try_from(info.fourcc)
         .map_err(|_| anyhow!("captured fourcc {:#x} not a known DRM format", info.fourcc))?;
@@ -430,8 +397,8 @@ fn pipeline_gl(node: &std::path::Path, w: usize, h: usize, bgra: &[u8], buffer: 
     for _ in 0..10 {
         let main_desc = main_surf.export_prime().map_err(|e| anyhow!("export main: {e}"))?;
         let aux_desc = aux_surf.export_prime().map_err(|e| anyhow!("export aux: {e}"))?;
-        let (my, muv) = nv12_planes(&main_desc, w as u32, h as u32);
-        let (ay, auv) = nv12_planes(&aux_desc, w as u32, h as u32);
+        let (my, muv) = nv12_planes(&main_desc);
+        let (ay, auv) = nv12_planes(&aux_desc);
         let t = Instant::now();
         headless.split_dual(&input, w as u32, h as u32, &my, &muv, &ay, &auv).context("gl split")?;
         gl_ms = gl_ms.min(t.elapsed().as_secs_f64() * 1000.0);
@@ -471,13 +438,13 @@ fn pipeline_gl(node: &std::path::Path, w: usize, h: usize, bgra: &[u8], buffer: 
 
     // Correctness: recombine each and compare to the CPU 4:4:4 reference.
     let gl444 = recombine_yuv444(&gl_main, &gl_aux);
-    let y_psnr = bgra_psnr(&cpu_src.y, &gl444.y);
-    let u_psnr = bgra_psnr(&cpu_src.u, &gl444.u);
-    let v_psnr = bgra_psnr(&cpu_src.v, &gl444.v);
-    let my_psnr = bgra_psnr(&cpu_main.y, &gl_main.y);
-    let muv_psnr = bgra_psnr(&cpu_main.uv, &gl_main.uv);
-    let ay_psnr = bgra_psnr(&cpu_aux.y, &gl_aux.y);
-    let auv_psnr = bgra_psnr(&cpu_aux.uv, &gl_aux.uv);
+    let y_psnr = psnr(&cpu_src.y, &gl444.y);
+    let u_psnr = psnr(&cpu_src.u, &gl444.u);
+    let v_psnr = psnr(&cpu_src.v, &gl444.v);
+    let my_psnr = psnr(&cpu_main.y, &gl_main.y);
+    let muv_psnr = psnr(&cpu_main.uv, &gl_main.uv);
+    let ay_psnr = psnr(&cpu_aux.y, &gl_aux.y);
+    let auv_psnr = psnr(&cpu_aux.uv, &gl_aux.uv);
     println!("  per-plane PSNR vs CPU: main.Y {my_psnr:.1} main.UV {muv_psnr:.1} aux.Y {ay_psnr:.1} aux.UV {auv_psnr:.1} dB");
     println!("  recombined 4:4:4 PSNR vs CPU: Y {y_psnr:.1} U {u_psnr:.1} V {v_psnr:.1} dB");
     println!("  split time: GPU {gl_ms:.2} ms/frame  vs  CPU {cpu_ms:.2} ms/frame");
@@ -502,10 +469,7 @@ fn pipeline_gl(node: &std::path::Path, w: usize, h: usize, bgra: &[u8], buffer: 
     let packet = encoder.encode(&input, 0, true).context("gl encode")?;
     println!("  gl-encoded main {} bytes, aux {} bytes, key={}", packet.main.len(), packet.aux.len(), packet.keyframe);
     let out444 = decoder.decode(0, &packet.main, &packet.aux).context("decode")?.ok_or_else(|| anyhow!("dual decode produced no frame"))?;
-    let out_bgra = yuv444_to_bgra(&out444);
-    let rgb: Vec<u8> = bgra.iter().enumerate().filter(|(i, _)| i % 4 != 3).map(|(_, b)| *b).collect();
-    let rgb_out: Vec<u8> = out_bgra.iter().enumerate().filter(|(i, _)| i % 4 != 3).map(|(_, b)| *b).collect();
-    let e2e_psnr = bgra_psnr(&rgb, &rgb_out);
+    let e2e_psnr = psnr(&rgb_channels(bgra), &rgb_channels(&yuv444_to_bgra(&out444)));
     println!("  end-to-end RGB PSNR (GPU split -> encode -> decode): {e2e_psnr:.1} dB");
     let e2e_ok = e2e_psnr > 30.0;
     status(e2e_ok, "GPU-split Dual420 4:4:4 round-trip on a captured frame");
@@ -517,35 +481,6 @@ fn pipeline_gl(node: &std::path::Path, w: usize, h: usize, bgra: &[u8], buffer: 
         bail!("GPU-split end-to-end PSNR too low");
     }
     Ok(())
-}
-
-/// Build the Y (R8) and UV (GR88) dmabuf planes of an exported NV12 surface.
-fn nv12_planes(
-    desc: &haver_codec::libva::DrmPrimeSurfaceDescriptor,
-    w: u32,
-    h: u32,
-) -> (haver_gl::DmabufPlane<'_>, haver_gl::DmabufPlane<'_>) {
-    let obj = &desc.objects[0];
-    let layer = &desc.layers[0];
-    let y = haver_gl::DmabufPlane {
-        fd: obj.fd.as_fd(),
-        width: w,
-        height: h,
-        offset: layer.offset[0],
-        stride: layer.pitch[0],
-        fourcc: drm_fourcc::DrmFourcc::R8,
-        modifier: obj.drm_format_modifier,
-    };
-    let uv = haver_gl::DmabufPlane {
-        fd: obj.fd.as_fd(),
-        width: w / 2,
-        height: h / 2,
-        offset: layer.offset[1],
-        stride: layer.pitch[1],
-        fourcc: drm_fourcc::DrmFourcc::Gr88,
-        modifier: obj.drm_format_modifier,
-    };
-    (y, uv)
 }
 
 fn pick_output(target: &Target, output: Option<String>) -> Result<String> {
@@ -577,10 +512,9 @@ fn capture(target: &Target, node: &std::path::Path, output: Option<String>, png_
                 println!("  session ready {width}x{height} fourcc {:?} modifier {modifier:#x}", fourcc.to_le_bytes().map(|b| b as char));
             }
             CaptureEvent::Frame(frame) => {
-                let info = &frame.buffer.info;
-                let (w, h) = (info.width, info.height);
-                let fourcc = info.fourcc;
-                let rgb = frame.buffer.with_mapped(|pixels, stride| to_rgb(pixels, stride as usize, w, h, fourcc))?;
+                let image = frame.buffer.read_bgra()?;
+                let (w, h) = (image.width as u32, image.height as u32);
+                let rgb: Vec<u8> = image.pixels.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0]]).collect();
                 write_png(png_path, w, h, &rgb)?;
                 println!("  wrote {} ({w}x{h}, seq {}, damage {:?}, presentation {} ns)", png_path.display(), frame.sequence, frame.damage, frame.presentation_ns);
                 got_frame = true;
@@ -603,22 +537,6 @@ fn capture(target: &Target, node: &std::path::Path, output: Option<String>, png_
         bail!("no frame within 5 s");
     }
     Ok(())
-}
-
-fn to_rgb(pixels: &[u8], stride: usize, w: u32, h: u32, fourcc: u32) -> Vec<u8> {
-    let bgr = matches!(&fourcc.to_le_bytes(), b"XR24" | b"AR24");
-    let mut out = Vec::with_capacity((w * h * 3) as usize);
-    for row in 0..h as usize {
-        let line = &pixels[row * stride..row * stride + w as usize * 4];
-        for px in line.chunks_exact(4) {
-            if bgr {
-                out.extend_from_slice(&[px[2], px[1], px[0]]);
-            } else {
-                out.extend_from_slice(&[px[0], px[1], px[2]]);
-            }
-        }
-    }
-    out
 }
 
 fn write_png(path: &std::path::Path, w: u32, h: u32, rgb: &[u8]) -> Result<()> {
@@ -676,25 +594,7 @@ fn input(target: &Target, output: Option<String>, text: &str, click: bool) -> Re
     Ok(())
 }
 
-#[allow(clippy::large_enum_variant)]
-enum TestDecoder {
-    Dual(haver_codec::dual::DualDecoder),
-    Single(haver_codec::single::SingleDecoder),
-}
-impl TestDecoder {
-    fn new(chroma: haver_proto::ChromaMode, w: usize, h: usize) -> Result<Self> {
-        let display = vaapi::open_display(&vaapi::render_node(None))?;
-        Ok(match chroma {
-            haver_proto::ChromaMode::Single420 => TestDecoder::Single(haver_codec::single::SingleDecoder::new(display, w, h)?),
-            _ => TestDecoder::Dual(haver_codec::dual::DualDecoder::new(display, w, h)?),
-        })
-    }
-    fn decode(&mut self, ts: u64, main: &[u8], aux: &[u8]) -> haver_codec::Result<Option<haver_proto::chroma::Yuv444>> {
-        match self { TestDecoder::Dual(d) => d.decode(ts, main, aux), TestDecoder::Single(s) => s.decode(ts, main) }
-    }
-}
-
-fn serve_test(_node: &std::path::Path, addr: &str, frames: usize) -> Result<()> {
+fn serve_test(node: &std::path::Path, addr: &str, frames: usize) -> Result<()> {
     use haver_proto::{ChromaMode, ClientCaps, ClientMsg, Codec, ServerMsg};
     use haver_transport::Framed;
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
@@ -711,9 +611,10 @@ fn serve_test(_node: &std::path::Path, addr: &str, frames: usize) -> Result<()> 
         let ServerMsg::HelloAck { session, outputs, .. } = ack else { bail!("expected HelloAck, got {ack:?}") };
         eprintln!("  HelloAck: headless={} output={} ({} outputs)", session.headless, session.output, outputs.len());
         let cfg = reader.read_msg::<ServerMsg>().await?;
-        let (mut w, mut h, mut chroma) = match cfg { ServerMsg::StreamConfig { width, height, chroma, .. } => (width as usize, height as usize, chroma), o => bail!("expected StreamConfig, got {o:?}") };
+        let (mut w, mut h, chroma) = match cfg { ServerMsg::StreamConfig { width, height, chroma, .. } => (width as usize, height as usize, chroma), o => bail!("expected StreamConfig, got {o:?}") };
         eprintln!("  StreamConfig: {w}x{h} chroma {chroma:?}");
-        let mut decoder = TestDecoder::new(chroma, w, h)?;
+        let display = vaapi::open_display(node)?;
+        let mut decoder = Decoder::new(display.clone(), chroma, w, h)?;
         let mut got = 0usize;
         let mut keyframes = 0usize;
         while got < frames {
@@ -735,10 +636,10 @@ fn serve_test(_node: &std::path::Path, addr: &str, frames: usize) -> Result<()> 
                         }
                     }
                 }
-                ServerMsg::StreamConfig { width, height, chroma: c, .. } => {
-                    w = width as usize; h = height as usize; chroma = c;
+                ServerMsg::StreamConfig { width, height, chroma, .. } => {
+                    w = width as usize; h = height as usize;
                     eprintln!("  reconfig to {w}x{h}");
-                    decoder = TestDecoder::new(chroma, w, h)?;
+                    decoder = Decoder::new(display.clone(), chroma, w, h)?;
                 }
                 ServerMsg::CursorShape { argb_len, .. } => { let _ = reader.read_payload(argb_len).await?; }
                 ServerMsg::ClipboardData { data_len, .. } => {
@@ -750,7 +651,6 @@ fn serve_test(_node: &std::path::Path, addr: &str, frames: usize) -> Result<()> 
             }
         }
         writer.write_msg(&ClientMsg::Bye).await?;
-        let _ = chroma;
         eprintln!("RESULT decoded {got} frames, {keyframes} keyframes");
         status(got >= frames && keyframes >= 1, &format!("decoded {got} frames from the server ({keyframes} keyframes, resize honoured)"));
         Ok::<(), anyhow::Error>(())
