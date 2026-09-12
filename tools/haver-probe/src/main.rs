@@ -1,4 +1,4 @@
-//! Environment probe: protocols, outputs, VA-API, codec round-trip, capture,
+//! Environment probe: protocols, outputs, Vulkan, codec round-trip, capture,
 //! and input injection. Every check prints PASS/FAIL lines.
 
 use std::os::fd::AsFd;
@@ -12,13 +12,9 @@ use wayland_client::globals::GlobalListContents;
 use wayland_client::protocol::wl_registry::WlRegistry;
 use wayland_client::{Connection, Dispatch, QueueHandle};
 
-use haver_codec::color::{bgra_to_yuv444, psnr, yuv444_to_bgra};
-use haver_codec::dual::{DualDecoder, DualEncoder};
-use haver_codec::frame::{FrameAllocator, FramePool};
-use haver_codec::gl_split::{nv12_planes, GlDualEncoder};
-use haver_codec::h264::{EncoderSettings, H264Decoder, H264Encoder};
-use haver_codec::{vaapi, Decoder};
-use hypr_capture::{BgraImage, CaptureConfig, CaptureEvent, Capturer};
+use haver_proto::color::{bgra_to_yuv444, psnr, yuv444_to_bgra};
+use haver_vk::{Decoder, DmabufPlane, Encoder, EncoderSettings, Gpu};
+use hypr_capture::{CaptureConfig, CaptureEvent, Capturer};
 use hypr_input::{keys, Input, InputConfig, InputEvent};
 use hypr_wl::Target;
 
@@ -31,7 +27,7 @@ struct Cli {
     /// Hyprland instance signature
     #[arg(long, global = true)]
     instance: Option<String>,
-    /// DRM render node for GBM and VA-API
+    /// DRM render node for GBM and Vulkan
     #[arg(long, global = true)]
     render_node: Option<PathBuf>,
     #[command(subcommand)]
@@ -46,9 +42,9 @@ enum Cmd {
     Outputs,
     /// Report Hyprland permission settings that can block capture
     Permissions,
-    /// List VA-API profiles and entrypoints
-    Vaapi,
-    /// Encode and decode a synthetic NV12 stream and report PSNR
+    /// Vulkan: device, queues and video capabilities
+    Vulkan,
+    /// Encode and decode synthetic BGRA frames end to end on the GPU
     Roundtrip {
         #[arg(long, default_value_t = 640)]
         width: u32,
@@ -56,7 +52,11 @@ enum Cmd {
         height: u32,
         #[arg(long, default_value_t = 10)]
         frames: usize,
-        /// Target bitrate in bits per second (default: derived from size)
+        /// Single 4:2:0 stream instead of Dual420 4:4:4.
+        #[arg(long)]
+        single: bool,
+        /// Bits per second per stream (default: 4x the server default, as
+        /// the synthetic stripes are a worst case for 4:2:0 chroma).
         #[arg(long)]
         bitrate: Option<u32>,
     },
@@ -80,14 +80,11 @@ enum Cmd {
         #[arg(long)]
         click: bool,
     },
-    /// Capture one output frame and run it through the full Dual420 4:4:4 codec
+    /// Capture one output frame and run it through the full Dual420 4:4:4
+    /// pipeline: dmabuf import, GPU split, encode, decode, GPU recombine
     Pipeline {
         #[arg(long)]
         output: Option<String>,
-        /// Do the 4:4:4 split on the GPU (GL into VA surfaces) and compare
-        /// against the CPU split for correctness and speed.
-        #[arg(long)]
-        gl: bool,
     },
     /// Connect to a running `haver-server --listen` and decode a few frames
     ServeTest {
@@ -105,26 +102,10 @@ enum Cmd {
         #[arg(long, default_value_t = 3)]
         secs: u64,
     },
-    /// Micro-benchmark the CPU colour/split stages the GPU path would replace
+    /// Micro-benchmark the CPU colour/split reference the GPU shaders replace
     Bench {
         #[arg(long, default_value_t = 100)]
         iters: usize,
-    },
-    /// Feasibility test: can GL render into a VA encoder surface (dmabuf)?
-    GlTest,
-    /// Vulkan: device, queues and video capabilities
-    Vk,
-    /// Vulkan: encode and decode synthetic BGRA frames end to end
-    VkRoundtrip {
-        #[arg(long, default_value_t = 640)]
-        width: u32,
-        #[arg(long, default_value_t = 360)]
-        height: u32,
-        #[arg(long, default_value_t = 10)]
-        frames: usize,
-        /// Single 4:2:0 stream instead of Dual420 4:4:4.
-        #[arg(long)]
-        single: bool,
     },
     /// Run every non-interactive check
     All,
@@ -140,18 +121,19 @@ fn main() -> Result<()> {
         display: cli.display.clone(),
         instance: cli.instance.clone(),
     };
-    let node = vaapi::render_node(cli.render_node.as_deref());
+    let node = hypr_capture::render_node(cli.render_node.as_deref());
     match cli.cmd {
         Cmd::Protocols => protocols(&target)?,
         Cmd::Outputs => outputs(&target)?,
         Cmd::Permissions => permissions(&target)?,
-        Cmd::Vaapi => vaapi_probe(&node)?,
+        Cmd::Vulkan => vulkan_info(&node)?,
         Cmd::Roundtrip {
             width,
             height,
             frames,
+            single,
             bitrate,
-        } => roundtrip(&node, width, height, frames, bitrate)?,
+        } => roundtrip(&node, width, height, frames, !single, bitrate)?,
         Cmd::Capture {
             output,
             png,
@@ -162,19 +144,16 @@ fn main() -> Result<()> {
             text,
             click,
         } => input(&target, output, &text, click)?,
-        Cmd::Pipeline { output, gl } => pipeline(&target, &node, output, gl)?,
+        Cmd::Pipeline { output } => pipeline(&target, &node, output)?,
         Cmd::ServeTest { connect, frames } => serve_test(&node, &connect, frames)?,
         Cmd::Clipboard { set, secs } => clipboard(&target, set, secs)?,
         Cmd::Bench { iters } => bench(iters)?,
-        Cmd::GlTest => gltest(&node)?,
-        Cmd::Vk => vk_info(&node)?,
-        Cmd::VkRoundtrip { width, height, frames, single } => vk_roundtrip(&node, width, height, frames, !single)?,
         Cmd::All => {
             protocols(&target)?;
             outputs(&target)?;
             permissions(&target)?;
-            vaapi_probe(&node)?;
-            roundtrip(&node, 640, 360, 10, None)?;
+            vulkan_info(&node)?;
+            roundtrip(&node, 640, 360, 10, true, None)?;
         }
     }
     Ok(())
@@ -267,418 +246,12 @@ fn permissions(target: &Target) -> Result<()> {
     Ok(())
 }
 
-fn vaapi_probe(node: &std::path::Path) -> Result<()> {
-    let info = vaapi::probe(node)?;
-    println!("  {} : {}", info.node.display(), info.vendor);
-    for p in &info.profiles {
-        let eps: Vec<&str> = p.entrypoints.iter().map(|(_, n)| *n).collect();
-        println!("  {:<24} {}", p.name, eps.join(","));
-    }
-    status(info.h264_encode(), "H.264 encode");
-    status(info.h264_decode(), "H.264 decode");
-    let native = info.native_444_encode();
-    println!(
-        "INFO native 4:4:4 encode profiles: {}",
-        if native.is_empty() {
-            "none".to_owned()
-        } else {
-            native.join(",")
-        }
-    );
-    if !(info.h264_encode() && info.h264_decode()) {
-        bail!("VA-API H.264 encode and decode are both required");
-    }
-    Ok(())
-}
-
-fn fill_synthetic(
-    frame: &mut haver_codec::frame::Nv12Frame,
-    w: u32,
-    h: u32,
-    t: usize,
-) -> Result<()> {
-    let shift = t as f64 * 3.0;
-    frame.with_planes_mut(|y, uv, py, puv| {
-        for row in 0..h as usize {
-            for col in 0..w as usize {
-                let base = 16.0 + 200.0 * (col as f64 / w as f64);
-                let wave = 16.0 * ((row as f64 / 24.0 + shift).sin());
-                y[row * py + col] = (base + wave).clamp(16.0, 235.0) as u8;
-            }
-        }
-        for row in 0..(h / 2) as usize {
-            for col in 0..(w / 2) as usize {
-                uv[row * puv + col * 2] = 128;
-                uv[row * puv + col * 2 + 1] = 128;
-            }
-        }
-    })?;
-    Ok(())
-}
-
 /// The colour bytes of a BGRA buffer, skipping the alpha/X byte whose captured
 /// value is undefined.
 fn rgb_channels(bgra: &[u8]) -> Vec<u8> {
     bgra.chunks_exact(4)
         .flat_map(|p| [p[0], p[1], p[2]])
         .collect()
-}
-
-fn roundtrip(
-    node: &std::path::Path,
-    width: u32,
-    height: u32,
-    frames: usize,
-    bitrate: Option<u32>,
-) -> Result<()> {
-    let display = vaapi::open_display(node)?;
-    let bitrate = bitrate.unwrap_or_else(|| EncoderSettings::default_bitrate(width, height, 60));
-    let settings = EncoderSettings {
-        width,
-        height,
-        bitrate,
-        framerate: 60,
-        low_power: false,
-    };
-    let (cw, ch) = (settings.coded_width(), settings.coded_height());
-    let alloc = FrameAllocator::open(node)?;
-    let pool = FramePool::new(&alloc, cw, ch, 4)?;
-    let mut encoder = H264Encoder::new(display.clone(), settings).context("create encoder")?;
-    let dec_alloc = FrameAllocator::open(node)?;
-    let mut decoder = H264Decoder::new(display, dec_alloc, 2).context("create decoder")?;
-    let mut total_bytes = 0usize;
-    let mut decoded = 0usize;
-    let mut min_psnr = f64::MAX;
-    let start = std::time::Instant::now();
-    for i in 0..frames {
-        let mut frame = pool.try_alloc()?;
-        fill_synthetic(&mut frame, width, height, i)?;
-        let source_y = frame.read_nv12(width as usize, height as usize)?.y;
-        let force = i == frames / 2;
-        let (yb, uvb, yp, uvp) =
-            frame.with_planes(|y, uv, py, puv| (y.to_vec(), uv.to_vec(), py, puv))?;
-        let t0 = std::time::Instant::now();
-        let packet = encoder
-            .encode_planes(&yb, yp, &uvb, uvp, i as u64, force)
-            .with_context(|| format!("encode frame {i}"))?;
-        let enc_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        total_bytes += packet.data.len();
-        let t1 = std::time::Instant::now();
-        let out = decoder
-            .decode(i as u64, &packet.data)
-            .with_context(|| format!("decode frame {i}"))?;
-        let dec_ms = t1.elapsed().as_secs_f64() * 1000.0;
-        println!(
-            "  frame {i}: {} bytes key={} enc {enc_ms:.2} ms dec {dec_ms:.2} ms -> {} frame(s) out",
-            packet.data.len(),
-            packet.keyframe,
-            out.len()
-        );
-        if i == 0 && !packet.keyframe {
-            bail!("first packet is not a keyframe");
-        }
-        if force && !packet.keyframe {
-            bail!("forced keyframe was not honoured");
-        }
-        for d in out {
-            decoded += 1;
-            let y_out = d.frame.read_nv12(width as usize, height as usize)?.y;
-            min_psnr = min_psnr.min(psnr(&source_y, &y_out));
-            if d.timestamp != i as u64 {
-                println!(
-                    "  WARN decoded timestamp {} for input {i}: decoder is not zero-latency",
-                    d.timestamp
-                );
-            }
-        }
-    }
-    let elapsed = start.elapsed().as_secs_f64();
-    println!(
-        "  {frames} frames, {total_bytes} bytes, {:.1} fps end to end, extradata {} bytes",
-        frames as f64 / elapsed,
-        encoder.parameter_sets().len()
-    );
-    status(
-        decoded == frames,
-        &format!("decoded {decoded}/{frames} frames with zero decoder latency"),
-    );
-    status(min_psnr > 30.0, &format!("min luma PSNR {min_psnr:.1} dB"));
-    if decoded != frames || min_psnr <= 30.0 {
-        bail!("round-trip check failed");
-    }
-    Ok(())
-}
-
-fn pipeline(
-    target: &Target,
-    node: &std::path::Path,
-    output: Option<String>,
-    gl: bool,
-) -> Result<()> {
-    use std::sync::mpsc;
-    use std::time::Duration;
-    let output = pick_output(target, output)?;
-    let mut cfg = CaptureConfig::new(output.clone());
-    cfg.target = target.clone();
-    cfg.render_node = node.to_path_buf();
-    cfg.cursor = false;
-    let (tx, rx) = mpsc::channel();
-    let capturer = Capturer::start(
-        cfg,
-        Box::new(move |ev| {
-            let _ = tx.send(ev);
-        }),
-    )?;
-    capturer.request_frame()?;
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    let mut captured = None;
-    while std::time::Instant::now() < deadline {
-        match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(CaptureEvent::Frame(frame)) => {
-                captured = Some((frame.buffer.read_bgra()?, frame.buffer.clone()));
-                break;
-            }
-            Ok(CaptureEvent::Error(e)) => bail!("capture error: {e}"),
-            Ok(_) => {}
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(_) => break,
-        }
-    }
-    drop(capturer);
-    let (
-        BgraImage {
-            width: w,
-            height: h,
-            pixels: bgra,
-        },
-        buffer,
-    ) = captured.ok_or_else(|| {
-        anyhow!(
-            "no frame captured (a headless output renders reliably; a physical KVM output may not)"
-        )
-    })?;
-    println!("  captured {w}x{h} from {output}");
-
-    if gl {
-        return pipeline_gl(node, w, h, &bgra, &buffer);
-    }
-
-    let display = vaapi::open_display(node)?;
-    let settings = EncoderSettings {
-        width: w as u32,
-        height: h as u32,
-        bitrate: EncoderSettings::default_bitrate(w as u32, h as u32, 60),
-        framerate: 60,
-        low_power: false,
-    };
-    let mut encoder = DualEncoder::new(display.clone(), settings).context("dual encoder")?;
-    let mut decoder = DualDecoder::new(display, w, h).context("dual decoder")?;
-
-    let src444 = bgra_to_yuv444(&bgra, w * 4, w, h);
-    let t0 = std::time::Instant::now();
-    let packet = encoder.encode(&src444, 0, true).context("encode")?;
-    let enc_ms = t0.elapsed().as_secs_f64() * 1000.0;
-    println!(
-        "  encoded main {} bytes, aux {} bytes, key={}, {enc_ms:.1} ms",
-        packet.main.len(),
-        packet.aux.len(),
-        packet.keyframe
-    );
-    let t1 = std::time::Instant::now();
-    let out444 = decoder
-        .decode(0, &packet.main, &packet.aux)
-        .context("decode")?
-        .ok_or_else(|| anyhow!("dual decode produced no frame"))?;
-    let dec_ms = t1.elapsed().as_secs_f64() * 1000.0;
-
-    let y_psnr = psnr(&src444.y, &out444.y);
-    let u_psnr = psnr(&src444.u, &out444.u);
-    let v_psnr = psnr(&src444.v, &out444.v);
-    let rgb_psnr = psnr(
-        &rgb_channels(&bgra),
-        &rgb_channels(&yuv444_to_bgra(&out444)),
-    );
-    println!("  decoded {dec_ms:.1} ms; PSNR Y {y_psnr:.1} U {u_psnr:.1} V {v_psnr:.1} dB, end-to-end RGB {rgb_psnr:.1} dB");
-    status(
-        y_psnr > 35.0 && u_psnr > 35.0 && v_psnr > 35.0,
-        "Dual420 4:4:4 round-trip on a captured frame",
-    );
-    if !(y_psnr > 35.0 && u_psnr > 35.0 && v_psnr > 35.0) {
-        bail!("4:4:4 pipeline PSNR too low");
-    }
-    Ok(())
-}
-
-fn pipeline_gl(
-    node: &std::path::Path,
-    w: usize,
-    h: usize,
-    bgra: &[u8],
-    buffer: &hypr_capture::CaptureBuffer,
-) -> Result<()> {
-    use haver_codec::libva::{Display, Image, UsageHint, VA_FOURCC_NV12, VA_RT_FORMAT_YUV420};
-    use haver_proto::chroma::{recombine_yuv444, split_yuv444, Nv12};
-    use std::time::Instant;
-
-    let info = &buffer.info;
-    let src_fourcc = drm_fourcc::DrmFourcc::try_from(info.fourcc)
-        .map_err(|_| anyhow!("captured fourcc {:#x} not a known DRM format", info.fourcc))?;
-    let input = haver_gl::DmabufPlane {
-        fd: info.fd.as_fd(),
-        width: info.width,
-        height: info.height,
-        offset: info.planes[0].offset,
-        stride: info.planes[0].stride,
-        fourcc: src_fourcc,
-        modifier: info.modifier,
-    };
-    println!(
-        "  input dmabuf: {:?} {}x{} modifier {:#x}",
-        src_fourcc, info.width, info.height, info.modifier
-    );
-
-    let display: std::rc::Rc<Display> = vaapi::open_display(node)?;
-    let make_nv12 = || -> Result<_> {
-        let mut s = display
-            .create_surfaces::<()>(
-                VA_RT_FORMAT_YUV420,
-                Some(VA_FOURCC_NV12),
-                w as u32,
-                h as u32,
-                Some(UsageHint::USAGE_HINT_ENCODER),
-                vec![()],
-            )
-            .map_err(|e| anyhow!("create_surfaces: {e}"))?;
-        Ok(s.remove(0))
-    };
-    let main_surf = make_nv12()?;
-    let aux_surf = make_nv12()?;
-
-    let mut headless = haver_gl::Headless::new(node)?;
-
-    // Time the GL split over a few iterations. Re-export each iteration mirrors
-    // the per-frame cost; the encoder would hold the surfaces across frames.
-    let mut gl_ms = f64::INFINITY;
-    for _ in 0..10 {
-        let main_desc = main_surf
-            .export_prime()
-            .map_err(|e| anyhow!("export main: {e}"))?;
-        let aux_desc = aux_surf
-            .export_prime()
-            .map_err(|e| anyhow!("export aux: {e}"))?;
-        let (my, muv) = nv12_planes(&main_desc);
-        let (ay, auv) = nv12_planes(&aux_desc);
-        let t = Instant::now();
-        headless
-            .split_dual(&input, w as u32, h as u32, &my, &muv, &ay, &auv)
-            .context("gl split")?;
-        gl_ms = gl_ms.min(t.elapsed().as_secs_f64() * 1000.0);
-    }
-
-    // Read the two GL-filled surfaces back to a main/aux NV12 pair.
-    let fmt = display
-        .query_image_formats()
-        .map_err(|e| anyhow!("{e}"))?
-        .into_iter()
-        .find(|f| f.fourcc == VA_FOURCC_NV12)
-        .ok_or_else(|| anyhow!("no NV12 image format"))?;
-    let read_nv12 = |surface: &haver_codec::libva::Surface<()>| -> Result<Nv12> {
-        let image = Image::create_from(surface, fmt, (w as u32, h as u32), (w as u32, h as u32))
-            .map_err(|e| anyhow!("map: {e}"))?;
-        let d = image.as_ref();
-        let va = *image.image();
-        let (yo, uvo) = (va.offsets[0] as usize, va.offsets[1] as usize);
-        let (yp, uvp) = (va.pitches[0] as usize, va.pitches[1] as usize);
-        let mut nv = Nv12::new(w, h);
-        for row in 0..h {
-            nv.y[row * w..row * w + w].copy_from_slice(&d[yo + row * yp..yo + row * yp + w]);
-        }
-        for row in 0..h / 2 {
-            nv.uv[row * w..row * w + w].copy_from_slice(&d[uvo + row * uvp..uvo + row * uvp + w]);
-        }
-        Ok(nv)
-    };
-    let gl_main = read_nv12(&main_surf)?;
-    let gl_aux = read_nv12(&aux_surf)?;
-
-    // CPU reference: the exact split the GPU path replaces. Take the best of
-    // several warm runs so both sides are measured the same way.
-    let cpu_src = bgra_to_yuv444(bgra, w * 4, w, h);
-    let (cpu_main, cpu_aux) = split_yuv444(&cpu_src);
-    let mut cpu_ms = f64::INFINITY;
-    for _ in 0..10 {
-        let t = Instant::now();
-        let s = bgra_to_yuv444(bgra, w * 4, w, h);
-        let _ = split_yuv444(&s);
-        cpu_ms = cpu_ms.min(t.elapsed().as_secs_f64() * 1000.0);
-    }
-
-    // Correctness: recombine each and compare to the CPU 4:4:4 reference.
-    let gl444 = recombine_yuv444(&gl_main, &gl_aux);
-    let y_psnr = psnr(&cpu_src.y, &gl444.y);
-    let u_psnr = psnr(&cpu_src.u, &gl444.u);
-    let v_psnr = psnr(&cpu_src.v, &gl444.v);
-    let my_psnr = psnr(&cpu_main.y, &gl_main.y);
-    let muv_psnr = psnr(&cpu_main.uv, &gl_main.uv);
-    let ay_psnr = psnr(&cpu_aux.y, &gl_aux.y);
-    let auv_psnr = psnr(&cpu_aux.uv, &gl_aux.uv);
-    println!("  per-plane PSNR vs CPU: main.Y {my_psnr:.1} main.UV {muv_psnr:.1} aux.Y {ay_psnr:.1} aux.UV {auv_psnr:.1} dB");
-    println!("  recombined 4:4:4 PSNR vs CPU: Y {y_psnr:.1} U {u_psnr:.1} V {v_psnr:.1} dB");
-    println!("  split time: GPU {gl_ms:.2} ms/frame  vs  CPU {cpu_ms:.2} ms/frame");
-
-    // GL uses BT.709 float math and rounds slightly differently from the CPU
-    // integer path, so exact equality is not expected; >40 dB means the shader
-    // orientation and channel order are correct.
-    let split_ok = y_psnr > 40.0 && u_psnr > 40.0 && v_psnr > 40.0;
-    status(
-        split_ok,
-        "GPU 4:4:4 split matches CPU split (orientation + channel order)",
-    );
-
-    // Release the standalone split resources before the integrated encoder
-    // builds its own GL context and surfaces.
-    drop(headless);
-    drop(main_surf);
-    drop(aux_surf);
-
-    // Integrated: encode the GPU-split surfaces, decode, recombine, and check
-    // end-to-end fidelity against the captured frame.
-    let settings = EncoderSettings {
-        width: w as u32,
-        height: h as u32,
-        bitrate: EncoderSettings::default_bitrate(w as u32, h as u32, 60),
-        framerate: 60,
-        low_power: false,
-    };
-    let mut encoder =
-        GlDualEncoder::new(display.clone(), node, settings).context("gl dual encoder")?;
-    let mut decoder = DualDecoder::new(display, w, h).context("dual decoder")?;
-    let packet = encoder.encode(&input, 0, true).context("gl encode")?;
-    println!(
-        "  gl-encoded main {} bytes, aux {} bytes, key={}",
-        packet.main.len(),
-        packet.aux.len(),
-        packet.keyframe
-    );
-    let out444 = decoder
-        .decode(0, &packet.main, &packet.aux)
-        .context("decode")?
-        .ok_or_else(|| anyhow!("dual decode produced no frame"))?;
-    let e2e_psnr = psnr(&rgb_channels(bgra), &rgb_channels(&yuv444_to_bgra(&out444)));
-    println!("  end-to-end RGB PSNR (GPU split -> encode -> decode): {e2e_psnr:.1} dB");
-    let e2e_ok = e2e_psnr > 30.0;
-    status(
-        e2e_ok,
-        "GPU-split Dual420 4:4:4 round-trip on a captured frame",
-    );
-
-    if !split_ok {
-        bail!("GPU split PSNR too low: shader orientation or GR88 channel order is wrong");
-    }
-    if !e2e_ok {
-        bail!("GPU-split end-to-end PSNR too low");
-    }
-    Ok(())
 }
 
 fn pick_output(target: &Target, output: Option<String>) -> Result<String> {
@@ -865,8 +438,8 @@ fn serve_test(node: &std::path::Path, addr: &str, frames: usize) -> Result<()> {
         let cfg = reader.read_msg::<ServerMsg>().await?;
         let (mut w, mut h, chroma) = match cfg { ServerMsg::StreamConfig { width, height, chroma, .. } => (width as usize, height as usize, chroma), o => bail!("expected StreamConfig, got {o:?}") };
         eprintln!("  StreamConfig: {w}x{h} chroma {chroma:?}");
-        let display = vaapi::open_display(node)?;
-        let mut decoder = Decoder::new(display.clone(), chroma, w, h)?;
+        let gpu = Gpu::open(Some(node))?;
+        let mut decoder = Decoder::new(&gpu, chroma != ChromaMode::Single420, w as u32, h as u32)?;
         let mut got = 0usize;
         let mut keyframes = 0usize;
         while got < frames {
@@ -876,7 +449,7 @@ fn serve_test(node: &std::path::Path, addr: &str, frames: usize) -> Result<()> {
                     let main = reader.read_payload(data_len).await?;
                     let aux = if aux_len > 0 { reader.read_payload(aux_len).await?.to_vec() } else { Vec::new() };
                     if keyframe { keyframes += 1; }
-                    let out = decoder.decode(frame_id, &main, &aux)?;
+                    let out = decoder.decode_to_bgra(&main, &aux)?;
                     if out.is_some() { got += 1; }
                     if got == 1 { eprintln!("  first decoded frame ok ({}x{}, main {} aux {} bytes, key {keyframe})", w, h, data_len, aux_len); }
                     writer.write_msg(&ClientMsg::FrameAck { frame_id, decoded_at_ms: 0 }).await?;
@@ -891,7 +464,7 @@ fn serve_test(node: &std::path::Path, addr: &str, frames: usize) -> Result<()> {
                 ServerMsg::StreamConfig { width, height, chroma, .. } => {
                     w = width as usize; h = height as usize;
                     eprintln!("  reconfig to {w}x{h}");
-                    decoder = Decoder::new(display.clone(), chroma, w, h)?;
+                    decoder = Decoder::new(&gpu, chroma != ChromaMode::Single420, w as u32, h as u32)?;
                 }
                 ServerMsg::CursorShape { argb_len, .. } => { let _ = reader.read_payload(argb_len).await?; }
                 ServerMsg::ClipboardData { data_len, .. } => {
@@ -944,7 +517,6 @@ fn clipboard(target: &Target, set: Option<String>, secs: u64) -> Result<()> {
 }
 
 fn bench(iters: usize) -> Result<()> {
-    use haver_codec::color::{bgra_to_yuv444, yuv444_to_bgra};
     use haver_proto::chroma::{recombine_yuv444, split_yuv444, yuv444_to_nv12};
     use std::time::Instant;
     for (w, h) in [(1280usize, 720usize), (1920, 1080), (3840, 2160)] {
@@ -1004,73 +576,8 @@ fn bench(iters: usize) -> Result<()> {
     Ok(())
 }
 
-fn gltest(node: &std::path::Path) -> Result<()> {
-    use haver_codec::libva::{Display, UsageHint, VA_FOURCC_NV12, VA_RT_FORMAT_YUV420};
-    let (w, h) = (256u32, 256u32);
-    let display: std::rc::Rc<Display> = vaapi::open_display(node)?;
-    let mut surfaces = display
-        .create_surfaces::<()>(
-            VA_RT_FORMAT_YUV420,
-            Some(VA_FOURCC_NV12),
-            w,
-            h,
-            Some(UsageHint::USAGE_HINT_ENCODER),
-            vec![()],
-        )
-        .map_err(|e| anyhow!("create_surfaces: {e}"))?;
-    let surface = surfaces.remove(0);
-    let desc = surface
-        .export_prime()
-        .map_err(|e| anyhow!("export_prime: {e}"))?;
-    let layer = &desc.layers[0];
-    let obj = &desc.objects[0];
-    println!(
-        "  VA NV12 surface exported: modifier {:#x}, Y off {} pitch {}",
-        obj.drm_format_modifier, layer.offset[0], layer.pitch[0]
-    );
-    let y_plane = haver_gl::DmabufPlane {
-        fd: obj.fd.as_fd(),
-        width: w,
-        height: h,
-        offset: layer.offset[0],
-        stride: layer.pitch[0],
-        fourcc: drm_fourcc::DrmFourcc::R8,
-        modifier: obj.drm_format_modifier,
-    };
-    let headless = haver_gl::Headless::new(node)?;
-    let clear = headless.clear_plane(&y_plane, 0.5);
-    match &clear {
-        Ok(()) => println!("  GL cleared the surface Y plane to 0.5 (framebuffer complete)"),
-        Err(e) => println!("  GL render into VA surface FAILED: {e}"),
-    }
-    // Read the surface back and check the Y plane is ~128.
-    drop(desc); // close exported fds before mapping
-    let fmt = display
-        .query_image_formats()
-        .map_err(|e| anyhow!("{e}"))?
-        .into_iter()
-        .find(|f| f.fourcc == VA_FOURCC_NV12)
-        .ok_or_else(|| anyhow!("no NV12 image"))?;
-    let image = haver_codec::libva::Image::create_from(&surface, fmt, (w, h), (w, h))
-        .map_err(|e| anyhow!("map surface: {e}"))?;
-    let data = image.as_ref();
-    let yo = image.image().offsets[0] as usize;
-    let samples: Vec<u8> = (0..8).map(|i| data[yo + i]).collect();
-    let mean: f64 = (0..(w * h) as usize)
-        .map(|i| data[yo + i] as f64)
-        .sum::<f64>()
-        / (w * h) as f64;
-    println!("  read-back Y[0..8]={samples:?} mean={mean:.1} (expect ~128 if GL wrote it)");
-    let ok = clear.is_ok() && (mean - 128.0).abs() < 8.0;
-    status(ok, "GL render into VA encoder surface");
-    if !ok {
-        bail!("server GL-into-VA-surface path is not usable on this GPU");
-    }
-    Ok(())
-}
-
-fn vk_info(node: &std::path::Path) -> Result<()> {
-    let gpu = haver_vk::Gpu::open(Some(node))?;
+fn vulkan_info(node: &std::path::Path) -> Result<()> {
+    let gpu = Gpu::open(Some(node))?;
     println!("  {} ({})", gpu.name, gpu.driver);
     status(gpu.can_encode(), "Vulkan H.264 encode queue");
     status(gpu.can_decode(), "Vulkan H.264 decode queue");
@@ -1084,7 +591,7 @@ fn synthetic_bgra(w: usize, h: usize, t: usize) -> Vec<u8> {
     for y in 0..h {
         for x in 0..w {
             let p = &mut out[(y * w + x) * 4..(y * w + x) * 4 + 4];
-            let stripe = ((x + t * 3) / 8) % 4;
+            let stripe = ((x + t * 3) / 32) % 4;
             let (b, g, r) = match stripe {
                 0 => (255, 0, 0),
                 1 => (0, 255, 0),
@@ -1100,12 +607,25 @@ fn synthetic_bgra(w: usize, h: usize, t: usize) -> Vec<u8> {
     out
 }
 
-fn vk_roundtrip(node: &std::path::Path, width: u32, height: u32, frames: usize, dual: bool) -> Result<()> {
-    let gpu = haver_vk::Gpu::open(Some(node))?;
+fn roundtrip(
+    node: &std::path::Path,
+    width: u32,
+    height: u32,
+    frames: usize,
+    dual: bool,
+    bitrate: Option<u32>,
+) -> Result<()> {
+    let gpu = Gpu::open(Some(node))?;
     println!("  {} ({}) dual={dual}", gpu.name, gpu.driver);
-    let settings = haver_vk::EncoderSettings { width, height, bitrate: haver_vk::EncoderSettings::default_bitrate(width, height, 60), framerate: 60 };
-    let mut encoder = haver_vk::Encoder::new(&gpu, settings, dual).context("vulkan encoder")?;
-    let mut decoder = haver_vk::Decoder::new(&gpu, dual, width, height).context("vulkan decoder")?;
+    let bitrate = bitrate.unwrap_or(4 * EncoderSettings::default_bitrate(width, height, 60));
+    let settings = EncoderSettings {
+        width,
+        height,
+        bitrate,
+        framerate: 60,
+    };
+    let mut encoder = Encoder::new(&gpu, settings, dual).context("vulkan encoder")?;
+    let mut decoder = Decoder::new(&gpu, dual, width, height).context("vulkan decoder")?;
     let (w, h) = (width as usize, height as usize);
     let mut min_psnr = f64::MAX;
     let mut decoded = 0;
@@ -1115,12 +635,16 @@ fn vk_roundtrip(node: &std::path::Path, width: u32, height: u32, frames: usize, 
         let src = synthetic_bgra(w, h, i);
         let force = i == frames / 2;
         let t0 = std::time::Instant::now();
-        let packet = encoder.encode_bgra(&src, force).with_context(|| format!("encode frame {i}"))?;
+        let packet = encoder
+            .encode_bgra(&src, force)
+            .with_context(|| format!("encode frame {i}"))?;
         let enc_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let aux = packet.aux.as_deref().unwrap_or(&[]);
         total_bytes += packet.main.len() + aux.len();
         let t1 = std::time::Instant::now();
-        let out = decoder.decode_to_bgra(&packet.main, aux).with_context(|| format!("decode frame {i}"))?;
+        let out = decoder
+            .decode_to_bgra(&packet.main, aux)
+            .with_context(|| format!("decode frame {i}"))?;
         let dec_ms = t1.elapsed().as_secs_f64() * 1000.0;
         if i == 0 && !packet.keyframe {
             bail!("first packet is not a keyframe");
@@ -1137,24 +661,151 @@ fn vk_roundtrip(node: &std::path::Path, width: u32, height: u32, frames: usize, 
         // chroma mode, so 4:2:0's inherent loss is not counted against the GPU.
         let reference = {
             let yuv = bgra_to_yuv444(&src, w * 4, w, h);
-            if dual { yuv444_to_bgra(&yuv) } else { yuv444_to_bgra(&haver_proto::chroma::nv12_to_yuv444(&haver_proto::chroma::yuv444_to_nv12(&yuv))) }
+            if dual {
+                yuv444_to_bgra(&yuv)
+            } else {
+                yuv444_to_bgra(&haver_proto::chroma::nv12_to_yuv444(
+                    &haver_proto::chroma::yuv444_to_nv12(&yuv),
+                ))
+            }
         };
         let p = psnr(&rgb_channels(&reference), &rgb_channels(&out));
         min_psnr = min_psnr.min(p);
         if let Some(dir) = std::env::var_os("HAVER_VK_DUMP") {
             let dir = std::path::PathBuf::from(dir);
-            let to_rgb = |b: &[u8]| -> Vec<u8> { b.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0]]).collect() };
-            write_png(&dir.join(format!("src{i}.png")), width, height, &to_rgb(&src))?;
-            write_png(&dir.join(format!("out{i}.png")), width, height, &to_rgb(&out))?;
+            let to_rgb = |b: &[u8]| -> Vec<u8> {
+                b.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0]]).collect()
+            };
+            write_png(
+                &dir.join(format!("src{i}.png")),
+                width,
+                height,
+                &to_rgb(&src),
+            )?;
+            write_png(
+                &dir.join(format!("out{i}.png")),
+                width,
+                height,
+                &to_rgb(&out),
+            )?;
         }
         println!("  frame {i}: main {} aux {} bytes key={} enc {enc_ms:.2} ms dec {dec_ms:.2} ms rgb psnr {p:.1} dB", packet.main.len(), aux.len(), packet.keyframe);
     }
     let elapsed = start.elapsed().as_secs_f64();
-    println!("  {frames} frames, {total_bytes} bytes, {:.1} fps end to end", frames as f64 / elapsed);
-    status(decoded == frames, &format!("decoded {decoded}/{frames} frames"));
+    println!(
+        "  {frames} frames, {total_bytes} bytes, {:.1} fps end to end",
+        frames as f64 / elapsed
+    );
+    status(
+        decoded == frames,
+        &format!("decoded {decoded}/{frames} frames"),
+    );
     status(min_psnr > 30.0, &format!("min RGB PSNR {min_psnr:.1} dB"));
     if decoded != frames || min_psnr <= 30.0 {
         bail!("vulkan round-trip failed");
+    }
+    Ok(())
+}
+
+/// Capture one frame and push it through the exact server and client
+/// pipelines: dmabuf import, GPU split, two encodes, two decodes, GPU
+/// recombine. Compares the result with the CPU 4:4:4 reference.
+fn pipeline(target: &Target, node: &std::path::Path, output: Option<String>) -> Result<()> {
+    let output = pick_output(target, output)?;
+    let mut cfg = CaptureConfig::new(output.clone());
+    cfg.target = target.clone();
+    cfg.render_node = node.to_path_buf();
+    cfg.cursor = false;
+    let (tx, rx) = mpsc::channel();
+    let capturer = Capturer::start(
+        cfg,
+        Box::new(move |ev| {
+            let _ = tx.send(ev);
+        }),
+    )?;
+    capturer.request_frame()?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut captured = None;
+    while std::time::Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(CaptureEvent::Frame(frame)) => {
+                captured = Some(frame);
+                break;
+            }
+            Ok(CaptureEvent::Error(e)) => bail!("capture error: {e}"),
+            Ok(_) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(_) => break,
+        }
+    }
+    let frame = captured.ok_or_else(|| {
+        anyhow!(
+            "no frame captured (a headless output renders reliably; a physical KVM output may not)"
+        )
+    })?;
+    let reference = frame.buffer.read_bgra()?;
+    let (w, h) = (reference.width as u32, reference.height as u32);
+    let info = &frame.buffer.info;
+    let fourcc = drm_fourcc::DrmFourcc::try_from(info.fourcc)
+        .map_err(|_| anyhow!("captured fourcc {:#x} is not a DRM format", info.fourcc))?;
+    println!(
+        "  captured {w}x{h} {fourcc:?} modifier {:#x} from {output}",
+        info.modifier
+    );
+    let plane = DmabufPlane {
+        fd: info.fd.as_fd(),
+        width: info.width,
+        height: info.height,
+        offset: info.planes[0].offset,
+        stride: info.planes[0].stride,
+        fourcc,
+        modifier: info.modifier,
+    };
+
+    let gpu = Gpu::open(Some(node))?;
+    let settings = EncoderSettings {
+        width: w,
+        height: h,
+        bitrate: EncoderSettings::default_bitrate(w, h, 60),
+        framerate: 60,
+    };
+    let mut encoder = Encoder::new(&gpu, settings, true).context("encoder")?;
+    let mut decoder = Decoder::new(&gpu, true, w, h).context("decoder")?;
+    let t0 = std::time::Instant::now();
+    let packet = encoder.encode_dmabuf(1, &plane, true).context("encode")?;
+    let enc_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let aux = packet.aux.as_deref().unwrap_or(&[]);
+    println!(
+        "  encoded main {} bytes, aux {} bytes, key={}, {enc_ms:.1} ms",
+        packet.main.len(),
+        aux.len(),
+        packet.keyframe
+    );
+    let t1 = std::time::Instant::now();
+    let out = decoder
+        .decode_to_bgra(&packet.main, aux)
+        .context("decode")?
+        .ok_or_else(|| anyhow!("decode produced no frame"))?;
+    let dec_ms = t1.elapsed().as_secs_f64() * 1000.0;
+    drop(frame);
+    drop(capturer);
+
+    // What the CPU reference path makes of the same pixels, so only coding
+    // loss and shader rounding count.
+    let cpu = yuv444_to_bgra(&bgra_to_yuv444(
+        &reference.pixels,
+        reference.width * 4,
+        reference.width,
+        reference.height,
+    ));
+    let rgb_psnr = psnr(&rgb_channels(&cpu), &rgb_channels(&out));
+    println!("  decoded {dec_ms:.1} ms; end-to-end RGB PSNR vs CPU reference {rgb_psnr:.1} dB");
+    status(
+        rgb_psnr > 35.0,
+        "Dual420 4:4:4 GPU pipeline on a captured frame",
+    );
+    if rgb_psnr <= 35.0 {
+        bail!("pipeline PSNR too low");
     }
     Ok(())
 }

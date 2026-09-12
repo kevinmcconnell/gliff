@@ -7,8 +7,6 @@ members = [
     "crates/hypr-wl",
     "crates/hypr-capture",
     "crates/hypr-input",
-    "crates/haver-codec",
-    "crates/haver-gl",
     "crates/haver-vk",
     "bins/haver-server",
     "bins/haver-client",
@@ -34,8 +32,6 @@ hypr-ipc = { path = "crates/hypr-ipc" }
 hypr-wl = { path = "crates/hypr-wl" }
 hypr-capture = { path = "crates/hypr-capture" }
 hypr-input = { path = "crates/hypr-input" }
-haver-codec = { path = "crates/haver-codec" }
-haver-gl = { path = "crates/haver-gl" }
 haver-vk = { path = "crates/haver-vk" }
 
 anyhow = "1"
@@ -66,14 +62,5 @@ drm = "0.14"
 nix = { version = "0.30", features = ["fs", "socket", "uio", "poll"] }
 rustix = { version = "1", features = ["fs", "mm"] }
 
-cros-codecs = { version = "0.0.6", features = ["vaapi"] }
-
 gtk4 = { version = "0.11", features = ["v4_18"] }
 libadwaita = { version = "0.9", features = ["v1_6"] }
-glow = "0.18"
-khronos-egl = { version = "6", features = ["static"] }
-libloading = "0.8"
-
-[patch.crates-io]
-cros-libva = { path = "vendor/cros-libva" }
-cros-codecs = { path = "vendor/cros-codecs" }

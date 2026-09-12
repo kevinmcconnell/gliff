@@ -1,11 +1,11 @@
 //! BGRA <-> planar YUV 4:4:4, BT.709 limited range, on the CPU with rayon.
 //!
-//! This is the `CpuSplitter`'s colour stage: the one place in the pipeline that
-//! touches system memory per frame. `GlSplitter` (phase 5) replaces it.
+//! The reference the compute shaders in `haver-vk` are checked against; the
+//! streaming path itself never runs it.
 
 use rayon::prelude::*;
 
-use haver_proto::chroma::Yuv444;
+use crate::chroma::Yuv444;
 
 /// Convert BGRA (or BGRX) pixels with `stride` bytes per row to planar YUV 4:4:4.
 pub fn bgra_to_yuv444(bgra: &[u8], stride: usize, width: usize, height: usize) -> Yuv444 {

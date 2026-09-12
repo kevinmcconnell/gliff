@@ -23,10 +23,10 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
-pub mod device;
-pub mod image;
 pub mod compute;
+pub mod device;
 pub mod encoder;
+pub mod image;
 
 /// An all-zero value of a plain C struct from the Vulkan video headers. The
 /// `StdVideo*` types are integer fields and bitfields, for which zero is the

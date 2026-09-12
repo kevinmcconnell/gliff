@@ -45,7 +45,11 @@ pub struct Encoder {
 impl Encoder {
     pub fn new(gpu: &Arc<Gpu>, settings: EncoderSettings, dual: bool) -> Result<Self> {
         let main = H264Encoder::new(gpu, settings.clone())?;
-        let aux = if dual { Some(H264Encoder::new(gpu, settings.clone())?) } else { None };
+        let aux = if dual {
+            Some(H264Encoder::new(gpu, settings.clone())?)
+        } else {
+            None
+        };
         let main_in = main.new_input()?;
         let aux_in = aux.as_ref().map(|a| a.new_input()).transpose()?;
         Ok(Self {
@@ -68,14 +72,20 @@ impl Encoder {
 
     /// Encode a captured dmabuf. `key` identifies the buffer so its import
     /// is reused across frames; pass a new key when the buffer changes.
-    pub fn encode_dmabuf(&mut self, key: u64, plane: &DmabufPlane, force_keyframe: bool) -> Result<EncodedFrame> {
+    pub fn encode_dmabuf(
+        &mut self,
+        key: u64,
+        plane: &DmabufPlane,
+        force_keyframe: bool,
+    ) -> Result<EncodedFrame> {
         if !self.imports.contains_key(&key) {
             // A new capture ring means the old buffers are gone.
             if self.imports.len() >= 8 {
                 self.compute.wait()?;
                 self.imports.clear();
             }
-            self.imports.insert(key, Image::import_dmabuf(&self.gpu, plane)?);
+            self.imports
+                .insert(key, Image::import_dmabuf(&self.gpu, plane)?);
         }
         let src = self.imports.remove(&key).expect("inserted above");
         let result = self.encode_image(&src, force_keyframe);
@@ -86,14 +96,20 @@ impl Encoder {
     /// Encode packed BGRA pixels (tests and the probe; one extra upload).
     pub fn encode_bgra(&mut self, bgra: &[u8], force_keyframe: bool) -> Result<EncodedFrame> {
         let (w, h) = (self.settings.width, self.settings.height);
-        let staging = HostBuffer::new(&self.gpu, bgra.len(), vk::BufferUsageFlags::TRANSFER_SRC, None)?;
+        let staging = HostBuffer::new(
+            &self.gpu,
+            bgra.len(),
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            None,
+        )?;
         staging.write(0, bgra);
         let src = Image::bgra_upload(&self.gpu, w, h)?;
-        self.compute.run(self.timeline.semaphore, None, None, true, |cmd| {
-            src.transition(cmd, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
-            src.copy_rgba_from_buffer(cmd, &staging);
-            Ok(())
-        })?;
+        self.compute
+            .run(self.timeline.semaphore, None, None, true, |cmd| {
+                src.transition(cmd, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+                src.copy_rgba_from_buffer(cmd, &staging);
+                Ok(())
+            })?;
         self.encode_image(&src, force_keyframe)
     }
 
@@ -101,26 +117,39 @@ impl Encoder {
         let (w, h) = (self.settings.width, self.settings.height);
         let split_done = self.timeline.advance();
         let (split, main_in, aux_in) = (&self.split, &self.main_in, self.aux_in.as_ref());
-        self.compute.run(self.timeline.semaphore, None, Some(split_done), false, |cmd| {
-            src.transition(cmd, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-            main_in.transition(cmd, vk::ImageLayout::GENERAL);
-            if let Some(a) = aux_in {
-                a.transition(cmd, vk::ImageLayout::GENERAL);
-            }
-            split.record(cmd, src, main_in, aux_in, w, h)?;
-            main_in.memory_barrier(cmd);
-            Ok(())
-        })?;
-        if std::env::var_os("HAVER_VK_SPLIT_ONLY").is_some() {
-            self.compute.wait()?;
-            return Ok(EncodedFrame { keyframe: true, main: vec![0, 0, 1], aux: None });
-        }
-        let main = self.main.encode(&self.main_in, &self.timeline, Some(split_done), force_keyframe)?;
+        self.compute.run(
+            self.timeline.semaphore,
+            None,
+            Some(split_done),
+            false,
+            |cmd| {
+                src.transition(cmd, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+                main_in.transition(cmd, vk::ImageLayout::GENERAL);
+                if let Some(a) = aux_in {
+                    a.transition(cmd, vk::ImageLayout::GENERAL);
+                }
+                split.record(cmd, src, main_in, aux_in, w, h)?;
+                main_in.memory_barrier(cmd);
+                Ok(())
+            },
+        )?;
+        let main = self.main.encode(
+            &self.main_in,
+            &self.timeline,
+            Some(split_done),
+            force_keyframe,
+        )?;
         let aux = match (&mut self.aux, &self.aux_in) {
-            (Some(enc), Some(input)) => Some(enc.encode(input, &self.timeline, Some(split_done), force_keyframe)?),
+            (Some(enc), Some(input)) => {
+                Some(enc.encode(input, &self.timeline, Some(split_done), force_keyframe)?)
+            }
             _ => None,
         };
-        Ok(EncodedFrame { keyframe: main.keyframe, main: main.data, aux: aux.map(|a| a.data) })
+        Ok(EncodedFrame {
+            keyframe: main.keyframe,
+            main: main.data,
+            aux: aux.map(|a| a.data),
+        })
     }
 }
 
@@ -151,6 +180,8 @@ pub struct Decoder {
     aux: Option<H264Decoder>,
     outputs: Vec<(Image, ExportedDmabuf)>,
     next_output: usize,
+    /// CPU readback staging, allocated on first use (tests and the probe).
+    readback: Option<HostBuffer>,
     width: u32,
     height: u32,
 }
@@ -170,9 +201,14 @@ impl Decoder {
             compute: Commands::new(gpu, gpu.families.compute, gpu.compute_queue)?,
             recombine: Recombine::new(gpu)?,
             main: H264Decoder::new(gpu)?,
-            aux: if dual { Some(H264Decoder::new(gpu)?) } else { None },
+            aux: if dual {
+                Some(H264Decoder::new(gpu)?)
+            } else {
+                None
+            },
             outputs,
             next_output: 0,
+            readback: None,
             width,
             height,
         })
@@ -197,19 +233,35 @@ impl Decoder {
 
     /// Decode and read the BGRA pixels back to the CPU (tests and the probe).
     pub fn decode_to_bgra(&mut self, main: &[u8], aux: &[u8]) -> Result<Option<Vec<u8>>> {
-        let Some(idx) = self.decode_to_output(main, aux)? else { return Ok(None) };
+        let Some(idx) = self.decode_to_output(main, aux)? else {
+            return Ok(None);
+        };
         let (image, _) = &self.outputs[idx];
-        let buf = HostBuffer::new(&self.gpu, (self.width * self.height * 4) as usize, vk::BufferUsageFlags::TRANSFER_DST, None)?;
-        self.compute.run(self.timeline.semaphore, None, None, true, |cmd| {
-            image.copy_rgba_to_buffer(cmd, &buf);
-            Ok(())
-        })?;
-        Ok(Some(buf.read(0, buf.size)))
+        let size = (self.width * self.height * 4) as usize;
+        if self.readback.is_none() {
+            self.readback = Some(HostBuffer::new(
+                &self.gpu,
+                size,
+                vk::BufferUsageFlags::TRANSFER_DST,
+                None,
+            )?);
+        }
+        let buf = self.readback.as_ref().expect("allocated above");
+        self.compute
+            .run(self.timeline.semaphore, None, None, true, |cmd| {
+                image.copy_rgba_to_buffer(cmd, &buf);
+                Ok(())
+            })?;
+        Ok(Some(buf.read(0, size)))
     }
 
     fn decode_to_output(&mut self, main: &[u8], aux: &[u8]) -> Result<Option<usize>> {
+        let t0 = std::time::Instant::now();
         let main_done = self.timeline.advance();
-        let Some(main_img) = self.main.decode(main, &self.timeline, main_done)? else { return Ok(None) };
+        let Some(main_img) = self.main.decode(main, &self.timeline, main_done)? else {
+            return Ok(None);
+        };
+        let t_main = t0.elapsed();
         let (aux_img, wait) = match &mut self.aux {
             Some(dec) => {
                 let aux_done = self.timeline.advance();
@@ -220,20 +272,28 @@ impl Decoder {
             }
             None => (None, main_done),
         };
+        let t_aux = t0.elapsed() - t_main;
         let idx = self.next_output;
         self.next_output = (self.next_output + 1) % DISPLAY_RING;
         let (dst, _) = &self.outputs[idx];
         let (recombine, w, h) = (&self.recombine, self.width, self.height);
-        self.compute.run(self.timeline.semaphore, Some(wait), None, true, |cmd| {
-            main_img.transition(cmd, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-            if let Some(a) = aux_img {
-                a.transition(cmd, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-            }
-            dst.transition(cmd, vk::ImageLayout::GENERAL);
-            recombine.record(cmd, main_img, aux_img, dst, w, h)?;
-            dst.memory_barrier(cmd);
-            Ok(())
-        })?;
+        self.compute
+            .run(self.timeline.semaphore, Some(wait), None, true, |cmd| {
+                main_img.transition(cmd, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+                if let Some(a) = aux_img {
+                    a.transition(cmd, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+                }
+                dst.transition(cmd, vk::ImageLayout::GENERAL);
+                recombine.record(cmd, main_img, aux_img, dst, w, h)?;
+                dst.memory_barrier(cmd);
+                Ok(())
+            })?;
+        tracing::debug!(
+            submit_main_us = t_main.as_micros(),
+            submit_aux_us = t_aux.as_micros(),
+            total_us = t0.elapsed().as_micros(),
+            "decode + recombine"
+        );
         Ok(Some(idx))
     }
 }
@@ -253,4 +313,3 @@ impl Drop for Encoder {
         let _ = self.compute.wait();
     }
 }
-

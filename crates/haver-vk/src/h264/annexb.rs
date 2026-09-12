@@ -37,7 +37,11 @@ pub fn nal_units(data: &[u8]) -> Vec<Nal<'_>> {
                 end -= 1;
             }
             let unit = &data[body..end];
-            unit.first().map(|h| Nal { nal_type: h & 0x1f, ref_idc: (h >> 5) & 3, data: unit })
+            unit.first().map(|h| Nal {
+                nal_type: h & 0x1f,
+                ref_idc: (h >> 5) & 3,
+                data: unit,
+            })
         })
         .collect()
 }
@@ -52,9 +56,14 @@ mod tests {
 
     #[test]
     fn splits_units() {
-        let s = [0, 0, 0, 1, 0x67, 1, 2, 0, 0, 1, 0x68, 3, 0, 0, 0, 1, 0x65, 9, 9];
+        let s = [
+            0, 0, 0, 1, 0x67, 1, 2, 0, 0, 1, 0x68, 3, 0, 0, 0, 1, 0x65, 9, 9,
+        ];
         let units = nal_units(&s);
-        let v: Vec<(u8, u8, usize)> = units.iter().map(|n| (n.nal_type, n.ref_idc, n.data.len())).collect();
+        let v: Vec<(u8, u8, usize)> = units
+            .iter()
+            .map(|n| (n.nal_type, n.ref_idc, n.data.len()))
+            .collect();
         assert_eq!(v, vec![(NAL_SPS, 3, 3), (NAL_PPS, 3, 2), (NAL_IDR, 3, 3)]);
     }
 }

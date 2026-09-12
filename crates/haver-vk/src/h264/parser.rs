@@ -21,7 +21,12 @@ pub struct ScalingLists {
 
 impl Default for ScalingLists {
     fn default() -> Self {
-        Self { present_mask: 0, use_default_mask: 0, list_4x4: [[0; 16]; 6], list_8x8: [[0; 64]; 6] }
+        Self {
+            present_mask: 0,
+            use_default_mask: 0,
+            list_4x4: [[0; 16]; 6],
+            list_8x8: [[0; 64]; 6],
+        }
     }
 }
 
@@ -67,7 +72,10 @@ impl Sps {
     /// Coded (macroblock-aligned) size.
     pub fn coded_size(&self) -> (u32, u32) {
         let mult = if self.frame_mbs_only { 1 } else { 2 };
-        ((self.pic_width_in_mbs_minus1 + 1) * 16, (self.pic_height_in_map_units_minus1 + 1) * 16 * mult)
+        (
+            (self.pic_width_in_mbs_minus1 + 1) * 16,
+            (self.pic_height_in_map_units_minus1 + 1) * 16 * mult,
+        )
     }
 
     /// Displayed size after cropping (4:2:0, frame pictures).
@@ -187,10 +195,18 @@ fn scaling_lists(r: &mut BitReader, count: usize) -> Result<ScalingLists> {
 pub fn parse_sps(nal: &[u8]) -> Result<Sps> {
     let rbsp = unescape_rbsp(nal.get(1..).ok_or(Error::Bitstream("empty SPS"))?);
     let mut r = BitReader::new(&rbsp);
-    let mut sps = Sps { profile_idc: r.bits(8)? as u8, constraint_flags: r.bits(8)? as u8, level_idc: r.bits(8)? as u8, ..Default::default() };
+    let mut sps = Sps {
+        profile_idc: r.bits(8)? as u8,
+        constraint_flags: r.bits(8)? as u8,
+        level_idc: r.bits(8)? as u8,
+        ..Default::default()
+    };
     sps.sps_id = r.ue()? as u8;
     sps.chroma_format_idc = 1;
-    if matches!(sps.profile_idc, 100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135) {
+    if matches!(
+        sps.profile_idc,
+        100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135
+    ) {
         sps.chroma_format_idc = r.ue()? as u8;
         if sps.chroma_format_idc == 3 {
             sps.separate_colour_plane = r.bit()?;
@@ -235,7 +251,10 @@ pub fn parse_sps(nal: &[u8]) -> Result<Sps> {
     if !sps.frame_mbs_only {
         return Err(Error::Bitstream("interlaced streams are not supported"));
     }
-    if sps.chroma_format_idc != 1 || sps.bit_depth_luma_minus8 != 0 || sps.bit_depth_chroma_minus8 != 0 {
+    if sps.chroma_format_idc != 1
+        || sps.bit_depth_luma_minus8 != 0
+        || sps.bit_depth_chroma_minus8 != 0
+    {
         return Err(Error::Bitstream("only 8-bit 4:2:0 is supported"));
     }
     Ok(sps)
@@ -246,7 +265,11 @@ pub fn parse_sps(nal: &[u8]) -> Result<Sps> {
 pub fn parse_pps(nal: &[u8], sps_for: impl Fn(u8) -> Option<Sps>) -> Result<Pps> {
     let rbsp = unescape_rbsp(nal.get(1..).ok_or(Error::Bitstream("empty PPS"))?);
     let mut r = BitReader::new(&rbsp);
-    let mut pps = Pps { pps_id: r.ue()? as u8, sps_id: r.ue()? as u8, ..Default::default() };
+    let mut pps = Pps {
+        pps_id: r.ue()? as u8,
+        sps_id: r.ue()? as u8,
+        ..Default::default()
+    };
     let sps = sps_for(pps.sps_id).ok_or(Error::Bitstream("PPS refers to an unknown SPS"))?;
     pps.entropy_coding_mode = r.bit()?;
     pps.bottom_field_pic_order_in_frame_present = r.bit()?;
@@ -267,7 +290,8 @@ pub fn parse_pps(nal: &[u8], sps_for: impl Fn(u8) -> Option<Sps>) -> Result<Pps>
     if r.more_rbsp_data() {
         pps.transform_8x8_mode = r.bit()?;
         if r.bit()? {
-            let count = 6 + if sps.chroma_format_idc != 3 { 2 } else { 6 } * pps.transform_8x8_mode as usize;
+            let count = 6 + if sps.chroma_format_idc != 3 { 2 } else { 6 }
+                * pps.transform_8x8_mode as usize;
             pps.scaling_lists = Some(scaling_lists(&mut r, count)?);
         }
         pps.second_chroma_qp_index_offset = r.se()? as i8;
@@ -276,11 +300,18 @@ pub fn parse_pps(nal: &[u8], sps_for: impl Fn(u8) -> Option<Sps>) -> Result<Pps>
 }
 
 /// Parse a slice header up to and including `dec_ref_pic_marking`.
-pub fn parse_slice_header(nal: &[u8], pps_for: impl Fn(u8) -> Option<(Pps, Sps)>) -> Result<SliceHeader> {
+pub fn parse_slice_header(
+    nal: &[u8],
+    pps_for: impl Fn(u8) -> Option<(Pps, Sps)>,
+) -> Result<SliceHeader> {
     let header = *nal.first().ok_or(Error::Bitstream("empty slice"))?;
     let rbsp = unescape_rbsp(&nal[1..]);
     let mut r = BitReader::new(&rbsp);
-    let mut sh = SliceHeader { nal_type: header & 0x1f, ref_idc: (header >> 5) & 3, ..Default::default() };
+    let mut sh = SliceHeader {
+        nal_type: header & 0x1f,
+        ref_idc: (header >> 5) & 3,
+        ..Default::default()
+    };
     sh.first_mb_in_slice = r.ue()?;
     sh.slice_type = match r.ue()? % 5 {
         0 => Some(SliceType::P),
@@ -288,9 +319,12 @@ pub fn parse_slice_header(nal: &[u8], pps_for: impl Fn(u8) -> Option<(Pps, Sps)>
         2 => Some(SliceType::I),
         _ => None,
     };
-    let Some(slice_type) = sh.slice_type else { return Err(Error::Bitstream("SP/SI slices are not supported")) };
+    let Some(slice_type) = sh.slice_type else {
+        return Err(Error::Bitstream("SP/SI slices are not supported"));
+    };
     sh.pps_id = r.ue()? as u8;
-    let (pps, sps) = pps_for(sh.pps_id).ok_or(Error::Bitstream("slice refers to an unknown PPS"))?;
+    let (pps, sps) =
+        pps_for(sh.pps_id).ok_or(Error::Bitstream("slice refers to an unknown PPS"))?;
     if sps.separate_colour_plane {
         r.bits(2)?;
     }
@@ -334,8 +368,16 @@ pub fn parse_slice_header(nal: &[u8], pps_for: impl Fn(u8) -> Option<(Pps, Sps)>
     if slice_type == SliceType::B {
         skip_ref_pic_list_modification(&mut r)?;
     }
-    if (pps.weighted_pred && slice_type == SliceType::P) || (pps.weighted_bipred_idc == 1 && slice_type == SliceType::B) {
-        skip_pred_weight_table(&mut r, &sps, sh.num_ref_idx_l0_active_minus1, num_l1, slice_type == SliceType::B)?;
+    if (pps.weighted_pred && slice_type == SliceType::P)
+        || (pps.weighted_bipred_idc == 1 && slice_type == SliceType::B)
+    {
+        skip_pred_weight_table(
+            &mut r,
+            &sps,
+            sh.num_ref_idx_l0_active_minus1,
+            num_l1,
+            slice_type == SliceType::B,
+        )?;
     }
     if sh.is_reference() {
         if sh.is_idr() {
@@ -348,7 +390,13 @@ pub fn parse_slice_header(nal: &[u8], pps_for: impl Fn(u8) -> Option<(Pps, Sps)>
                 if op == 0 {
                     break;
                 }
-                let mut m = Mmco { op, difference_of_pic_nums_minus1: 0, long_term_pic_num: 0, long_term_frame_idx: 0, max_long_term_frame_idx_plus1: 0 };
+                let mut m = Mmco {
+                    op,
+                    difference_of_pic_nums_minus1: 0,
+                    long_term_pic_num: 0,
+                    long_term_frame_idx: 0,
+                    max_long_term_frame_idx_plus1: 0,
+                };
                 if op == 1 || op == 3 {
                     m.difference_of_pic_nums_minus1 = r.ue()?;
                 }
@@ -385,7 +433,13 @@ fn skip_ref_pic_list_modification(r: &mut BitReader) -> Result<()> {
     Ok(())
 }
 
-fn skip_pred_weight_table(r: &mut BitReader, sps: &Sps, num_l0: u8, num_l1: u8, b: bool) -> Result<()> {
+fn skip_pred_weight_table(
+    r: &mut BitReader,
+    sps: &Sps,
+    num_l0: u8,
+    num_l1: u8,
+    b: bool,
+) -> Result<()> {
     r.ue()?; // luma_log2_weight_denom
     if sps.chroma_format_idc != 0 {
         r.ue()?;
@@ -416,7 +470,11 @@ mod tests {
     const STREAM: &[u8] = include_bytes!("testdata/x264-64x64.264");
 
     fn unit(t: u8) -> &'static [u8] {
-        nal_units(STREAM).into_iter().find(|n| n.nal_type == t).unwrap().data
+        nal_units(STREAM)
+            .into_iter()
+            .find(|n| n.nal_type == t)
+            .unwrap()
+            .data
     }
 
     #[test]

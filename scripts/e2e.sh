@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # End-to-end test for haver. Must run inside a Hyprland session (it starts a
-# nested Hyprland as the device under test). Requires a VA-API GPU.
+# nested Hyprland as the device under test). Requires a GPU with Vulkan Video.
 #
 # It exercises, and asserts PASS on:
-#   1. haver-probe protocols / outputs / vaapi / encode-decode round-trip
-#   2. haver-probe pipeline: capture one frame and run the whole 4:4:4 codec
+#   1. haver-probe protocols / vulkan / GPU encode-decode round-trip
+#   2. haver-probe pipeline: capture one frame and run the whole GPU 4:4:4 path
 #   3. server --listen --headless  + serve-test client  (Dual420 4:4:4)
 #   4. server --listen --headless --low-bandwidth + serve-test (Single420)
 #
@@ -50,8 +50,8 @@ damage() { for i in $(seq 1 80); do hyprctl notify 1 200 0 "e2e $i" >/dev/null 2
 
 echo "== 1. probe checks =="
 $PROBE --instance "$NEST_SIG" protocols 2>/dev/null | grep -q "^PASS" || fail "protocols"
-$PROBE vaapi 2>/dev/null | grep -q "^PASS H.264 encode" || fail "vaapi encode"
-$PROBE roundtrip 2>/dev/null | grep -q "^PASS min luma PSNR" || fail "codec round-trip"
+$PROBE vulkan 2>/dev/null | grep -q "^PASS Vulkan H.264 encode" || fail "vulkan encode"
+$PROBE roundtrip 2>/dev/null | grep -q "^PASS min RGB PSNR" || fail "codec round-trip"
 echo "   probe checks PASS"
 
 echo "== 2. capture->4:4:4 pipeline =="

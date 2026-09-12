@@ -2,24 +2,22 @@
 
 use std::collections::VecDeque;
 use std::ops::ControlFlow;
+use std::os::fd::AsFd;
 use std::path::PathBuf;
-use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
-use haver_codec::color::bgra_to_yuv444;
-use haver_codec::h264::EncoderSettings;
-use haver_codec::libva::Display;
-use haver_codec::Encoder;
 use haver_proto::{
     ChromaMode, ClientCaps, ClientMsg, Codec, OutputInfo as ProtoOutput, Rect, ServerMsg,
     SessionInfo, PROTOCOL_VERSION,
 };
 use haver_transport::Framed;
-use hypr_capture::{BgraImage, CaptureConfig, CaptureEvent, Capturer};
+use haver_vk::{DmabufPlane, Encoder, EncoderSettings, Gpu};
+use hypr_capture::{CaptureConfig, CaptureEvent, CapturedFrame, Capturer};
 use hypr_input::{Axis as InAxis, Clipboard, ClipboardEvent, Input, InputCmd, InputConfig};
 use hypr_wl::Target;
 
@@ -35,7 +33,7 @@ const TEXT_MIME: &str = "text/plain;charset=utf-8";
 
 /// Events from the capture thread.
 enum Incoming {
-    Frame(BgraImage),
+    Frame(CapturedFrame),
     Cursor {
         width: u32,
         height: u32,
@@ -117,17 +115,17 @@ where
     .map_err(|e| tracing::warn!(error = %e, "clipboard bridge unavailable"))
     .ok();
 
-    let display = haver_codec::vaapi::open_display(&cfg.render_node).context("open VA display")?;
+    let gpu = Gpu::open(Some(&cfg.render_node)).context("open Vulkan device")?;
     let settings = encoder_settings(output.width, output.height, cfg.bitrate);
-    let encoder =
-        Encoder::new(display.clone(), settings.clone(), chroma).context("create encoder")?;
+    let encoder = Encoder::new(&gpu, settings.clone(), chroma == ChromaMode::Dual420)
+        .context("create encoder")?;
 
     let (mut msg_rx, mut clip_in_rx) = spawn_reader(reader);
 
     capturer.request_frame().ok();
     let mut session = Session {
         writer,
-        display,
+        gpu,
         instance,
         output,
         caps,
@@ -250,7 +248,7 @@ where
 
 struct Session<W> {
     writer: Framed<W>,
-    display: Rc<Display>,
+    gpu: Arc<Gpu>,
     instance: hypr_ipc::Instance,
     output: SessionOutput,
     caps: ClientCaps,
@@ -262,7 +260,7 @@ struct Session<W> {
     input: Input,
     capturer: Capturer,
     /// The newest captured frame not yet encoded.
-    pending: Option<BgraImage>,
+    pending: Option<CapturedFrame>,
     capture_asked: bool,
     /// Frames sent but not yet acked; bounded by `n_limit` for pacing.
     in_flight: u32,
@@ -354,8 +352,12 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         self.output.width = width;
         self.output.height = height;
         self.settings = encoder_settings(width, height, self.bitrate);
-        self.encoder = Encoder::new(self.display.clone(), self.settings.clone(), self.chroma)
-            .context("reconfigure encoder")?;
+        self.encoder = Encoder::new(
+            &self.gpu,
+            self.settings.clone(),
+            self.chroma == ChromaMode::Dual420,
+        )
+        .context("reconfigure encoder")?;
         self.inject(InputCmd::SetExtent { width, height });
         self.pending = None;
         self.want_keyframe = true;
@@ -425,12 +427,11 @@ impl<W: AsyncWrite + Unpin> Session<W> {
     /// ask the capture thread for the next one.
     async fn pump_encoder(&mut self) -> Result<()> {
         if self.in_flight < self.n_limit {
-            if let Some(image) = self.pending.take() {
+            if let Some(frame) = self.pending.take() {
                 // A frame captured before a resize took effect is stale.
-                if (image.width, image.height)
-                    == (self.output.width as usize, self.output.height as usize)
-                {
-                    self.encode_and_send(&image).await?;
+                let info = &frame.buffer.info;
+                if (info.width & !1, info.height & !1) == (self.output.width, self.output.height) {
+                    self.encode_and_send(&frame).await?;
                 }
             }
         }
@@ -441,12 +442,27 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         Ok(())
     }
 
-    async fn encode_and_send(&mut self, image: &BgraImage) -> Result<()> {
+    async fn encode_and_send(&mut self, frame: &CapturedFrame) -> Result<()> {
         let (width, height) = (self.output.width, self.output.height);
-        let src = bgra_to_yuv444(&image.pixels, image.width * 4, image.width, image.height);
+        let info = &frame.buffer.info;
+        let fourcc = drm_fourcc::DrmFourcc::try_from(info.fourcc).map_err(|_| {
+            anyhow::anyhow!("capture fourcc {:#x} is not a DRM format", info.fourcc)
+        })?;
+        let plane = DmabufPlane {
+            fd: info.fd.as_fd(),
+            width: info.width,
+            height: info.height,
+            offset: info.planes[0].offset,
+            stride: info.planes[0].stride,
+            fourcc,
+            modifier: info.modifier,
+        };
+        // The import is cached per ring buffer; the generation changes when
+        // the ring is reallocated (resize), so old imports are never reused.
+        let buffer_key = (frame.buffer.generation << 32) | frame.buffer.index as u64;
         let key = std::mem::take(&mut self.want_keyframe);
         let t0 = Instant::now();
-        let encoded = self.encoder.encode(&src, self.frame_id, key)?;
+        let encoded = self.encoder.encode_dmabuf(buffer_key, &plane, key)?;
         let enc_us = t0.elapsed().as_micros();
         let aux = encoded.aux.unwrap_or_default();
         let msg = ServerMsg::VideoFrame {
@@ -530,7 +546,6 @@ fn encoder_settings(width: u32, height: u32, bitrate: Option<u32>) -> EncoderSet
         height,
         bitrate: bitrate.unwrap_or_else(|| EncoderSettings::default_bitrate(width, height, 60)),
         framerate: 60,
-        low_power: false,
     }
 }
 
@@ -604,10 +619,7 @@ fn start_capture(
     cc.cursor = true;
     let sink = Box::new(move |ev: CaptureEvent| {
         let msg = match ev {
-            CaptureEvent::Frame(frame) => match frame.buffer.read_bgra() {
-                Ok(image) => Incoming::Frame(image),
-                Err(e) => Incoming::Error(e.to_string()),
-            },
+            CaptureEvent::Frame(frame) => Incoming::Frame(frame),
             CaptureEvent::CursorShape {
                 width,
                 height,

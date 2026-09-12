@@ -12,6 +12,7 @@ workspace = true
 serde.workspace = true
 postcard.workspace = true
 thiserror.workspace = true
+rayon.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

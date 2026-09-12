@@ -48,7 +48,6 @@ pub struct Gpu {
     pub(crate) decode: ash::khr::video_decode_queue::Device,
     pub(crate) external_fd: ash::khr::external_memory_fd::Device,
     pub(crate) drm_modifier: ash::ext::image_drm_format_modifier::Device,
-    pub(crate) has_foreign_queue: bool,
     pub name: String,
     pub driver: String,
     _entry: ash::Entry,
@@ -66,7 +65,6 @@ const OPTIONAL_EXTENSIONS: &[&CStr] = &[
     ash::khr::video_encode_h264::NAME,
     ash::khr::video_decode_queue::NAME,
     ash::khr::video_decode_h264::NAME,
-    ash::ext::queue_family_foreign::NAME,
 ];
 
 impl Gpu {
@@ -76,8 +74,13 @@ impl Gpu {
         // NUL-terminated names; nothing outlives the entry it came from.
         unsafe {
             let entry = ash::Entry::load()?;
-            let app = vk::ApplicationInfo::default().application_name(c"haver").api_version(vk::API_VERSION_1_3);
-            let instance = entry.create_instance(&vk::InstanceCreateInfo::default().application_info(&app), None)?;
+            let app = vk::ApplicationInfo::default()
+                .application_name(c"haver")
+                .api_version(vk::API_VERSION_1_3);
+            let instance = entry.create_instance(
+                &vk::InstanceCreateInfo::default().application_info(&app),
+                None,
+            )?;
             let wanted = render_node.and_then(drm_dev_number);
             let mut chosen = None;
             for pd in instance.enumerate_physical_devices()? {
@@ -85,8 +88,10 @@ impl Gpu {
                     let mut drm = vk::PhysicalDeviceDrmPropertiesEXT::default();
                     let mut props = vk::PhysicalDeviceProperties2::default().push_next(&mut drm);
                     instance.get_physical_device_properties2(pd, &mut props);
-                    let matches = (drm.has_render == vk::TRUE && (drm.render_major, drm.render_minor) == want)
-                        || (drm.has_primary == vk::TRUE && (drm.primary_major, drm.primary_minor) == want);
+                    let matches = (drm.has_render == vk::TRUE
+                        && (drm.render_major, drm.render_minor) == want)
+                        || (drm.has_primary == vk::TRUE
+                            && (drm.primary_major, drm.primary_minor) == want);
                     if !matches {
                         continue;
                     }
@@ -94,29 +99,47 @@ impl Gpu {
                 let exts: Vec<String> = instance
                     .enumerate_device_extension_properties(pd)?
                     .iter()
-                    .map(|e| CStr::from_ptr(e.extension_name.as_ptr()).to_string_lossy().into_owned())
+                    .map(|e| {
+                        CStr::from_ptr(e.extension_name.as_ptr())
+                            .to_string_lossy()
+                            .into_owned()
+                    })
                     .collect();
                 let has = |n: &CStr| exts.iter().any(|e| e.as_str() == n.to_str().unwrap_or(""));
                 if !REQUIRED_EXTENSIONS.iter().all(|n| has(n)) {
                     continue;
                 }
-                let Some(families) = pick_families(&instance, pd) else { continue };
+                let Some(families) = pick_families(&instance, pd) else {
+                    continue;
+                };
                 chosen = Some((pd, families, exts));
                 break;
             }
             let Some((physical, families, exts)) = chosen else {
                 instance.destroy_instance(None);
-                return Err(Error::NoDevice("no Vulkan device with a compute queue, dmabuf import and video queues"));
+                return Err(Error::NoDevice(
+                    "no Vulkan device with a compute queue, dmabuf import and video queues",
+                ));
             };
             let has = |n: &CStr| exts.iter().any(|e| e.as_str() == n.to_str().unwrap_or(""));
-            let mut names: Vec<*const c_char> = REQUIRED_EXTENSIONS.iter().map(|n| n.as_ptr()).collect();
-            names.extend(OPTIONAL_EXTENSIONS.iter().filter(|n| has(n)).map(|n| n.as_ptr()));
+            let mut names: Vec<*const c_char> =
+                REQUIRED_EXTENSIONS.iter().map(|n| n.as_ptr()).collect();
+            names.extend(
+                OPTIONAL_EXTENSIONS
+                    .iter()
+                    .filter(|n| has(n))
+                    .map(|n| n.as_ptr()),
+            );
 
             let priority = [1.0f32];
             let queue_infos: Vec<vk::DeviceQueueCreateInfo> = families
                 .all()
                 .into_iter()
-                .map(|f| vk::DeviceQueueCreateInfo::default().queue_family_index(f).queue_priorities(&priority))
+                .map(|f| {
+                    vk::DeviceQueueCreateInfo::default()
+                        .queue_family_index(f)
+                        .queue_priorities(&priority)
+                })
                 .collect();
             let mut f12 = vk::PhysicalDeviceVulkan12Features::default().timeline_semaphore(true);
             let mut f13 = vk::PhysicalDeviceVulkan13Features::default().synchronization2(true);
@@ -131,7 +154,9 @@ impl Gpu {
             let mut drv = vk::PhysicalDeviceDriverProperties::default();
             let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut drv);
             instance.get_physical_device_properties2(physical, &mut p2);
-            let name = CStr::from_ptr(props.device_name.as_ptr()).to_string_lossy().into_owned();
+            let name = CStr::from_ptr(props.device_name.as_ptr())
+                .to_string_lossy()
+                .into_owned();
             let driver = format!(
                 "{} {}",
                 CStr::from_ptr(drv.driver_name.as_ptr()).to_string_lossy(),
@@ -150,7 +175,6 @@ impl Gpu {
                 decode: ash::khr::video_decode_queue::Device::new(&instance, &device),
                 external_fd: ash::khr::external_memory_fd::Device::new(&instance, &device),
                 drm_modifier: ash::ext::image_drm_format_modifier::Device::new(&instance, &device),
-                has_foreign_queue: has(ash::ext::queue_family_foreign::NAME),
                 name,
                 driver,
                 families,
@@ -172,17 +196,30 @@ impl Gpu {
     }
 
     pub(crate) fn encode_family(&self) -> Result<u32> {
-        self.families.encode.ok_or_else(|| Error::Unsupported("no video encode queue".into()))
+        self.families
+            .encode
+            .ok_or_else(|| Error::Unsupported("no video encode queue".into()))
     }
 
     pub(crate) fn decode_family(&self) -> Result<u32> {
-        self.families.decode.ok_or_else(|| Error::Unsupported("no video decode queue".into()))
+        self.families
+            .decode
+            .ok_or_else(|| Error::Unsupported("no video decode queue".into()))
     }
 
     /// Index of a memory type allowed by `type_bits` with all of `flags`.
-    pub(crate) fn memory_type(&self, type_bits: u32, flags: vk::MemoryPropertyFlags) -> Result<u32> {
+    pub(crate) fn memory_type(
+        &self,
+        type_bits: u32,
+        flags: vk::MemoryPropertyFlags,
+    ) -> Result<u32> {
         (0..self.memory.memory_type_count)
-            .find(|&i| type_bits & (1 << i) != 0 && self.memory.memory_types[i as usize].property_flags.contains(flags))
+            .find(|&i| {
+                type_bits & (1 << i) != 0
+                    && self.memory.memory_types[i as usize]
+                        .property_flags
+                        .contains(flags)
+            })
             .ok_or_else(|| Error::Unsupported(format!("no memory type for {flags:?}")))
     }
 
@@ -237,7 +274,9 @@ fn drm_dev_number(path: &Path) -> Option<(i64, i64)> {
 fn pick_families(instance: &ash::Instance, pd: vk::PhysicalDevice) -> Option<Families> {
     // SAFETY: valid physical device; the structs are properly chained.
     let (props, video) = unsafe {
-        let n = instance.get_physical_device_queue_family_properties(pd).len();
+        let n = instance
+            .get_physical_device_queue_family_properties(pd)
+            .len();
         let mut video = vec![vk::QueueFamilyVideoPropertiesKHR::default(); n];
         let mut props = vec![vk::QueueFamilyProperties2::default(); n];
         for (p, v) in props.iter_mut().zip(video.iter_mut()) {
@@ -248,11 +287,26 @@ fn pick_families(instance: &ash::Instance, pd: vk::PhysicalDevice) -> Option<Fam
     };
     let flags = |i: usize| props[i].queue_family_properties.queue_flags;
     let compute = (0..props.len())
-        .find(|&i| flags(i).contains(vk::QueueFlags::COMPUTE) && !flags(i).contains(vk::QueueFlags::GRAPHICS))
+        .find(|&i| {
+            flags(i).contains(vk::QueueFlags::COMPUTE)
+                && !flags(i).contains(vk::QueueFlags::GRAPHICS)
+        })
         .or_else(|| (0..props.len()).find(|&i| flags(i).contains(vk::QueueFlags::COMPUTE)))?;
-    let encode = (0..props.len()).find(|&i| video[i].video_codec_operations.contains(vk::VideoCodecOperationFlagsKHR::ENCODE_H264));
-    let decode = (0..props.len()).find(|&i| video[i].video_codec_operations.contains(vk::VideoCodecOperationFlagsKHR::DECODE_H264));
-    Some(Families { compute: compute as u32, encode: encode.map(|i| i as u32), decode: decode.map(|i| i as u32) })
+    let encode = (0..props.len()).find(|&i| {
+        video[i]
+            .video_codec_operations
+            .contains(vk::VideoCodecOperationFlagsKHR::ENCODE_H264)
+    });
+    let decode = (0..props.len()).find(|&i| {
+        video[i]
+            .video_codec_operations
+            .contains(vk::VideoCodecOperationFlagsKHR::DECODE_H264)
+    });
+    Some(Families {
+        compute: compute as u32,
+        encode: encode.map(|i| i as u32),
+        decode: decode.map(|i| i as u32),
+    })
 }
 
 /// A command pool plus a fence, for one-shot submissions on one queue.
@@ -268,11 +322,21 @@ impl Commands {
         // SAFETY: valid device and family index. The fence starts signalled
         // so the first `run` does not wait on work that was never submitted.
         let (pool, fence) = unsafe {
-            let info = vk::CommandPoolCreateInfo::default().queue_family_index(family).flags(vk::CommandPoolCreateFlags::TRANSIENT);
+            let info = vk::CommandPoolCreateInfo::default()
+                .queue_family_index(family)
+                .flags(vk::CommandPoolCreateFlags::TRANSIENT);
             let fence = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
-            (gpu.device.create_command_pool(&info, None)?, gpu.device.create_fence(&fence, None)?)
+            (
+                gpu.device.create_command_pool(&info, None)?,
+                gpu.device.create_fence(&fence, None)?,
+            )
         };
-        Ok(Self { gpu: gpu.clone(), pool, queue, fence })
+        Ok(Self {
+            gpu: gpu.clone(),
+            pool,
+            queue,
+            fence,
+        })
     }
 
     /// Record with `f` and submit. Waits for `wait` (a timeline value) first
@@ -294,22 +358,42 @@ impl Commands {
             dev.wait_for_fences(&[self.fence], true, u64::MAX)?;
             dev.reset_fences(&[self.fence])?;
             dev.reset_command_pool(self.pool, vk::CommandPoolResetFlags::empty())?;
-            let alloc = vk::CommandBufferAllocateInfo::default().command_pool(self.pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1);
+            let alloc = vk::CommandBufferAllocateInfo::default()
+                .command_pool(self.pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
             let cmd = dev.allocate_command_buffers(&alloc)?[0];
-            dev.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
+            dev.begin_command_buffer(
+                cmd,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )?;
             f(cmd)?;
             dev.end_command_buffer(cmd)?;
 
             let waits: Vec<vk::SemaphoreSubmitInfo> = wait
-                .map(|v| vk::SemaphoreSubmitInfo::default().semaphore(timeline).value(v).stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS))
+                .map(|v| {
+                    vk::SemaphoreSubmitInfo::default()
+                        .semaphore(timeline)
+                        .value(v)
+                        .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                })
                 .into_iter()
                 .collect();
             let signals: Vec<vk::SemaphoreSubmitInfo> = signal
-                .map(|v| vk::SemaphoreSubmitInfo::default().semaphore(timeline).value(v).stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS))
+                .map(|v| {
+                    vk::SemaphoreSubmitInfo::default()
+                        .semaphore(timeline)
+                        .value(v)
+                        .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                })
                 .into_iter()
                 .collect();
             let cmds = [vk::CommandBufferSubmitInfo::default().command_buffer(cmd)];
-            let submit = vk::SubmitInfo2::default().wait_semaphore_infos(&waits).command_buffer_infos(&cmds).signal_semaphore_infos(&signals);
+            let submit = vk::SubmitInfo2::default()
+                .wait_semaphore_infos(&waits)
+                .command_buffer_infos(&cmds)
+                .signal_semaphore_infos(&signals);
             dev.queue_submit2(self.queue, &[submit], self.fence)?;
             if block {
                 dev.wait_for_fences(&[self.fence], true, u64::MAX)?;
@@ -320,7 +404,11 @@ impl Commands {
 
     pub(crate) fn wait(&self) -> Result<()> {
         // SAFETY: valid fence.
-        unsafe { self.gpu.device.wait_for_fences(&[self.fence], true, u64::MAX)? };
+        unsafe {
+            self.gpu
+                .device
+                .wait_for_fences(&[self.fence], true, u64::MAX)?
+        };
         Ok(())
     }
 }
@@ -329,7 +417,10 @@ impl Drop for Commands {
     fn drop(&mut self) {
         // SAFETY: wait for in-flight work before destroying the pool.
         unsafe {
-            let _ = self.gpu.device.wait_for_fences(&[self.fence], true, u64::MAX);
+            let _ = self
+                .gpu
+                .device
+                .wait_for_fences(&[self.fence], true, u64::MAX);
             self.gpu.device.destroy_fence(self.fence, None);
             self.gpu.device.destroy_command_pool(self.pool, None);
         }
@@ -345,11 +436,17 @@ pub(crate) struct Timeline {
 
 impl Timeline {
     pub(crate) fn new(gpu: &Arc<Gpu>) -> Result<Self> {
-        let mut kind = vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE).initial_value(0);
+        let mut kind = vk::SemaphoreTypeCreateInfo::default()
+            .semaphore_type(vk::SemaphoreType::TIMELINE)
+            .initial_value(0);
         let info = vk::SemaphoreCreateInfo::default().push_next(&mut kind);
         // SAFETY: valid device and create info.
         let semaphore = unsafe { gpu.device.create_semaphore(&info, None) }?;
-        Ok(Self { gpu: gpu.clone(), semaphore, next: 0 })
+        Ok(Self {
+            gpu: gpu.clone(),
+            semaphore,
+            next: 0,
+        })
     }
 
     /// The next value to signal.

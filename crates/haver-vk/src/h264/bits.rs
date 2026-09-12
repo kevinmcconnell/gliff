@@ -29,7 +29,10 @@ impl<'a> BitReader<'a> {
     }
 
     pub fn bit(&mut self) -> Result<bool> {
-        let byte = self.data.get(self.pos / 8).ok_or(Error::Bitstream("unexpected end of header"))?;
+        let byte = self
+            .data
+            .get(self.pos / 8)
+            .ok_or(Error::Bitstream("unexpected end of header"))?;
         let bit = (byte >> (7 - self.pos % 8)) & 1;
         self.pos += 1;
         Ok(bit == 1)
@@ -105,7 +108,10 @@ mod tests {
 
     #[test]
     fn unescapes() {
-        assert_eq!(unescape_rbsp(&[0, 0, 3, 1, 0, 0, 3, 0, 0, 3]), vec![0, 0, 1, 0, 0, 0, 0]);
+        assert_eq!(
+            unescape_rbsp(&[0, 0, 3, 1, 0, 0, 3, 0, 0, 3]),
+            vec![0, 0, 1, 0, 0, 0, 0]
+        );
         assert_eq!(unescape_rbsp(&[0, 0, 3, 3]), vec![0, 0, 3]);
     }
 }

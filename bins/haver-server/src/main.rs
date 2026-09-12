@@ -35,7 +35,7 @@ struct Cli {
     /// Hyprland instance signature (default: newest).
     #[arg(long)]
     instance: Option<String>,
-    /// DRM render node for VA-API and GBM.
+    /// DRM render node for Vulkan and GBM.
     #[arg(long)]
     render_node: Option<PathBuf>,
     /// Single 4:2:0 stream instead of 4:4:4 (lower bandwidth).
@@ -68,7 +68,7 @@ fn main() -> Result<()> {
     let cfg = session::Config {
         target,
         output: cli.output.clone(),
-        render_node: haver_codec::vaapi::render_node(cli.render_node.as_deref()),
+        render_node: hypr_capture::render_node(cli.render_node.as_deref()),
         low_bandwidth: cli.low_bandwidth,
         bitrate: cli.bitrate,
     };
