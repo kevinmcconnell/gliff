@@ -1,72 +1,75 @@
 # Hardware and driver quirks
 
-haver targets VA-API on both ends. VA-API behaviour differs between drivers, so
-this file records what we have found and where more testing is needed. Findings
-so far come from **one** machine:
+haver targets Vulkan Video on both ends. Driver behaviour differs, so this
+file records what we have found and where more testing is needed. Findings so
+far come from **one** machine:
 
-- GPU: AMD Granite Ridge iGPU (Ryzen 9 9955HX), VCN 4/5 class.
-- Driver: Mesa `radeonsi` VA-API 26.2, libva 2.24, kernel 7.2.
+- GPU: AMD Granite Ridge iGPU (Ryzen 9 9955HX), VCN 4 class.
+- Driver: Mesa RADV 26.2 (Vulkan 1.4), kernel 7.2.
 - Compositor: Hyprland 0.56.2.
 
-## Confirmed on AMD radeonsi
+`haver-probe vulkan` prints the device and its video queues; the throwaway
+capability dump that informed the design is summarised in
+`docs/vulkan-plan.md`.
 
-### Encoder needs CBR, not CQP (blocker, fixed)
-cros-codecs' constant-QP path sends the rate-control buffer with
-`bits_per_second = 0`. On radeonsi this makes the H.264 encoder compress the
-luma range: a decoded pixel comes back as `input / 2 + 64` (a constant 64 in,
-say, 96 out). It is a clean, deterministic transform, not quantisation.
-ffmpeg's own `h264_vaapi` encodes the same input correctly, so the hardware is
-fine; the fault is the CQP setup. **Fix:** haver drives the encoder in CBR
-(`RateControl::ConstantBitrate`). With CBR a synthetic ramp round-trips at
-about 52 dB PSNR. `haver-codec` therefore has no CQP path.
-- **Needs testing on Intel:** whether Intel media-driver also needs CBR, or
-  whether CQP works there. If CQP works on Intel, make the mode driver-gated.
+## Confirmed on AMD RADV
 
-### Encoder zeroes the slice NAL header byte (fixed)
-The radeonsi encoder returns each coded slice with its NAL unit header byte set
-to `0x00`, because cros-codecs does not supply a packed slice header. haver
-rewrites it: IDR slices to `0x65`, referenced P slices to `0x61`
-(`nal_ref_idc = 3`). See `haver-codec/src/h264.rs`.
-- **Needs testing on Intel:** Intel drivers usually return a complete NAL. The
-  rewrite only fires on a `0x00` header, so it should be a no-op there, but
-  confirm.
+### Encode input images may carry STORAGE usage (used)
+The `VK_KHR_video_encode_h264` input format query accepts
+`VIDEO_ENCODE_SRC | STORAGE` on `G8_B8R8_2PLANE_420_UNORM` with
+`MUTABLE_FORMAT | EXTENDED_USAGE`, so the split shader writes straight into
+the encoder's input planes through R8 / R8G8 plane views. Each view must be
+limited with `VkImageViewUsageCreateInfo`: the plane formats have no video
+usage and NV12 has no storage usage, so a view that inherits the image's full
+usage is invalid.
+- **Needs testing on Intel/NVIDIA:** if STORAGE is refused, fall back to
+  writing R8/R8G8 images and `vkCmdCopyImage` into the NV12 planes.
 
-### Decoder rejects a tiny placeholder context (fixed, in vendored cros-codecs)
-cros-codecs creates its first decode context at 16x16; radeonsi rejects that
-with `RESOLUTION_NOT_SUPPORTED`. The vendored copy uses 320x240. Intel accepts
-16x16, so this is harmless elsewhere.
+### Decode DPB and output are distinct
+`VK_VIDEO_DECODE_CAPABILITY_DPB_AND_OUTPUT_DISTINCT_BIT_KHR` only. The decoder
+keeps a DPB array image (`VIDEO_DECODE_DPB`) and a separate ring of output
+images (`VIDEO_DECODE_DST | SAMPLED`) the recombine shader samples. The
+coincide mode is not implemented.
+- **Needs testing:** a driver that only offers coincide mode.
 
-### NV12 allocation must be a single linear buffer (fixed)
-GBM on radeonsi refuses a multi-planar NV12 `create_buffer_object`. haver
-allocates one linear `R8` buffer of `height * 3/2` rows and places the UV plane
-at `stride * height`. Every importer we use takes explicit plane offsets, so
-this is portable, but the exact modifier handling wants checking on Intel.
+### Encode DPB must be one array image
+The encode capabilities report no `SEPARATE_REFERENCE_IMAGES`, so the two
+reference slots are layers of one image. Decode allows separate images but the
+same array layout is used for both.
 
-### Encoder input must be uploaded, not imported (fixed)
-The radeonsi encoder does not read a linear external dmabuf as its input
-surface. haver uploads NV12 into a driver-owned surface with `vaPutImage`
-(the path cros-codecs' own tests use). The zero-copy `GlSplitter` path (phase 5)
-will need a driver that accepts dmabuf encode input, or a blit into an
-encoder-owned surface.
+### Rate control must ride on every begin
+Once CBR is set with `vkCmdControlVideoCodingKHR`, every later
+`vkCmdBeginVideoCodingKHR` must carry the same `VkVideoEncodeRateControlInfoKHR`
+(+ H.264 layer info) in its pNext, or validation flags VUID 08253 and the
+result is undefined. The encoder rebuilds the chain per frame.
 
-## Vendored cros-codecs changes
+### Encoded parameter sets and slices carry no start codes
+`vkGetEncodedVideoSessionParametersKHR` and the slice output are raw NAL units;
+haver prepends `00 00 00 01` when a start code is absent, and asks for the SPS
+and PPS in two calls so each can be framed.
 
-All of the above that live inside cros-codecs are in
-`vendor/cros-codecs/README.haver.md`, plus a low-latency decode change
-(reorder-window output and access-unit-delimiter handling) and a forced-IDR
-change so a requested keyframe is a real random-access point.
+### Quality level and virtual buffer size barely matter
+On synthetic stress content the three quality levels and buffer sizes from
+500 ms to 2 s change PSNR by less than 1 dB; bitrate is what matters. The
+encoder uses quality level 0 and a 500 ms buffer.
+
+### Host memory for readback should be cached
+Reading 8 MB of BGRA back through write-combined host memory took ~25 ms;
+through `HOST_CACHED` memory it takes ~1 ms. `HostBuffer` prefers cached
+memory and falls back to write-combined. The encoder's bitstream buffer uses
+the same path.
 
 ## Not yet tested anywhere
-- Intel media-driver and Intel Mesa (`iHD`, `i965`) for every item above.
-- Native 4:4:4 encode: no AMD profile advertises it (`haver-probe vaapi` shows
-  none), so `Dual420` is the only 4:4:4 path on this GPU. Needs an Intel/again
-  GPU that advertises HEVC 4:4:4 or AV1 to exercise `Native444`.
-- Multiple GPUs / non-renderD128 nodes: `--render-node` exists but is untested.
+- Intel ANV and NVIDIA (proprietary and NVK) for every item above.
+- Native 4:4:4 encode (HEVC 4:4:4 / AV1) to retire the dual-stream split.
+- `VK_VALVE_video_encode_rgb_conversion` (exposed by RADV here): the encoder
+  converts RGB itself, which would remove the split pass for `Single420`.
+- Tiled capture buffers. The capture ring prefers linear modifiers and the
+  dmabuf import passes the modifier through, but only linear has been run.
+- Multiple GPUs / non-renderD128 nodes: `--render-node` matches the DRM
+  device number to the Vulkan physical device, untested with two GPUs.
 
-## Known limitations recorded from the code review (not yet fixed)
-
-These are low-severity and do not affect the validated paths, but are worth
-knowing before wider testing:
+## Known limitations recorded from code review (not yet fixed)
 
 - **Instance discovery tie-break.** `hypr-ipc` picks the newest instance by
   directory mtime; two Hyprland instances started within the same coarse
@@ -75,10 +78,9 @@ knowing before wider testing:
   would fail to bind. Hyprland always offers v4.
 - **Capture dmabuf uses one buffer-object fd for all planes.** Correct for the
   single-plane XRGB/ARGB formats we select; wrong if a multi-fd planar format is
-  ever chosen. The reported `Ready` modifier is the last buffer's, and buffers
-  are allocated independently, so a divergent modifier is possible in theory.
-- **Access-unit delimiter is appended, not prepended.** Each encoded access unit
-  ends with its delimiter. This works because each unit is framed and decoded
-  on its own, but differs from the usual layout.
+  ever chosen.
+- **Display ring reuse.** The client hands GTK a dmabuf from a ring of three
+  images and writes the same image again three frames later without an
+  explicit fence from GTK. A very slow compositor could show a torn frame.
 - **ssh environment.** The `--stdio` path is built but not yet tested from a cold
   machine; the ssh session must expose `WAYLAND_DISPLAY` and `XDG_RUNTIME_DIR`.

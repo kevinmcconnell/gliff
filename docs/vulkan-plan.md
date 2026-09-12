@@ -1,8 +1,45 @@
-# A Vulkan-based haver: design study
+# A Vulkan-based haver: design study and build record
 
-Status: **study only, not scheduled.** This document describes how haver would
-look if the media pipeline were rebuilt on Vulkan instead of VA-API + EGL/GL. It
-exists so the approach can be evaluated later; nothing here is built.
+Status: **built** on the `vulkan` branch in `crates/haver-vk`. The sections
+below are the original study, kept as the rationale; this first section
+records what the build found.
+
+## What was built, and what differed from the plan
+
+- Phases V0–V4 are done: the capability probe, the compute split checked
+  against the CPU reference, Vulkan encode, Vulkan decode plus recombine, and
+  the removal of VA-API, EGL/GL and the vendored crates.
+- **Driver reality (RADV, Mesa 26.2, Ryzen 9955HX).** Everything the plan
+  worried about is present with no `RADV_PERFTEST` gate: H.264/H.265 encode,
+  H.264/H.265/AV1 decode, dmabuf import with modifiers, timeline semaphores,
+  dedicated encode and decode queue families. Encode input images accept
+  `STORAGE`, so the split writes the encoder inputs directly. Decode wants DPB
+  and output distinct, and encode wants the DPB as one array image. The
+  capability dump lives in `docs/hardware-quirks.md`.
+- **The client stays on GTK.** `GdkDmabufTextureBuilder` (GTK 4.14+) takes
+  the exported BGRX dmabuf, so no Vulkan-native window was needed and
+  libadwaita stays.
+- **The H.264 parser is small.** Vulkan decode needs the SPS, PPS and the
+  slice header up to the reference marking; the parser is ~450 lines with
+  tests against an x264 stream and rejects what it cannot represent (fields,
+  slice groups, POC type 1) instead of guessing.
+- **`unsafe` is larger than `haver-gl` was** (about 4,000 lines of `haver-vk`,
+  much of it `unsafe` blocks) but stays in one crate behind plain Rust types,
+  and the validation layer runs clean.
+- **Bugs the validation layer caught** that would otherwise have been
+  device-loss guesswork: image views inheriting invalid usage, a query
+  read with the wrong count, the rate-control state missing from later
+  `vkCmdBeginVideoCodingKHR` calls, and a storage-image format mismatch.
+  Keep `vulkan-validation-layers` installed on development machines.
+- **Performance** at 1080p Dual420: ~9 ms for split plus two serial encodes,
+  ~5 ms for two decodes plus recombine, no CPU pixel work. The encodes are
+  the next thing to pipeline.
+- **Not done from the plan:** the Vulkan-native client window (not needed),
+  and the `VK_VALVE_video_encode_rgb_conversion` shortcut for `Single420`.
+
+---
+
+*Original study follows.*
 
 ## Why consider Vulkan at all
 

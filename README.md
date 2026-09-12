@@ -1,32 +1,36 @@
 # haver
 
 Remote-desktop a Hyprland session from another Hyprland machine, over SSH only.
-Custom wire protocol, VA-API hardware encode and decode, full-resolution 4:4:4
-colour by the RDP AVC444 technique (two 4:2:0 H.264 streams recombined on the
-client).
+Custom wire protocol, Vulkan Video hardware encode and decode, full-resolution
+4:4:4 colour by the RDP AVC444 technique (two 4:2:0 H.264 streams recombined on
+the client). The whole media path stays on the GPU: the captured dmabuf is
+imported into Vulkan, split by a compute shader, encoded, and on the client
+decoded, recombined by a compute shader and handed to GTK as a dmabuf.
 
 ## Status
 
-Working and validated on AMD (Ryzen Granite Ridge, Mesa radeonsi):
+Working and validated on AMD (Ryzen Granite Ridge, Mesa RADV):
 
 - Capture of a Hyprland output via `ext-image-copy-capture-v1` into GBM dmabufs.
 - Keyboard and pointer injection, with the client's xkb keymap uploaded so keys
   map identically on both ends.
-- VA-API H.264 encode and decode; Dual420 4:4:4 round-trips near-lossless, plus
-  a `--low-bandwidth` single 4:2:0 stream.
-- The full server pipeline (capture -> 4:4:4 -> two H.264 streams -> protocol)
-  and a GTK4 client that decodes, recombines, displays, forwards input, shows
-  the remote cursor, inhibits system shortcuts (release with `Shift+Esc`, set by
-  `--release-hotkey`), and auto-reconnects. Validated
-  over localhost against a nested Hyprland: connect, stream, resize, ack pacing,
-  both chroma modes.
+- Vulkan Video H.264 encode and decode (`VK_KHR_video_encode_h264`,
+  `VK_KHR_video_decode_h264`); Dual420 4:4:4 round-trips near-lossless, plus a
+  `--low-bandwidth` single 4:2:0 stream.
+- The full server pipeline (capture -> dmabuf import -> GPU split -> two H.264
+  streams -> protocol) and a GTK4 client that decodes, recombines on the GPU,
+  displays through a dmabuf texture, forwards input, shows the remote cursor,
+  inhibits system shortcuts (release with `Shift+Esc`, set by
+  `--release-hotkey`), and auto-reconnects. Validated over localhost against a
+  nested Hyprland: connect, stream, resize, ack pacing, both chroma modes.
 
 Design and the full picture are in `docs/architecture.md`; driver-specific
-behaviour and Intel test gaps are in `docs/hardware-quirks.md`.
+behaviour and test gaps are in `docs/hardware-quirks.md`; the Vulkan design
+record is `docs/vulkan-plan.md`.
 
-Not done yet: image/binary clipboard (text works both ways); the zero-copy `GlSplitter` and GL client
-recombine (needs `unsafe` GL); native single-stream 4:4:4 and AV1/HEVC (no
-encode entrypoint on this GPU); and a verified ssh-from-cold-machine path.
+Not done yet: image/binary clipboard (text works both ways); native
+single-stream 4:4:4 and AV1/HEVC; a verified ssh-from-cold-machine path; and
+testing on Intel and NVIDIA Vulkan drivers.
 
 ## Build
 
@@ -34,12 +38,21 @@ encode entrypoint on this GPU); and a verified ssh-from-cold-machine path.
 cargo build --release
 ```
 
-Needs Rust, clang (bindgen for cros-libva), and the runtime libraries in the
-PKGBUILD `depends`. Verify the machine first:
+Needs Rust and the runtime libraries in the PKGBUILD `depends`: a Vulkan
+loader and a driver with Vulkan Video (Mesa RADV 24+ on AMD). No C toolchain
+is needed; the compute shaders are committed as SPIR-V
+(`crates/haver-vk/shaders/build.sh` rebuilds them with `glslc`). Verify the
+machine first:
 
 ```
-haver-probe all          # protocols, outputs, VA-API, encode/decode round-trip
-haver-probe pipeline     # capture one frame and run the whole 4:4:4 codec
+haver-probe all          # protocols, outputs, Vulkan, GPU encode/decode round-trip
+haver-probe pipeline     # capture one frame and run the whole GPU 4:4:4 path
+```
+
+To run under the Khronos validation layer during development:
+
+```
+VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation haver-probe roundtrip
 ```
 
 ## Run (development, localhost)
@@ -75,11 +88,13 @@ Single420 server-plus-client streams.
 
 ## Layout
 
-- `crates/haver-proto` wire types, framing, AVC444 4:4:4 split/recombine.
+- `crates/haver-proto` wire types, framing, and the CPU reference for colour
+  conversion and the AVC444 4:4:4 split/recombine that the shaders must match.
 - `crates/haver-transport` framed IO, ssh spawning.
 - `crates/hypr-ipc`, `crates/hypr-wl` Hyprland IPC and shared Wayland plumbing.
 - `crates/hypr-capture` output + cursor capture into dmabufs.
 - `crates/hypr-input` keyboard and pointer injection.
-- `crates/haver-codec` VA-API encode/decode, CPU colour, Dual420.
+- `crates/haver-vk` the Vulkan media pipeline: device, dmabuf import/export,
+  split and recombine compute shaders, H.264 encode/decode, header parser.
+  The only crate with `unsafe`.
 - `bins/haver-server`, `bins/haver-client`, `tools/haver-probe`.
-- `vendor/` patched cros-libva and cros-codecs (see their `README.haver.md`).

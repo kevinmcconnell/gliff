@@ -18,10 +18,12 @@ pub fn local_keymap() -> String {
 
 fn build() -> anyhow::Result<String> {
     let inst = hypr_ipc::Instance::discover(None)?;
+    // Hyprland reports an unset string option as the literal "[[EMPTY]]".
     let opt = |name: &str| {
         inst.get_option(name)
             .ok()
             .and_then(|o| o.string)
+            .filter(|v| v != "[[EMPTY]]")
             .unwrap_or_default()
     };
     let names = KeymapNames {
