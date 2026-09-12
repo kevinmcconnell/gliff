@@ -4,6 +4,8 @@
 //! as [`frame::Nv12Frame`], and imported into VA-API by cros-codecs.
 
 pub mod annexb;
+pub mod color;
+pub mod dual;
 pub mod frame;
 pub mod h264;
 pub mod vaapi;

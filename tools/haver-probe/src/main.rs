@@ -12,6 +12,8 @@ use wayland_client::protocol::wl_registry::WlRegistry;
 use wayland_client::{Connection, Dispatch, QueueHandle};
 
 use haver_codec::frame::{FrameAllocator, FramePool};
+use haver_codec::color::{bgra_to_yuv444, psnr as bgra_psnr, yuv444_to_bgra};
+use haver_codec::dual::{DualDecoder, DualEncoder};
 use haver_codec::h264::{EncoderSettings, H264Decoder, H264Encoder};
 use haver_codec::vaapi;
 use hypr_capture::{CaptureConfig, CaptureEvent, Capturer};
@@ -76,6 +78,11 @@ enum Cmd {
         #[arg(long)]
         click: bool,
     },
+    /// Capture one output frame and run it through the full Dual420 4:4:4 codec
+    Pipeline {
+        #[arg(long)]
+        output: Option<String>,
+    },
     /// Run every non-interactive check
     All,
 }
@@ -93,6 +100,7 @@ fn main() -> Result<()> {
         Cmd::Roundtrip { width, height, frames, bitrate } => roundtrip(&node, width, height, frames, bitrate)?,
         Cmd::Capture { output, png, cursor } => capture(&target, &node, output, &png, cursor)?,
         Cmd::Input { output, text, click } => input(&target, output, &text, click)?,
+        Cmd::Pipeline { output } => pipeline(&target, &node, output)?,
         Cmd::All => {
             protocols(&target)?;
             outputs(&target)?;
@@ -268,6 +276,81 @@ fn roundtrip(node: &std::path::Path, width: u32, height: u32, frames: usize, bit
     status(min_psnr > 30.0, &format!("min luma PSNR {min_psnr:.1} dB"));
     if decoded != frames || min_psnr <= 30.0 {
         bail!("round-trip check failed");
+    }
+    Ok(())
+}
+
+fn pipeline(target: &Target, node: &std::path::Path, output: Option<String>) -> Result<()> {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let output = pick_output(target, output)?;
+    let mut cfg = CaptureConfig::new(output.clone());
+    cfg.target = target.clone();
+    cfg.render_node = node.to_path_buf();
+    cfg.cursor = false;
+    let (tx, rx) = mpsc::channel();
+    let capturer = Capturer::start(cfg, Box::new(move |ev| { let _ = tx.send(ev); }))?;
+    capturer.request_frame()?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut captured = None;
+    while std::time::Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(CaptureEvent::Frame(frame)) => {
+                let info = &frame.buffer.info;
+                let (w, h) = (info.width as usize & !1, info.height as usize & !1);
+                let fourcc = info.fourcc;
+                let bgra = frame.buffer.with_mapped(|pixels, stride| {
+                    let mut out = vec![0u8; w * h * 4];
+                    let bgr_order = matches!(&fourcc.to_le_bytes(), b"XR24" | b"AR24");
+                    for row in 0..h {
+                        let line = &pixels[row * stride as usize..row * stride as usize + w * 4];
+                        for col in 0..w {
+                            let p = &line[col * 4..col * 4 + 4];
+                            let d = &mut out[(row * w + col) * 4..(row * w + col) * 4 + 4];
+                            if bgr_order { d.copy_from_slice(p); } else { d[0]=p[2]; d[1]=p[1]; d[2]=p[0]; d[3]=p[3]; }
+                        }
+                    }
+                    out
+                })?;
+                captured = Some((w, h, bgra));
+                break;
+            }
+            Ok(CaptureEvent::Error(e)) => bail!("capture error: {e}"),
+            Ok(_) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(_) => break,
+        }
+    }
+    drop(capturer);
+    let (w, h, bgra) = captured.ok_or_else(|| anyhow!("no frame captured (a headless output renders reliably; a physical KVM output may not)"))?;
+    println!("  captured {w}x{h} from {output}");
+
+    let display = vaapi::open_display(node)?;
+    let settings = EncoderSettings { width: w as u32, height: h as u32, bitrate: EncoderSettings::default_bitrate(w as u32, h as u32, 60), framerate: 60, low_power: false };
+    let mut encoder = DualEncoder::new(display.clone(), settings).context("dual encoder")?;
+    let mut decoder = DualDecoder::new(display, w, h).context("dual decoder")?;
+
+    let src444 = bgra_to_yuv444(&bgra, w * 4, w, h);
+    let t0 = std::time::Instant::now();
+    let packet = encoder.encode(&src444, 0, true).context("encode")?;
+    let enc_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    println!("  encoded main {} bytes, aux {} bytes, key={}, {enc_ms:.1} ms", packet.main.len(), packet.aux.len(), packet.keyframe);
+    let t1 = std::time::Instant::now();
+    let out444 = decoder.decode(0, &packet.main, &packet.aux).context("decode")?.ok_or_else(|| anyhow!("dual decode produced no frame"))?;
+    let dec_ms = t1.elapsed().as_secs_f64() * 1000.0;
+
+    let y_psnr = bgra_psnr(&src444.y, &out444.y);
+    let u_psnr = bgra_psnr(&src444.u, &out444.u);
+    let v_psnr = bgra_psnr(&src444.v, &out444.v);
+    let out_bgra = yuv444_to_bgra(&out444);
+    // Compare colour channels only; the captured X byte is undefined.
+    let rgb: Vec<u8> = bgra.iter().enumerate().filter(|(i, _)| i % 4 != 3).map(|(_, b)| *b).collect();
+    let rgb_out: Vec<u8> = out_bgra.iter().enumerate().filter(|(i, _)| i % 4 != 3).map(|(_, b)| *b).collect();
+    let rgb_psnr = bgra_psnr(&rgb, &rgb_out);
+    println!("  decoded {dec_ms:.1} ms; PSNR Y {y_psnr:.1} U {u_psnr:.1} V {v_psnr:.1} dB, end-to-end RGB {rgb_psnr:.1} dB");
+    status(y_psnr > 35.0 && u_psnr > 35.0 && v_psnr > 35.0, "Dual420 4:4:4 round-trip on a captured frame");
+    if !(y_psnr > 35.0 && u_psnr > 35.0 && v_psnr > 35.0) {
+        bail!("4:4:4 pipeline PSNR too low");
     }
     Ok(())
 }

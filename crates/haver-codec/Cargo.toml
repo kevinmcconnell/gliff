@@ -11,6 +11,7 @@ workspace = true
 [dependencies]
 thiserror.workspace = true
 tracing.workspace = true
+haver-proto.workspace = true
 cros-codecs.workspace = true
 gbm.workspace = true
 drm-fourcc.workspace = true

@@ -9,3 +9,9 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+serde.workspace = true
+postcard.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
