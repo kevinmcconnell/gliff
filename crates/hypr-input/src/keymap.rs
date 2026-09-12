@@ -81,6 +81,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn builds_us_keymap_text() {
+        let text = keymap_from_names(&KeymapNames { layout: "us".into(), ..Default::default() }).unwrap();
+        assert!(text.contains("xkb_keymap"));
+        assert!(text.contains("xkb_symbols"));
+    }
+
+    #[test]
     fn shift_changes_modifiers() {
         let mut ks = KeyState::default_us().unwrap();
         const KEY_LEFTSHIFT: u32 = 42;

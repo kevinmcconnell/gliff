@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# End-to-end test for haver. Must run inside a Hyprland session (it starts a
+# nested Hyprland as the device under test). Requires a VA-API GPU.
+#
+# It exercises, and asserts PASS on:
+#   1. haver-probe protocols / outputs / vaapi / encode-decode round-trip
+#   2. haver-probe pipeline: capture one frame and run the whole 4:4:4 codec
+#   3. server --listen --headless  + serve-test client  (Dual420 4:4:4)
+#   4. server --listen --headless --low-bandwidth + serve-test (Single420)
+#
+# Exits non-zero on the first failure.
+set -uo pipefail
+cd "$(dirname "$0")/.."
+
+fail() { echo "E2E FAIL: $*" >&2; cleanup; exit 1; }
+PIDS=()
+NEST_SIG=""
+cleanup() {
+    for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done
+    [ -n "$NEST_SIG" ] && pkill -9 -f "Hyprland .*e2e-hypr.conf" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+command -v Hyprland >/dev/null || fail "Hyprland not found"
+[ -n "${WAYLAND_DISPLAY:-}" ] || fail "run inside a Wayland (Hyprland) session"
+
+echo "== building (release) =="
+cargo build --release --workspace >/dev/null 2>&1 || fail "build failed"
+PROBE=target/release/haver-probe
+SERVER=target/release/haver-server
+
+echo "== starting nested Hyprland =="
+CONF=$(mktemp --suffix=-e2e-hypr.conf)
+cat > "$CONF" <<HYPR
+monitor=,1280x800,auto,1
+misc { disable_hyprland_logo = true; disable_splash_rendering = true }
+ecosystem { no_update_news = true; no_donation_nag = true }
+HYPR
+before=$(ls "$XDG_RUNTIME_DIR/hypr" 2>/dev/null)
+WAYLAND_DISPLAY="$WAYLAND_DISPLAY" HYPRLAND_INSTANCE_SIGNATURE= setsid Hyprland -c "$CONF" >/tmp/haver-e2e-hypr.log 2>&1 &
+sleep 6
+NEST_SIG=$(ls -t "$XDG_RUNTIME_DIR/hypr" | head -1)
+[ -n "$NEST_SIG" ] || fail "nested Hyprland did not start"
+export HYPRLAND_INSTANCE_SIGNATURE="$NEST_SIG"
+export WAYLAND_DISPLAY=$(sed -n 2p "$XDG_RUNTIME_DIR/hypr/$NEST_SIG/hyprland.lock")
+echo "   nested sig $NEST_SIG on $WAYLAND_DISPLAY"
+
+damage() { for i in $(seq 1 80); do hyprctl notify 1 200 0 "e2e $i" >/dev/null 2>&1; sleep 0.1; done; }
+
+echo "== 1. probe checks =="
+$PROBE --instance "$NEST_SIG" protocols 2>/dev/null | grep -q "^PASS" || fail "protocols"
+$PROBE vaapi 2>/dev/null | grep -q "^PASS H.264 encode" || fail "vaapi encode"
+$PROBE roundtrip 2>/dev/null | grep -q "^PASS min luma PSNR" || fail "codec round-trip"
+echo "   probe checks PASS"
+
+echo "== 2. capture->4:4:4 pipeline =="
+hyprctl output create headless e2ecap >/dev/null 2>&1
+sleep 1
+HN=$(hyprctl monitors -j | python3 -c "import sys,json;print(next((m['name'] for m in json.load(sys.stdin) if 'e2ecap' in m['name'] or m['name']=='e2ecap'),''))")
+$PROBE --instance "$NEST_SIG" pipeline --output "${HN:-e2ecap}" 2>/dev/null | grep -q "^PASS" || fail "4:4:4 pipeline"
+hyprctl output remove "${HN:-e2ecap}" >/dev/null 2>&1
+echo "   pipeline PASS"
+
+run_server_test() {
+    local port=$1; shift
+    local label=$1; shift
+    "$SERVER" --listen "127.0.0.1:$port" --headless --instance "$NEST_SIG" "$@" >/tmp/haver-e2e-server.log 2>&1 &
+    local sp=$!; PIDS+=("$sp")
+    sleep 2
+    damage & local dp=$!; PIDS+=("$dp")
+    local out
+    out=$(timeout 30 $PROBE serve-test --connect "127.0.0.1:$port" --frames 8 2>&1)
+    kill "$dp" 2>/dev/null; kill "$sp" 2>/dev/null; sleep 1
+    echo "$out" | grep -q "^PASS" || fail "$label ($(echo "$out" | tail -1))"
+    echo "   $label PASS"
+}
+
+echo "== 3. server + client, Dual420 =="
+run_server_test 9040 "Dual420 stream"
+
+echo "== 4. server + client, Single420 (--low-bandwidth) =="
+run_server_test 9041 "Single420 stream" --low-bandwidth
+
+echo "E2E PASS: all checks passed"

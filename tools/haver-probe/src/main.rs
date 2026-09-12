@@ -491,6 +491,7 @@ fn input(target: &Target, output: Option<String>, text: &str, click: bool) -> Re
     Ok(())
 }
 
+#[allow(clippy::large_enum_variant)]
 enum TestDecoder {
     Dual(haver_codec::dual::DualDecoder),
     Single(haver_codec::single::SingleDecoder),

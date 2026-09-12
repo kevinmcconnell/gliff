@@ -167,6 +167,41 @@ mod tests {
         }
     }
 
+    /// A 4:4:4 frame whose chroma is constant within each 2x2 block, so a
+    /// 4:2:0 subsample then upsample is lossless.
+    fn block_constant(w: usize, h: usize) -> Yuv444 {
+        let mut f = Yuv444::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                f.y[y * w + x] = (x * 3 + y * 5) as u8;
+                let (bx, by) = (x / 2, y / 2);
+                f.u[y * w + x] = (bx * 7 + by) as u8;
+                f.v[y * w + x] = (bx + by * 11) as u8;
+            }
+        }
+        f
+    }
+
+    #[test]
+    fn single_stream_subsample_upsample_is_lossless_on_block_constant() {
+        for (w, h) in [(2, 2), (16, 16), (640, 360)] {
+            let src = block_constant(w, h);
+            let nv12 = yuv444_to_nv12(&src);
+            assert_eq!(nv12.y.len(), w * h);
+            assert_eq!(nv12.uv.len(), w * h / 2);
+            let back = nv12_to_yuv444(&nv12);
+            assert_eq!(src, back, "single-stream lossless on block-constant {w}x{h}");
+        }
+    }
+
+    #[test]
+    fn upsample_preserves_luma_exactly() {
+        let src = filled(64, 48);
+        let nv12 = yuv444_to_nv12(&src);
+        let back = nv12_to_yuv444(&nv12);
+        assert_eq!(src.y, back.y, "luma is never subsampled");
+    }
+
     #[test]
     fn sample_counts_match_444() {
         let (w, h) = (640, 360);

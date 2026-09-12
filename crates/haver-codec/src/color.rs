@@ -69,3 +69,36 @@ pub fn psnr(a: &[u8], b: &[u8]) -> f64 {
         10.0 * (255.0f64 * 255.0 / mse).log10()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bgra_yuv444_round_trip_is_high_quality() {
+        // A smooth BGRA gradient should survive BGRA->YUV444->BGRA well above
+        // visual-lossless, confirming the forward and inverse matrices match.
+        let (w, h) = (64usize, 64usize);
+        let mut bgra = vec![0u8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let p = &mut bgra[(y * w + x) * 4..(y * w + x) * 4 + 4];
+                p[0] = (x * 4) as u8;
+                p[1] = (y * 4) as u8;
+                p[2] = ((x + y) * 2) as u8;
+                p[3] = 255;
+            }
+        }
+        let yuv = bgra_to_yuv444(&bgra, w * 4, w, h);
+        let back = yuv444_to_bgra(&yuv);
+        // Compare colour channels only (alpha is forced to 255).
+        let rgb: Vec<u8> = bgra.iter().enumerate().filter(|(i, _)| i % 4 != 3).map(|(_, b)| *b).collect();
+        let rgb_out: Vec<u8> = back.iter().enumerate().filter(|(i, _)| i % 4 != 3).map(|(_, b)| *b).collect();
+        assert!(psnr(&rgb, &rgb_out) > 40.0, "colour round-trip PSNR too low: {}", psnr(&rgb, &rgb_out));
+    }
+
+    #[test]
+    fn psnr_identical_is_max() {
+        assert_eq!(psnr(&[1, 2, 3], &[1, 2, 3]), 99.0);
+    }
+}

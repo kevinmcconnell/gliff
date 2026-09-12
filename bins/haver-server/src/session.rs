@@ -414,3 +414,19 @@ impl RttEstimator {
         n.clamp(2, 8) as u32
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::RttEstimator;
+
+    #[test]
+    fn ack_window_stays_in_bounds() {
+        let rtt = RttEstimator::new();
+        // With the default smoothed RTT the window is at least 2 and never
+        // exceeds 8, for any frame rate.
+        for fps in [1u32, 30, 60, 240] {
+            let n = rtt.window(fps);
+            assert!((2..=8).contains(&n), "window {n} out of bounds at {fps} fps");
+        }
+    }
+}
