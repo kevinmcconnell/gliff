@@ -9,6 +9,7 @@ mod keymap;
 mod net;
 
 use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Receiver};
@@ -72,6 +73,9 @@ struct App {
     status: gtk::Label,
     stream_size: Rc<RefCell<(u32, u32)>>,
     input_tx: Rc<RefCell<Option<OutSender>>>,
+    /// Evdev codes currently held on the remote, so they can all be released
+    /// when the keyboard is handed back to the local compositor.
+    pressed_keys: Rc<RefCell<BTreeSet<u32>>>,
     /// Last text we set on the local clipboard from the remote, to avoid echo.
     last_remote_clip: Rc<RefCell<Option<String>>>,
     /// The last endpoint, kept so a dropped connection can be retried.
@@ -159,6 +163,7 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         status: status.clone(),
         stream_size: Rc::new(RefCell::new((0, 0))),
         input_tx: Rc::new(RefCell::new(None)),
+        pressed_keys: Rc::new(RefCell::new(BTreeSet::new())),
         endpoint: Rc::new(RefCell::new(None)),
         retries: Rc::new(RefCell::new(0)),
         last_remote_clip: Rc::new(RefCell::new(None)),
@@ -574,6 +579,24 @@ fn release_capture(ui: &App, window: &adw::ApplicationWindow) {
     ui.status.set_text("Shortcuts released — click the screen to capture again");
 }
 
+/// Release every key held on the remote. Once the video loses focus their
+/// local release events never reach us, so the remote would keep (say) Shift
+/// down until the next connection.
+fn release_pressed_keys(ui: &App) {
+    let held = std::mem::take(&mut *ui.pressed_keys.borrow_mut());
+    for code in held {
+        send(ui, ClientMsg::Key { keycode: code, pressed: false });
+    }
+}
+
+/// Record a local key event. Returns false when it should not be forwarded:
+/// an auto-repeat press (the remote compositor repeats on its own) or a
+/// release of a key whose press was never sent.
+fn track_key(ui: &App, code: u32, pressed: bool) -> bool {
+    let mut keys = ui.pressed_keys.borrow_mut();
+    if pressed { keys.insert(code) } else { keys.remove(&code) }
+}
+
 fn install_input_handlers(ui: &Rc<App>, video: &gtk::Widget, window: &adw::ApplicationWindow, hotkey: ReleaseHotkey) {
     video.set_focusable(true);
     video.set_can_focus(true);
@@ -588,17 +611,24 @@ fn install_input_handlers(ui: &Rc<App>, video: &gtk::Widget, window: &adw::Appli
         let last_tap = last_tap.clone();
         key.connect_key_pressed(move |_, keyval, keycode, state| {
             if hotkey.matches(keyval, state, &last_tap) {
+                release_pressed_keys(&ui);
                 release_capture(&ui, &window);
                 return glib::Propagation::Stop;
             }
-            send(&ui, ClientMsg::Key { keycode: keycode.saturating_sub(8), pressed: true });
+            let code = keycode.saturating_sub(8);
+            if track_key(&ui, code, true) {
+                send(&ui, ClientMsg::Key { keycode: code, pressed: true });
+            }
             glib::Propagation::Stop
         });
     }
     {
         let ui = ui.clone();
         key.connect_key_released(move |_, _keyval, keycode, _state| {
-            send(&ui, ClientMsg::Key { keycode: keycode.saturating_sub(8), pressed: false });
+            let code = keycode.saturating_sub(8);
+            if track_key(&ui, code, false) {
+                send(&ui, ClientMsg::Key { keycode: code, pressed: false });
+            }
         });
     }
     video.add_controller(key);
@@ -697,7 +727,9 @@ fn install_input_handlers(ui: &Rc<App>, video: &gtk::Widget, window: &adw::Appli
     }
     {
         let window = window.clone();
+        let ui = ui.clone();
         focus.connect_leave(move |_| {
+            release_pressed_keys(&ui);
             if let Some(toplevel) = window.surface().and_downcast::<gdk::Toplevel>() {
                 toplevel.restore_system_shortcuts();
             }
