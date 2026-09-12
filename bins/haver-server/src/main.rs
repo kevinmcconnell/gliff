@@ -58,7 +58,6 @@ fn main() -> Result<()> {
     let cfg = session::Config {
         target,
         output: cli.output.clone(),
-        headless: cli.headless,
         render_node: haver_codec::vaapi::render_node(cli.render_node.as_deref()),
         low_bandwidth: cli.low_bandwidth,
         bitrate: cli.bitrate,

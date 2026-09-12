@@ -22,7 +22,6 @@ use hypr_wl::Target;
 pub struct Config {
     pub target: Target,
     pub output: Option<String>,
-    pub headless: bool,
     pub render_node: PathBuf,
     pub low_bandwidth: bool,
     pub bitrate: Option<u32>,
@@ -106,9 +105,8 @@ where
     let mut want_keyframe = true;
     let mut rtt = RttEstimator::new();
     let mut cursor_shape_id: u32 = 0;
-    let mut capture_asked = false;
     capturer.request_frame().ok();
-    capture_asked = true;
+    let mut capture_asked = true;
 
     loop {
         tokio::select! {
@@ -258,8 +256,8 @@ fn setup_output(instance: &hypr_ipc::Instance, cfg: &Config, caps: &haver_proto:
         .find(|m| !before.contains(&m.name))
         .context("headless output did not appear")?;
     let name = m.name.clone();
-    let w = (caps.max_width.min(1920).max(320)) & !1;
-    let h = (caps.max_height.min(1080).max(240)) & !1;
+    let w = caps.max_width.clamp(320, 1920) & !1;
+    let h = caps.max_height.clamp(240, 1080) & !1;
     instance.set_monitor_mode(&name, w, h, 60, 1.0).ok();
     std::thread::sleep(Duration::from_millis(150));
     Ok((name, w, h, true))
@@ -348,6 +346,7 @@ impl RttEstimator {
 
     fn window(&self, framerate: u32) -> u32 {
         let interval_ms = 1000.0 / framerate.max(1) as f64;
-        (((self.smoothed_ms / interval_ms).ceil() as i64) + 1).clamp(2, 8) as u32
+        let n = (self.smoothed_ms / interval_ms).ceil() as i64 + 1;
+        n.clamp(2, 8) as u32
     }
 }
