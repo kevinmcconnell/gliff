@@ -16,6 +16,9 @@ use drm_fourcc::DrmFourcc;
 use glow::HasContext;
 use khronos_egl as egl;
 
+pub mod headless;
+pub use headless::Headless;
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("EGL: {0}")]
@@ -87,7 +90,7 @@ fn probe(render_node: &Path) -> Result<bool> {
     Ok(ok)
 }
 
-type ImageTargetTexture2D = extern "system" fn(u32, *mut c_void);
+pub(crate) type ImageTargetTexture2D = extern "system" fn(u32, *mut c_void);
 
 /// Recombines decoded NV12 dmabufs (or blits CPU BGRA) with one shader pass.
 /// Create it inside a current GL context (a `gtk::GLArea` render callback).
@@ -311,7 +314,7 @@ impl Drop for Renderer {
 
 /// # Safety
 /// A current GL context.
-unsafe fn new_texture(gl: &glow::Context) -> Result<glow::NativeTexture> {
+pub(crate) unsafe fn new_texture(gl: &glow::Context) -> Result<glow::NativeTexture> {
     // SAFETY: create + configure a texture on the current context.
     unsafe {
         let t = gl.create_texture().map_err(Error::Gl)?;
@@ -324,7 +327,7 @@ unsafe fn new_texture(gl: &glow::Context) -> Result<glow::NativeTexture> {
     }
 }
 
-const VERT: &str = r#"#version 300 es
+pub(crate) const VERT: &str = r#"#version 300 es
 const vec2 verts[3] = vec2[3](vec2(-1.0,-1.0), vec2(3.0,-1.0), vec2(-1.0,3.0));
 out vec2 uv;
 void main() {
@@ -392,7 +395,7 @@ void main() {
 
 /// # Safety
 /// A current GL context.
-unsafe fn build_program(gl: &glow::Context, vert: &str, frag: &str) -> Result<glow::Program> {
+pub(crate) unsafe fn build_program(gl: &glow::Context, vert: &str, frag: &str) -> Result<glow::Program> {
     // SAFETY: standard shader compile/link on the current context.
     unsafe {
         let program = gl.create_program().map_err(Error::Gl)?;

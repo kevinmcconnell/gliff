@@ -1,6 +1,7 @@
 //! Environment probe: protocols, outputs, VA-API, codec round-trip, capture,
 //! and input injection. Every check prints PASS/FAIL lines.
 
+use std::os::fd::AsFd;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -14,6 +15,7 @@ use wayland_client::{Connection, Dispatch, QueueHandle};
 use haver_codec::frame::{FrameAllocator, FramePool};
 use haver_codec::color::{bgra_to_yuv444, psnr as bgra_psnr, yuv444_to_bgra};
 use haver_codec::dual::{DualDecoder, DualEncoder};
+use haver_codec::gl_split::GlDualEncoder;
 use haver_codec::h264::{EncoderSettings, H264Decoder, H264Encoder};
 use haver_codec::vaapi;
 use hypr_capture::{CaptureConfig, CaptureEvent, Capturer};
@@ -82,6 +84,10 @@ enum Cmd {
     Pipeline {
         #[arg(long)]
         output: Option<String>,
+        /// Do the 4:4:4 split on the GPU (GL into VA surfaces) and compare
+        /// against the CPU split for correctness and speed.
+        #[arg(long)]
+        gl: bool,
     },
     /// Connect to a running `haver-server --listen` and decode a few frames
     ServeTest {
@@ -104,6 +110,8 @@ enum Cmd {
         #[arg(long, default_value_t = 100)]
         iters: usize,
     },
+    /// Feasibility test: can GL render into a VA encoder surface (dmabuf)?
+    GlTest,
     /// Run every non-interactive check
     All,
 }
@@ -121,10 +129,11 @@ fn main() -> Result<()> {
         Cmd::Roundtrip { width, height, frames, bitrate } => roundtrip(&node, width, height, frames, bitrate)?,
         Cmd::Capture { output, png, cursor } => capture(&target, &node, output, &png, cursor)?,
         Cmd::Input { output, text, click } => input(&target, output, &text, click)?,
-        Cmd::Pipeline { output } => pipeline(&target, &node, output)?,
+        Cmd::Pipeline { output, gl } => pipeline(&target, &node, output, gl)?,
         Cmd::ServeTest { connect, frames } => serve_test(&node, &connect, frames)?,
         Cmd::Clipboard { set, secs } => clipboard(&target, set, secs)?,
         Cmd::Bench { iters } => bench(iters)?,
+        Cmd::GlTest => gltest(&node)?,
         Cmd::All => {
             protocols(&target)?;
             outputs(&target)?;
@@ -304,7 +313,7 @@ fn roundtrip(node: &std::path::Path, width: u32, height: u32, frames: usize, bit
     Ok(())
 }
 
-fn pipeline(target: &Target, node: &std::path::Path, output: Option<String>) -> Result<()> {
+fn pipeline(target: &Target, node: &std::path::Path, output: Option<String>, gl: bool) -> Result<()> {
     use std::sync::mpsc;
     use std::time::Duration;
     let output = pick_output(target, output)?;
@@ -336,7 +345,7 @@ fn pipeline(target: &Target, node: &std::path::Path, output: Option<String>) -> 
                     }
                     out
                 })?;
-                captured = Some((w, h, bgra));
+                captured = Some((w, h, bgra, frame.buffer.clone()));
                 break;
             }
             Ok(CaptureEvent::Error(e)) => bail!("capture error: {e}"),
@@ -346,8 +355,12 @@ fn pipeline(target: &Target, node: &std::path::Path, output: Option<String>) -> 
         }
     }
     drop(capturer);
-    let (w, h, bgra) = captured.ok_or_else(|| anyhow!("no frame captured (a headless output renders reliably; a physical KVM output may not)"))?;
+    let (w, h, bgra, buffer) = captured.ok_or_else(|| anyhow!("no frame captured (a headless output renders reliably; a physical KVM output may not)"))?;
     println!("  captured {w}x{h} from {output}");
+
+    if gl {
+        return pipeline_gl(node, w, h, &bgra, &buffer);
+    }
 
     let display = vaapi::open_display(node)?;
     let settings = EncoderSettings { width: w as u32, height: h as u32, bitrate: EncoderSettings::default_bitrate(w as u32, h as u32, 60), framerate: 60, low_power: false };
@@ -377,6 +390,162 @@ fn pipeline(target: &Target, node: &std::path::Path, output: Option<String>) -> 
         bail!("4:4:4 pipeline PSNR too low");
     }
     Ok(())
+}
+
+fn pipeline_gl(node: &std::path::Path, w: usize, h: usize, bgra: &[u8], buffer: &hypr_capture::CaptureBuffer) -> Result<()> {
+    use haver_codec::libva::{Display, Image, UsageHint, VA_FOURCC_NV12, VA_RT_FORMAT_YUV420};
+    use haver_proto::chroma::{recombine_yuv444, split_yuv444, Nv12};
+    use std::time::Instant;
+
+    let (w, h) = (w & !1, h & !1);
+    let info = &buffer.info;
+    let src_fourcc = drm_fourcc::DrmFourcc::try_from(info.fourcc)
+        .map_err(|_| anyhow!("captured fourcc {:#x} not a known DRM format", info.fourcc))?;
+    let input = haver_gl::DmabufPlane {
+        fd: info.fd.as_fd(),
+        width: info.width,
+        height: info.height,
+        offset: info.planes[0].offset,
+        stride: info.planes[0].stride,
+        fourcc: src_fourcc,
+        modifier: info.modifier,
+    };
+    println!("  input dmabuf: {:?} {}x{} modifier {:#x}", src_fourcc, info.width, info.height, info.modifier);
+
+    let display: std::rc::Rc<Display> = vaapi::open_display(node)?;
+    let make_nv12 = || -> Result<_> {
+        let mut s = display
+            .create_surfaces::<()>(VA_RT_FORMAT_YUV420, Some(VA_FOURCC_NV12), w as u32, h as u32, Some(UsageHint::USAGE_HINT_ENCODER), vec![()])
+            .map_err(|e| anyhow!("create_surfaces: {e}"))?;
+        Ok(s.remove(0))
+    };
+    let main_surf = make_nv12()?;
+    let aux_surf = make_nv12()?;
+
+    let mut headless = haver_gl::Headless::new(node)?;
+
+    // Time the GL split over a few iterations. Re-export each iteration mirrors
+    // the per-frame cost; the encoder would hold the surfaces across frames.
+    let mut gl_ms = f64::INFINITY;
+    for _ in 0..10 {
+        let main_desc = main_surf.export_prime().map_err(|e| anyhow!("export main: {e}"))?;
+        let aux_desc = aux_surf.export_prime().map_err(|e| anyhow!("export aux: {e}"))?;
+        let (my, muv) = nv12_planes(&main_desc, w as u32, h as u32);
+        let (ay, auv) = nv12_planes(&aux_desc, w as u32, h as u32);
+        let t = Instant::now();
+        headless.split_dual(&input, w as u32, h as u32, &my, &muv, &ay, &auv).context("gl split")?;
+        gl_ms = gl_ms.min(t.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    // Read the two GL-filled surfaces back to a main/aux NV12 pair.
+    let fmt = display.query_image_formats().map_err(|e| anyhow!("{e}"))?.into_iter().find(|f| f.fourcc == VA_FOURCC_NV12).ok_or_else(|| anyhow!("no NV12 image format"))?;
+    let read_nv12 = |surface: &haver_codec::libva::Surface<()>| -> Result<Nv12> {
+        let image = Image::create_from(surface, fmt, (w as u32, h as u32), (w as u32, h as u32)).map_err(|e| anyhow!("map: {e}"))?;
+        let d = image.as_ref();
+        let va = *image.image();
+        let (yo, uvo) = (va.offsets[0] as usize, va.offsets[1] as usize);
+        let (yp, uvp) = (va.pitches[0] as usize, va.pitches[1] as usize);
+        let mut nv = Nv12::new(w, h);
+        for row in 0..h {
+            nv.y[row * w..row * w + w].copy_from_slice(&d[yo + row * yp..yo + row * yp + w]);
+        }
+        for row in 0..h / 2 {
+            nv.uv[row * w..row * w + w].copy_from_slice(&d[uvo + row * uvp..uvo + row * uvp + w]);
+        }
+        Ok(nv)
+    };
+    let gl_main = read_nv12(&main_surf)?;
+    let gl_aux = read_nv12(&aux_surf)?;
+
+    // CPU reference: the exact split the GPU path replaces. Take the best of
+    // several warm runs so both sides are measured the same way.
+    let cpu_src = bgra_to_yuv444(bgra, w * 4, w, h);
+    let (cpu_main, cpu_aux) = split_yuv444(&cpu_src);
+    let mut cpu_ms = f64::INFINITY;
+    for _ in 0..10 {
+        let t = Instant::now();
+        let s = bgra_to_yuv444(bgra, w * 4, w, h);
+        let _ = split_yuv444(&s);
+        cpu_ms = cpu_ms.min(t.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    // Correctness: recombine each and compare to the CPU 4:4:4 reference.
+    let gl444 = recombine_yuv444(&gl_main, &gl_aux);
+    let y_psnr = bgra_psnr(&cpu_src.y, &gl444.y);
+    let u_psnr = bgra_psnr(&cpu_src.u, &gl444.u);
+    let v_psnr = bgra_psnr(&cpu_src.v, &gl444.v);
+    let my_psnr = bgra_psnr(&cpu_main.y, &gl_main.y);
+    let muv_psnr = bgra_psnr(&cpu_main.uv, &gl_main.uv);
+    let ay_psnr = bgra_psnr(&cpu_aux.y, &gl_aux.y);
+    let auv_psnr = bgra_psnr(&cpu_aux.uv, &gl_aux.uv);
+    println!("  per-plane PSNR vs CPU: main.Y {my_psnr:.1} main.UV {muv_psnr:.1} aux.Y {ay_psnr:.1} aux.UV {auv_psnr:.1} dB");
+    println!("  recombined 4:4:4 PSNR vs CPU: Y {y_psnr:.1} U {u_psnr:.1} V {v_psnr:.1} dB");
+    println!("  split time: GPU {gl_ms:.2} ms/frame  vs  CPU {cpu_ms:.2} ms/frame");
+
+    // GL uses BT.709 float math and rounds slightly differently from the CPU
+    // integer path, so exact equality is not expected; >40 dB means the shader
+    // orientation and channel order are correct.
+    let split_ok = y_psnr > 40.0 && u_psnr > 40.0 && v_psnr > 40.0;
+    status(split_ok, "GPU 4:4:4 split matches CPU split (orientation + channel order)");
+
+    // Release the standalone split resources before the integrated encoder
+    // builds its own GL context and surfaces.
+    drop(headless);
+    drop(main_surf);
+    drop(aux_surf);
+
+    // Integrated: encode the GPU-split surfaces, decode, recombine, and check
+    // end-to-end fidelity against the captured frame.
+    let settings = EncoderSettings { width: w as u32, height: h as u32, bitrate: EncoderSettings::default_bitrate(w as u32, h as u32, 60), framerate: 60, low_power: false };
+    let mut encoder = GlDualEncoder::new(display.clone(), node, settings).context("gl dual encoder")?;
+    let mut decoder = DualDecoder::new(display, w, h).context("dual decoder")?;
+    let packet = encoder.encode(&input, 0, true).context("gl encode")?;
+    println!("  gl-encoded main {} bytes, aux {} bytes, key={}", packet.main.len(), packet.aux.len(), packet.keyframe);
+    let out444 = decoder.decode(0, &packet.main, &packet.aux).context("decode")?.ok_or_else(|| anyhow!("dual decode produced no frame"))?;
+    let out_bgra = yuv444_to_bgra(&out444);
+    let rgb: Vec<u8> = bgra.iter().enumerate().filter(|(i, _)| i % 4 != 3).map(|(_, b)| *b).collect();
+    let rgb_out: Vec<u8> = out_bgra.iter().enumerate().filter(|(i, _)| i % 4 != 3).map(|(_, b)| *b).collect();
+    let e2e_psnr = bgra_psnr(&rgb, &rgb_out);
+    println!("  end-to-end RGB PSNR (GPU split -> encode -> decode): {e2e_psnr:.1} dB");
+    let e2e_ok = e2e_psnr > 30.0;
+    status(e2e_ok, "GPU-split Dual420 4:4:4 round-trip on a captured frame");
+
+    if !split_ok {
+        bail!("GPU split PSNR too low: shader orientation or GR88 channel order is wrong");
+    }
+    if !e2e_ok {
+        bail!("GPU-split end-to-end PSNR too low");
+    }
+    Ok(())
+}
+
+/// Build the Y (R8) and UV (GR88) dmabuf planes of an exported NV12 surface.
+fn nv12_planes(
+    desc: &haver_codec::libva::DrmPrimeSurfaceDescriptor,
+    w: u32,
+    h: u32,
+) -> (haver_gl::DmabufPlane<'_>, haver_gl::DmabufPlane<'_>) {
+    let obj = &desc.objects[0];
+    let layer = &desc.layers[0];
+    let y = haver_gl::DmabufPlane {
+        fd: obj.fd.as_fd(),
+        width: w,
+        height: h,
+        offset: layer.offset[0],
+        stride: layer.pitch[0],
+        fourcc: drm_fourcc::DrmFourcc::R8,
+        modifier: obj.drm_format_modifier,
+    };
+    let uv = haver_gl::DmabufPlane {
+        fd: obj.fd.as_fd(),
+        width: w / 2,
+        height: h / 2,
+        offset: layer.offset[1],
+        stride: layer.pitch[1],
+        fourcc: drm_fourcc::DrmFourcc::Gr88,
+        modifier: obj.drm_format_modifier,
+    };
+    (y, uv)
 }
 
 fn pick_output(target: &Target, output: Option<String>) -> Result<String> {
@@ -643,6 +812,50 @@ fn bench(iters: usize) -> Result<()> {
         time("subsample 4:4:4->NV12 (single)", iters, { let src = src.clone(); Box::new(move || { let _ = yuv444_to_nv12(&src); }) });
         time("recombine 2xNV12->444 (client)", iters, { let m = m.clone(); let a = a.clone(); Box::new(move || { let _ = recombine_yuv444(&m, &a); }) });
         time("yuv444->bgra (client)", iters, { let src = src.clone(); Box::new(move || { let _ = yuv444_to_bgra(&src); }) });
+    }
+    Ok(())
+}
+
+fn gltest(node: &std::path::Path) -> Result<()> {
+    use haver_codec::libva::{Display, UsageHint, VA_FOURCC_NV12, VA_RT_FORMAT_YUV420};
+    let (w, h) = (256u32, 256u32);
+    let display: std::rc::Rc<Display> = vaapi::open_display(node)?;
+    let mut surfaces = display
+        .create_surfaces::<()>(VA_RT_FORMAT_YUV420, Some(VA_FOURCC_NV12), w, h, Some(UsageHint::USAGE_HINT_ENCODER), vec![()])
+        .map_err(|e| anyhow!("create_surfaces: {e}"))?;
+    let surface = surfaces.remove(0);
+    let desc = surface.export_prime().map_err(|e| anyhow!("export_prime: {e}"))?;
+    let layer = &desc.layers[0];
+    let obj = &desc.objects[0];
+    println!("  VA NV12 surface exported: modifier {:#x}, Y off {} pitch {}", obj.drm_format_modifier, layer.offset[0], layer.pitch[0]);
+    let y_plane = haver_gl::DmabufPlane {
+        fd: obj.fd.as_fd(),
+        width: w,
+        height: h,
+        offset: layer.offset[0],
+        stride: layer.pitch[0],
+        fourcc: drm_fourcc::DrmFourcc::R8,
+        modifier: obj.drm_format_modifier,
+    };
+    let headless = haver_gl::Headless::new(node)?;
+    let clear = headless.clear_plane(&y_plane, 0.5);
+    match &clear {
+        Ok(()) => println!("  GL cleared the surface Y plane to 0.5 (framebuffer complete)"),
+        Err(e) => println!("  GL render into VA surface FAILED: {e}"),
+    }
+    // Read the surface back and check the Y plane is ~128.
+    drop(desc); // close exported fds before mapping
+    let fmt = display.query_image_formats().map_err(|e| anyhow!("{e}"))?.into_iter().find(|f| f.fourcc == VA_FOURCC_NV12).ok_or_else(|| anyhow!("no NV12 image"))?;
+    let image = haver_codec::libva::Image::create_from(&surface, fmt, (w, h), (w, h)).map_err(|e| anyhow!("map surface: {e}"))?;
+    let data = image.as_ref();
+    let yo = image.image().offsets[0] as usize;
+    let samples: Vec<u8> = (0..8).map(|i| data[yo + i]).collect();
+    let mean: f64 = (0..(w * h) as usize).map(|i| data[yo + i] as f64).sum::<f64>() / (w * h) as f64;
+    println!("  read-back Y[0..8]={samples:?} mean={mean:.1} (expect ~128 if GL wrote it)");
+    let ok = clear.is_ok() && (mean - 128.0).abs() < 8.0;
+    status(ok, "GL render into VA encoder surface");
+    if !ok {
+        bail!("server GL-into-VA-surface path is not usable on this GPU");
     }
     Ok(())
 }

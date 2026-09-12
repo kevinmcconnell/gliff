@@ -963,6 +963,7 @@ dependencies = [
  "cros-codecs",
  "drm-fourcc",
  "gbm",
+ "haver-gl",
  "haver-proto",
  "rayon",
  "thiserror 2.0.20",
@@ -988,7 +989,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "drm-fourcc",
  "haver-codec",
+ "haver-gl",
  "haver-proto",
  "haver-transport",
  "hypr-capture",

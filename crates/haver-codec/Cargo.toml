@@ -12,6 +12,7 @@ workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 haver-proto.workspace = true
+haver-gl.workspace = true
 cros-codecs.workspace = true
 gbm.workspace = true
 drm-fourcc.workspace = true

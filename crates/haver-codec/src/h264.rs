@@ -162,6 +162,22 @@ impl H264Encoder {
     pub fn encode_planes(&mut self, y: &[u8], y_stride: usize, uv: &[u8], uv_stride: usize, timestamp: u64, force_keyframe: bool) -> Result<EncodedPacket> {
         let handle = self.take_surface()?;
         self.upload(&handle, y, y_stride, uv, uv_stride)?;
+        self.encode_surface(handle, timestamp, force_keyframe)
+    }
+
+    /// Take an unused input surface from the pool so a caller can fill it
+    /// directly (for example by rendering into its exported dmabuf on the GPU),
+    /// then hand it back to [`encode_surface`].
+    pub fn acquire_surface(&mut self) -> Result<PooledVaSurface<()>> {
+        self.take_surface()
+    }
+
+    pub fn coded_size(&self) -> (u32, u32) {
+        (self.settings.coded_width(), self.settings.coded_height())
+    }
+
+    /// Encode a surface whose NV12 content is already in place.
+    pub fn encode_surface(&mut self, handle: PooledVaSurface<()>, timestamp: u64, force_keyframe: bool) -> Result<EncodedPacket> {
         let layout = FrameLayout {
             format: (nv12(), 0),
             size: Resolution { width: self.settings.coded_width(), height: self.settings.coded_height() },

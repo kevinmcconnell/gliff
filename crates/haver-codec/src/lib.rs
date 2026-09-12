@@ -8,6 +8,7 @@ pub mod color;
 pub mod dual;
 pub mod single;
 pub mod frame;
+pub mod gl_split;
 pub mod h264;
 pub mod vaapi;
 

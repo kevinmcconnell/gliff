@@ -38,8 +38,8 @@ video, cursor and pongs flow server→client.
 | `hypr-wl` | shared Wayland plumbing (connect, globals, output/seat tracking) | none |
 | `hypr-capture` | output + cursor capture into GBM dmabufs on a calloop thread | none |
 | `hypr-input` | virtual keyboard (xkb state) + virtual pointer on a calloop thread | none |
-| `haver-codec` | VA-API H.264 encode/decode, CPU colour, Dual420 and Single420 | none |
-| `haver-gl` | GPU dmabuf import + AVC444 recombine shader (client display) | **yes, isolated here** |
+| `haver-codec` | VA-API H.264 encode/decode, CPU colour, Dual420/Single420, GPU-split encoder | none (GL via `haver-gl`) |
+| `haver-gl` | GPU dmabuf import, AVC444 recombine shader (client), headless split into VA surfaces (server) | **yes, isolated here** |
 | `haver-server` | ties capture+input+codec to the protocol; `--stdio`/`--listen` | none |
 | `haver-client` | GTK4/libadwaita UI, decode worker | none |
 | `haver-probe` | environment checks and the headless test client | none |
@@ -123,9 +123,12 @@ tested against wl-clipboard).
 
 Not yet built, roughly in priority order:
 
-1. **Server-side GPU colour (VPP for Single420).** See the measurements and
-   decision above: kept on CPU for now; VPP is a documented, verified-feasible
-   future addition for the low-bandwidth path.
+1. **Wire the server GPU split into the live session.** `GlDualEncoder` is built,
+   verified end-to-end, and measured (~2x faster than the CPU split, growing with
+   resolution). It is not yet the server's live encoder because that needs the
+   captured dmabuf held on the encoder thread until `glFinish` returns. See the
+   decision under "GPU acceleration" above. VPP stays a separate Single420-only
+   option.
 2. **Native single-stream 4:4:4, and AV1/HEVC.** Probe-gated; this GPU exposes
    no such VA-API encode entrypoint, so they cannot be validated here. Needs an
    Intel or newer GPU.
@@ -170,16 +173,47 @@ verified running on radeonsi (visual confirmation pending a real display).
    not reachable through the vendored cros-libva 0.0.12: its bindings omit the
    VPP structs (they need `va_vpp.h` added and bindings regenerated, plus the
    `proc_pipeline` wrapper ported and a VPP context wired).
-3. **GL split on the server.** Would help Dual420, but radeonsi refuses an
-   imported dmabuf as encoder input, so it still needs one `vaPutImage` upload,
-   and it doubles the GL `unsafe` surface.
+3. **GL split on the server (built and measured).** This does the whole
+   BGRA→YUV444→2×NV12 split on the GPU and helps the default Dual420 path.
+   radeonsi refuses an *external* dmabuf as encoder input, but it does not need
+   one: GL renders into the encoder's **own** VA input surfaces. Each surface is
+   exported with `vaExportSurfaceHandle` (composed NV12 layer), imported back as
+   two EGL images (Y as `R8`, UV as `GR88`, with the tiled surface's DRM
+   modifier), and four fragment shaders write the main/aux Y and UV planes. The
+   encoder then reads the same surfaces with no upload. It lives in
+   `haver-codec::gl_split::GlDualEncoder`, all `unsafe` still confined to
+   `haver-gl` (`Headless` context + `split_dual`).
 
-Decision: keep **CPU on the server** and the **GPU/CPU pair on the client** — a
-subset, not all three. VPP is worth adding only if the low-bandwidth (Single420)
-path becomes important or 4K server CPU is a problem; it is verified feasible on
-radeonsi and documented here as a scoped future addition (add `va_vpp.h` to the
-vendored cros-libva wrapper, port `proc_pipeline`, feed the VPP output surface to
-the existing surface-input encoder for a zero-copy Single420 path).
+   Verified end-to-end on radeonsi via `haver-probe pipeline --gl`: the GPU split
+   matches the CPU split at 65-74 dB per plane (float-vs-integer rounding only),
+   and the full GPU-split→encode→decode→recombine round-trip reaches the same
+   RGB PSNR as the CPU pipeline (~45 dB on a captured desktop frame). Split time,
+   best of ten warm runs, GPU vs CPU:
+
+   | Resolution | GPU split | CPU split |
+   |---|---|---|
+   | 1280x720 | 0.59 ms | 1.19 ms |
+   | 1920x1080 | 1.16 ms | 2.75 ms |
+   | 3840x2160 | 4.82 ms | 9.01 ms |
+
+   The GPU figure includes a per-frame input import and a blocking `glFinish`;
+   in a pipelined server the destination surfaces are imported once and the GPU
+   work overlaps other CPU work, so the effective server CPU saved is close to
+   the full CPU-split column. The win is about 2x in wall-clock and grows with
+   resolution.
+
+Decision: keep **CPU on the server as the default**, with the GPU split built,
+measured, and ready as an opt-in — the client keeps its GPU/CPU pair. The server
+split is not yet wired into the live session because it needs the captured
+dmabuf to stay readable on the encoder thread until `glFinish` returns, which
+means holding the capture-ring frame across the capture→encoder thread boundary
+(or dup-ing its fd and pinning the ring slot) rather than the current
+map-to-BGRA-and-release. That is a capture-lifecycle change with a small
+regression risk to the one working path, and the 1080p gain is modest, so the
+integration is left as a deliberate switch to flip. VPP remains a separate,
+Single420-only option (add `va_vpp.h` to the vendored cros-libva wrapper, port
+`proc_pipeline`); the GL split is the better Dual420 answer and is now the
+recommended server GPU path when server CPU (especially at 4K) matters.
 
 ## Dependencies and binaries
 
