@@ -410,8 +410,9 @@ fn encoder_settings(width: u32, height: u32, bitrate: Option<u32>) -> EncoderSet
 fn setup_output(instance: &hypr_ipc::Instance, cfg: &Config, caps: &ClientCaps) -> Result<SessionOutput> {
     if let Some(name) = &cfg.output {
         let mons = instance.monitors()?;
-        let m = mons.iter().find(|m| &m.name == name).with_context(|| format!("no output {name}"))?;
-        return Ok(SessionOutput { name: name.clone(), width: m.width & !1, height: m.height & !1, headless: None });
+        let m = if name == "auto" { main_monitor(&mons) } else { mons.iter().find(|m| &m.name == name) }
+            .with_context(|| format!("no output {name}"))?;
+        return Ok(SessionOutput { name: m.name.clone(), width: m.width & !1, height: m.height & !1, headless: None });
     }
     let before: Vec<String> = instance.monitors()?.into_iter().map(|m| m.name).collect();
     let requested = format!("haver-{}", std::process::id());
@@ -427,6 +428,13 @@ fn setup_output(instance: &hypr_ipc::Instance, cfg: &Config, caps: &ClientCaps) 
     instance.set_monitor_mode(&output.name, output.width, output.height, 60, 1.0).ok();
     std::thread::sleep(Duration::from_millis(150));
     Ok(output)
+}
+
+/// The screen the user is most likely looking at: the focused monitor, else
+/// the leftmost enabled one.
+fn main_monitor(mons: &[hypr_ipc::Monitor]) -> Option<&hypr_ipc::Monitor> {
+    let enabled = || mons.iter().filter(|m| !m.disabled);
+    enabled().find(|m| m.focused).or_else(|| enabled().min_by_key(|m| (m.x, m.y)))
 }
 
 fn start_capture(target: &Target, output: &str, render_node: &std::path::Path, tx: UnboundedSender<Incoming>) -> Result<Capturer> {

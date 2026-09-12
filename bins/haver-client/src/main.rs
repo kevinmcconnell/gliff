@@ -41,8 +41,11 @@ struct Cli {
     /// Remote haver-server path.
     #[arg(long, default_value = "haver-server")]
     server_bin: String,
-    /// Mirror this remote output instead of creating a headless one sized to
-    /// the window.
+    /// Mirror the remote's focused screen instead of creating a headless
+    /// output sized to the window.
+    #[arg(long, conflicts_with = "output")]
+    mirror: bool,
+    /// Mirror the named remote output (e.g. `DP-1`).
     #[arg(long)]
     output: Option<String>,
     /// Hotkey that releases captured shortcuts and hands the keyboard back to
@@ -202,7 +205,7 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         let host_entry = host_entry.clone();
         let connect = cli.connect.clone();
         let server_bin = cli.server_bin.clone();
-        let output = cli.output.clone();
+        let output = cli.output.clone().or_else(|| cli.mirror.then(|| "auto".to_string()));
         connect_btn.connect_clicked(move |_| {
             let endpoint = match &connect {
                 Some(addr) => Endpoint::Tcp(addr.clone()),

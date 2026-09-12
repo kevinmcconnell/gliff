@@ -22,7 +22,8 @@ struct Cli {
     /// Dev only: listen on a TCP address (no auth; localhost).
     #[arg(long)]
     listen: Option<String>,
-    /// Mirror an existing output by name (attended use).
+    /// Mirror an existing output (attended use): a name like `DP-1`, or
+    /// `auto` for the focused one.
     #[arg(long, conflicts_with = "headless")]
     output: Option<String>,
     /// Create a dedicated headless output sized to the client.
