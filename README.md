@@ -10,17 +10,22 @@ client).
 Working and validated on AMD (Ryzen Granite Ridge, Mesa radeonsi):
 
 - Capture of a Hyprland output via `ext-image-copy-capture-v1` into GBM dmabufs.
-- Keyboard and pointer injection (virtual-keyboard, wlr-virtual-pointer).
-- VA-API H.264 encode and decode; Dual420 4:4:4 round-trips near-lossless.
+- Keyboard and pointer injection, with the client's xkb keymap uploaded so keys
+  map identically on both ends.
+- VA-API H.264 encode and decode; Dual420 4:4:4 round-trips near-lossless, plus
+  a `--low-bandwidth` single 4:2:0 stream.
 - The full server pipeline (capture -> 4:4:4 -> two H.264 streams -> protocol)
-  and a GTK4 client that decodes, recombines, and displays, validated over
-  localhost against a nested Hyprland: connect, stream, resize, frame-ack pacing.
+  and a GTK4 client that decodes, recombines, displays, forwards input, shows
+  the remote cursor, inhibits system shortcuts, and auto-reconnects. Validated
+  over localhost against a nested Hyprland: connect, stream, resize, ack pacing,
+  both chroma modes.
 
-Not done yet: clipboard bridge, keymap upload from the client, cursor drawing
-in the client, ssh env documentation tested end to end, the zero-copy
-`GlSplitter`, native single-stream 4:4:4, AV1/HEVC, and reconnect polish. See
-`docs/hardware-quirks.md` for driver-specific behaviour and what still needs
-testing on Intel.
+Design and the full picture are in `docs/architecture.md`; driver-specific
+behaviour and Intel test gaps are in `docs/hardware-quirks.md`.
+
+Not done yet: clipboard bridge; the zero-copy `GlSplitter` and GL client
+recombine (needs `unsafe` GL); native single-stream 4:4:4 and AV1/HEVC (no
+encode entrypoint on this GPU); and a verified ssh-from-cold-machine path.
 
 ## Build
 
@@ -54,6 +59,17 @@ haver-client user@host
 This spawns `ssh -T user@host haver-server --stdio --headless`. The ssh session
 must see the user's `WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR`; if `haver-server` is not
 on PATH over ssh, pass `--server-bin /path/to/haver-server`.
+
+## Testing
+
+```
+cargo test --workspace     # pure-logic unit tests, no GPU needed
+./scripts/e2e.sh           # full stack against a nested Hyprland (needs a GPU)
+```
+
+`scripts/e2e.sh` must run inside a Hyprland session; it boots a nested Hyprland
+and asserts the probe checks, the 4:4:4 capture pipeline, and both Dual420 and
+Single420 server-plus-client streams.
 
 ## Layout
 
