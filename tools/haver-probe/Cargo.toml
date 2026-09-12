@@ -20,3 +20,6 @@ hypr-wl.workspace = true
 hypr-capture.workspace = true
 hypr-input.workspace = true
 haver-codec.workspace = true
+haver-transport.workspace = true
+haver-proto.workspace = true
+tokio.workspace = true

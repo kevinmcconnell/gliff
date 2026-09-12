@@ -9,3 +9,15 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio = { workspace = true }
+haver-proto.workspace = true
+haver-transport.workspace = true
+haver-codec.workspace = true
+hypr-capture.workspace = true
+hypr-input.workspace = true
+hypr-ipc.workspace = true
+hypr-wl.workspace = true

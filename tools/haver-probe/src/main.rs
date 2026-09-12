@@ -83,6 +83,13 @@ enum Cmd {
         #[arg(long)]
         output: Option<String>,
     },
+    /// Connect to a running `haver-server --listen` and decode a few frames
+    ServeTest {
+        #[arg(long, default_value = "127.0.0.1:9000")]
+        connect: String,
+        #[arg(long, default_value_t = 30)]
+        frames: usize,
+    },
     /// Run every non-interactive check
     All,
 }
@@ -101,6 +108,7 @@ fn main() -> Result<()> {
         Cmd::Capture { output, png, cursor } => capture(&target, &node, output, &png, cursor)?,
         Cmd::Input { output, text, click } => input(&target, output, &text, click)?,
         Cmd::Pipeline { output } => pipeline(&target, &node, output)?,
+        Cmd::ServeTest { connect, frames } => serve_test(&node, &connect, frames)?,
         Cmd::All => {
             protocols(&target)?;
             outputs(&target)?;
@@ -480,5 +488,62 @@ fn input(target: &Target, output: Option<String>, text: &str, click: bool) -> Re
     input.release_all()?;
     std::thread::sleep(Duration::from_millis(50));
     status(true, &format!("moved pointer to {},{} on {output} and typed {text:?}", lw / 2, lh / 2));
+    Ok(())
+}
+
+fn serve_test(node: &std::path::Path, addr: &str, frames: usize) -> Result<()> {
+    use haver_proto::{ChromaMode, ClientCaps, ClientMsg, Codec, ServerMsg};
+    use haver_transport::Framed;
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async move {
+        let stream = tokio::net::TcpStream::connect(addr).await.with_context(|| format!("connect {addr}"))?;
+        stream.set_nodelay(true)?;
+        let (rd, wr) = tokio::io::split(stream);
+        let mut reader = Framed::new(rd);
+        let mut writer = Framed::new(wr);
+        let caps = ClientCaps { codecs: vec![Codec::H264], max_width: 1280, max_height: 720, chroma: vec![ChromaMode::Dual420, ChromaMode::Single420] };
+        writer.write_msg(&ClientMsg::Hello { version: haver_proto::PROTOCOL_VERSION, keymap: String::new(), caps }).await?;
+        let ack = reader.read_msg::<ServerMsg>().await?;
+        let ServerMsg::HelloAck { session, outputs, .. } = ack else { bail!("expected HelloAck, got {ack:?}") };
+        eprintln!("  HelloAck: headless={} output={} ({} outputs)", session.headless, session.output, outputs.len());
+        let cfg = reader.read_msg::<ServerMsg>().await?;
+        let (mut w, mut h, mut chroma) = match cfg { ServerMsg::StreamConfig { width, height, chroma, .. } => (width as usize, height as usize, chroma), o => bail!("expected StreamConfig, got {o:?}") };
+        eprintln!("  StreamConfig: {w}x{h} chroma {chroma:?}");
+        let display = vaapi::open_display(node)?;
+        let mut decoder = haver_codec::dual::DualDecoder::new(display, w, h)?;
+        let mut got = 0usize;
+        let mut keyframes = 0usize;
+        while got < frames {
+            let msg = reader.read_msg::<ServerMsg>().await?;
+            match msg {
+                ServerMsg::VideoFrame { frame_id, keyframe, data_len, aux_len, .. } => {
+                    let main = reader.read_payload(data_len).await?;
+                    let aux = if aux_len > 0 { reader.read_payload(aux_len).await?.to_vec() } else { Vec::new() };
+                    if keyframe { keyframes += 1; }
+                    let out = decoder.decode(frame_id, &main, &aux)?;
+                    if out.is_some() { got += 1; }
+                    if got == 1 { eprintln!("  first decoded frame ok ({}x{}, main {} aux {} bytes, key {keyframe})", w, h, data_len, aux_len); }
+                    writer.write_msg(&ClientMsg::FrameAck { frame_id, decoded_at_ms: 0 }).await?;
+                    if got == 3 { writer.write_msg(&ClientMsg::Resize { width: 800, height: 600, scale: 1.0 }).await?; }
+                }
+                ServerMsg::StreamConfig { width, height, chroma: c, .. } => {
+                    w = width as usize; h = height as usize; chroma = c;
+                    eprintln!("  reconfig to {w}x{h}");
+                    let display = vaapi::open_display(node)?;
+                    decoder = haver_codec::dual::DualDecoder::new(display, w, h)?;
+                }
+                ServerMsg::CursorShape { argb_len, .. } => { let _ = reader.read_payload(argb_len).await?; }
+                ServerMsg::CursorPos { .. } | ServerMsg::Pong { .. } | ServerMsg::Error { .. } => {}
+                ServerMsg::ClipboardData { data_len, .. } => { let _ = reader.read_payload(data_len).await?; }
+                _ => {}
+            }
+        }
+        writer.write_msg(&ClientMsg::Bye).await?;
+        let _ = chroma;
+        eprintln!("RESULT decoded {got} frames, {keyframes} keyframes");
+        status(got >= frames && keyframes >= 1, &format!("decoded {got} frames from the server ({keyframes} keyframes, resize honoured)"));
+        Ok::<(), anyhow::Error>(())
+    })?;
     Ok(())
 }
