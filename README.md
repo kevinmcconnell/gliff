@@ -24,7 +24,7 @@ Working and validated on AMD (Ryzen Granite Ridge, Mesa radeonsi):
 Design and the full picture are in `docs/architecture.md`; driver-specific
 behaviour and Intel test gaps are in `docs/hardware-quirks.md`.
 
-Not done yet: clipboard bridge; the zero-copy `GlSplitter` and GL client
+Not done yet: image/binary clipboard (text works both ways); the zero-copy `GlSplitter` and GL client
 recombine (needs `unsafe` GL); native single-stream 4:4:4 and AV1/HEVC (no
 encode entrypoint on this GPU); and a verified ssh-from-cold-machine path.
 

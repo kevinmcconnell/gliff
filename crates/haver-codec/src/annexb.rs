@@ -39,23 +39,6 @@ pub fn has_start_code(data: &[u8]) -> bool {
     data.windows(3).any(|w| w == [0, 0, 1])
 }
 
-/// Byte offset of each NAL unit's header (the byte after its start code).
-pub fn nal_header_offsets(data: &[u8]) -> Vec<usize> {
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i + 3 <= data.len() {
-        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
-            if i + 3 < data.len() {
-                out.push(i + 3);
-            }
-            i += 3;
-        } else {
-            i += 1;
-        }
-    }
-    out
-}
-
 /// Replace any NAL header byte that a driver left as `0x00` with `header`,
 /// scanning forward and resuming *after* each header we fix. Fixing a header
 /// removes the false start code its zero byte could otherwise form with the

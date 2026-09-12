@@ -8,5 +8,5 @@ pub mod frame;
 pub mod msg;
 
 pub use chroma::{recombine_yuv444, split_yuv444, Yuv444};
-pub use frame::{FrameHeader, PayloadLens, MAX_FRAME_BODY};
+pub use frame::MAX_FRAME_BODY;
 pub use msg::*;

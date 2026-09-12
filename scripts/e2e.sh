@@ -39,7 +39,8 @@ HYPR
 before=$(ls "$XDG_RUNTIME_DIR/hypr" 2>/dev/null)
 WAYLAND_DISPLAY="$WAYLAND_DISPLAY" HYPRLAND_INSTANCE_SIGNATURE= setsid Hyprland -c "$CONF" >/tmp/haver-e2e-hypr.log 2>&1 &
 sleep 6
-NEST_SIG=$(ls -t "$XDG_RUNTIME_DIR/hypr" | head -1)
+# The nested instance is the directory that was not there before we started it.
+NEST_SIG=$(comm -13 <(echo "$before" | sort) <(ls "$XDG_RUNTIME_DIR/hypr" | sort) | head -1)
 [ -n "$NEST_SIG" ] || fail "nested Hyprland did not start"
 export HYPRLAND_INSTANCE_SIGNATURE="$NEST_SIG"
 export WAYLAND_DISPLAY=$(sed -n 2p "$XDG_RUNTIME_DIR/hypr/$NEST_SIG/hyprland.lock")

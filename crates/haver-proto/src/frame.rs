@@ -10,25 +10,5 @@
 //! output goes straight to the socket with `write_vectored`, and the reader
 //! hands the slices to the decoder without an extra copy.
 
-use serde::{Deserialize, Serialize};
-
 /// Largest postcard body we will read; guards against a bad length prefix.
 pub const MAX_FRAME_BODY: usize = 1 << 20;
-
-/// The parsed length prefix plus how many payload bytes follow.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FrameHeader {
-    pub body_len: u32,
-}
-
-/// Payload lengths a message declares, in the order they appear on the wire.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PayloadLens {
-    pub lens: Vec<u32>,
-}
-
-impl PayloadLens {
-    pub fn total(&self) -> usize {
-        self.lens.iter().map(|&l| l as usize).sum()
-    }
-}
