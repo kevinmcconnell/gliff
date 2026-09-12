@@ -1,0 +1,36 @@
+#version 450
+// AVC444 recombine: main + aux NV12 -> BGRA, with the YUV->RGB convert
+// folded in. Inverse of split.comp; with has_aux == 0 the main chroma is
+// duplicated over each 2x2 block (the Single420 path).
+#include "common.glsl"
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0) uniform sampler2D main_y;
+layout(set = 0, binding = 1) uniform sampler2D main_uv;
+layout(set = 0, binding = 2) uniform sampler2D aux_y;
+layout(set = 0, binding = 3) uniform sampler2D aux_uv;
+// `dst` is a BGRA image viewed as RGBA, so channels are stored as B,G,R,A.
+layout(set = 0, binding = 4, rgba8) uniform writeonly image2D dst;
+layout(push_constant) uniform Push { int width; int height; int has_aux; } pc;
+
+void main() {
+    int bx = int(gl_GlobalInvocationID.x);
+    int by = int(gl_GlobalInvocationID.y);
+    int x = 2 * bx, y = 2 * by;
+    if (x >= pc.width || y >= pc.height) return;
+    float y00 = texelFetch(main_y, ivec2(x, y), 0).r;
+    float y10 = texelFetch(main_y, ivec2(x + 1, y), 0).r;
+    float y01 = texelFetch(main_y, ivec2(x, y + 1), 0).r;
+    float y11 = texelFetch(main_y, ivec2(x + 1, y + 1), 0).r;
+    vec2 c00 = texelFetch(main_uv, ivec2(bx, by), 0).rg;
+    vec2 c10 = c00, c01 = c00, c11 = c00;
+    if (pc.has_aux != 0) {
+        int half_h = pc.height / 2;
+        c10 = texelFetch(aux_uv, ivec2(bx, by), 0).rg;
+        c01 = vec2(texelFetch(aux_y, ivec2(x, by), 0).r,     texelFetch(aux_y, ivec2(x, half_h + by), 0).r);
+        c11 = vec2(texelFetch(aux_y, ivec2(x + 1, by), 0).r, texelFetch(aux_y, ivec2(x + 1, half_h + by), 0).r);
+    }
+    imageStore(dst, ivec2(x, y),         vec4(to_rgb(y00, c00.r, c00.g).bgr, 1.0));
+    imageStore(dst, ivec2(x + 1, y),     vec4(to_rgb(y10, c10.r, c10.g).bgr, 1.0));
+    imageStore(dst, ivec2(x, y + 1),     vec4(to_rgb(y01, c01.r, c01.g).bgr, 1.0));
+    imageStore(dst, ivec2(x + 1, y + 1), vec4(to_rgb(y11, c11.r, c11.g).bgr, 1.0));
+}

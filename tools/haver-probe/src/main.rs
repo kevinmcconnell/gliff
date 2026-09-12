@@ -112,6 +112,20 @@ enum Cmd {
     },
     /// Feasibility test: can GL render into a VA encoder surface (dmabuf)?
     GlTest,
+    /// Vulkan: device, queues and video capabilities
+    Vk,
+    /// Vulkan: encode and decode synthetic BGRA frames end to end
+    VkRoundtrip {
+        #[arg(long, default_value_t = 640)]
+        width: u32,
+        #[arg(long, default_value_t = 360)]
+        height: u32,
+        #[arg(long, default_value_t = 10)]
+        frames: usize,
+        /// Single 4:2:0 stream instead of Dual420 4:4:4.
+        #[arg(long)]
+        single: bool,
+    },
     /// Run every non-interactive check
     All,
 }
@@ -153,6 +167,8 @@ fn main() -> Result<()> {
         Cmd::Clipboard { set, secs } => clipboard(&target, set, secs)?,
         Cmd::Bench { iters } => bench(iters)?,
         Cmd::GlTest => gltest(&node)?,
+        Cmd::Vk => vk_info(&node)?,
+        Cmd::VkRoundtrip { width, height, frames, single } => vk_roundtrip(&node, width, height, frames, !single)?,
         Cmd::All => {
             protocols(&target)?;
             outputs(&target)?;
@@ -1049,6 +1065,96 @@ fn gltest(node: &std::path::Path) -> Result<()> {
     status(ok, "GL render into VA encoder surface");
     if !ok {
         bail!("server GL-into-VA-surface path is not usable on this GPU");
+    }
+    Ok(())
+}
+
+fn vk_info(node: &std::path::Path) -> Result<()> {
+    let gpu = haver_vk::Gpu::open(Some(node))?;
+    println!("  {} ({})", gpu.name, gpu.driver);
+    status(gpu.can_encode(), "Vulkan H.264 encode queue");
+    status(gpu.can_decode(), "Vulkan H.264 decode queue");
+    Ok(())
+}
+
+/// A synthetic BGRA frame with sharp colour edges and motion, the case the
+/// 4:4:4 path exists for.
+fn synthetic_bgra(w: usize, h: usize, t: usize) -> Vec<u8> {
+    let mut out = vec![0u8; w * h * 4];
+    for y in 0..h {
+        for x in 0..w {
+            let p = &mut out[(y * w + x) * 4..(y * w + x) * 4 + 4];
+            let stripe = ((x + t * 3) / 8) % 4;
+            let (b, g, r) = match stripe {
+                0 => (255, 0, 0),
+                1 => (0, 255, 0),
+                2 => (0, 0, 255),
+                _ => ((x * 255 / w) as u8, (y * 255 / h) as u8, 128),
+            };
+            p[0] = b;
+            p[1] = g;
+            p[2] = r;
+            p[3] = 255;
+        }
+    }
+    out
+}
+
+fn vk_roundtrip(node: &std::path::Path, width: u32, height: u32, frames: usize, dual: bool) -> Result<()> {
+    let gpu = haver_vk::Gpu::open(Some(node))?;
+    println!("  {} ({}) dual={dual}", gpu.name, gpu.driver);
+    let settings = haver_vk::EncoderSettings { width, height, bitrate: haver_vk::EncoderSettings::default_bitrate(width, height, 60), framerate: 60 };
+    let mut encoder = haver_vk::Encoder::new(&gpu, settings, dual).context("vulkan encoder")?;
+    let mut decoder = haver_vk::Decoder::new(&gpu, dual, width, height).context("vulkan decoder")?;
+    let (w, h) = (width as usize, height as usize);
+    let mut min_psnr = f64::MAX;
+    let mut decoded = 0;
+    let mut total_bytes = 0;
+    let start = std::time::Instant::now();
+    for i in 0..frames {
+        let src = synthetic_bgra(w, h, i);
+        let force = i == frames / 2;
+        let t0 = std::time::Instant::now();
+        let packet = encoder.encode_bgra(&src, force).with_context(|| format!("encode frame {i}"))?;
+        let enc_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let aux = packet.aux.as_deref().unwrap_or(&[]);
+        total_bytes += packet.main.len() + aux.len();
+        let t1 = std::time::Instant::now();
+        let out = decoder.decode_to_bgra(&packet.main, aux).with_context(|| format!("decode frame {i}"))?;
+        let dec_ms = t1.elapsed().as_secs_f64() * 1000.0;
+        if i == 0 && !packet.keyframe {
+            bail!("first packet is not a keyframe");
+        }
+        if force && !packet.keyframe {
+            bail!("forced keyframe was not honoured");
+        }
+        let Some(out) = out else {
+            println!("  frame {i}: no output");
+            continue;
+        };
+        decoded += 1;
+        // Compare against what the CPU reference path yields for the same
+        // chroma mode, so 4:2:0's inherent loss is not counted against the GPU.
+        let reference = {
+            let yuv = bgra_to_yuv444(&src, w * 4, w, h);
+            if dual { yuv444_to_bgra(&yuv) } else { yuv444_to_bgra(&haver_proto::chroma::nv12_to_yuv444(&haver_proto::chroma::yuv444_to_nv12(&yuv))) }
+        };
+        let p = psnr(&rgb_channels(&reference), &rgb_channels(&out));
+        min_psnr = min_psnr.min(p);
+        if let Some(dir) = std::env::var_os("HAVER_VK_DUMP") {
+            let dir = std::path::PathBuf::from(dir);
+            let to_rgb = |b: &[u8]| -> Vec<u8> { b.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0]]).collect() };
+            write_png(&dir.join(format!("src{i}.png")), width, height, &to_rgb(&src))?;
+            write_png(&dir.join(format!("out{i}.png")), width, height, &to_rgb(&out))?;
+        }
+        println!("  frame {i}: main {} aux {} bytes key={} enc {enc_ms:.2} ms dec {dec_ms:.2} ms rgb psnr {p:.1} dB", packet.main.len(), aux.len(), packet.keyframe);
+    }
+    let elapsed = start.elapsed().as_secs_f64();
+    println!("  {frames} frames, {total_bytes} bytes, {:.1} fps end to end", frames as f64 / elapsed);
+    status(decoded == frames, &format!("decoded {decoded}/{frames} frames"));
+    status(min_psnr > 30.0, &format!("min RGB PSNR {min_psnr:.1} dB"));
+    if decoded != frames || min_psnr <= 30.0 {
+        bail!("vulkan round-trip failed");
     }
     Ok(())
 }

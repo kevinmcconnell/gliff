@@ -1,0 +1,36 @@
+#version 450
+// AVC444 split: one BGRA/RGBA frame -> main NV12 (Y + even-position chroma)
+// and aux NV12 (the chroma the main stream dropped). One thread per 2x2
+// block. Layout matches haver-proto::chroma::split_yuv444 exactly.
+#include "common.glsl"
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0) uniform sampler2D src;
+layout(set = 0, binding = 1, r8)  uniform writeonly image2D main_y;
+layout(set = 0, binding = 2, rg8) uniform writeonly image2D main_uv;
+layout(set = 0, binding = 3, r8)  uniform writeonly image2D aux_y;
+layout(set = 0, binding = 4, rg8) uniform writeonly image2D aux_uv;
+layout(push_constant) uniform Push { int width; int height; int has_aux; } pc;
+
+vec3 px(int x, int y) {
+    return texelFetch(src, ivec2(clamp(x, 0, pc.width - 1), clamp(y, 0, pc.height - 1)), 0).rgb * 255.0;
+}
+
+void main() {
+    int bx = int(gl_GlobalInvocationID.x);
+    int by = int(gl_GlobalInvocationID.y);
+    int x = 2 * bx, y = 2 * by;
+    if (x >= pc.width || y >= pc.height) return;
+    vec3 c00 = px(x, y), c10 = px(x + 1, y), c01 = px(x, y + 1), c11 = px(x + 1, y + 1);
+    imageStore(main_y, ivec2(x, y),         vec4(luma(c00)));
+    imageStore(main_y, ivec2(x + 1, y),     vec4(luma(c10)));
+    imageStore(main_y, ivec2(x, y + 1),     vec4(luma(c01)));
+    imageStore(main_y, ivec2(x + 1, y + 1), vec4(luma(c11)));
+    imageStore(main_uv, ivec2(bx, by), vec4(chroma_u(c00), chroma_v(c00), 0.0, 0.0));
+    if (pc.has_aux == 0) return;
+    imageStore(aux_uv, ivec2(bx, by), vec4(chroma_u(c10), chroma_v(c10), 0.0, 0.0));
+    int half_h = pc.height / 2;
+    imageStore(aux_y, ivec2(x, by),              vec4(chroma_u(c01)));
+    imageStore(aux_y, ivec2(x + 1, by),          vec4(chroma_u(c11)));
+    imageStore(aux_y, ivec2(x, half_h + by),     vec4(chroma_v(c01)));
+    imageStore(aux_y, ivec2(x + 1, half_h + by), vec4(chroma_v(c11)));
+}

@@ -9,6 +9,7 @@ members = [
     "crates/hypr-input",
     "crates/haver-codec",
     "crates/haver-gl",
+    "crates/haver-vk",
     "bins/haver-server",
     "bins/haver-client",
     "tools/haver-probe",
@@ -35,6 +36,7 @@ hypr-capture = { path = "crates/hypr-capture" }
 hypr-input = { path = "crates/hypr-input" }
 haver-codec = { path = "crates/haver-codec" }
 haver-gl = { path = "crates/haver-gl" }
+haver-vk = { path = "crates/haver-vk" }
 
 anyhow = "1"
 thiserror = "2"

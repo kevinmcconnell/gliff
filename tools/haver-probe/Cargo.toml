@@ -23,5 +23,6 @@ haver-codec.workspace = true
 haver-transport.workspace = true
 haver-proto.workspace = true
 haver-gl.workspace = true
+haver-vk.workspace = true
 drm-fourcc.workspace = true
 tokio.workspace = true
