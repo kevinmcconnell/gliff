@@ -491,7 +491,24 @@ fn input(target: &Target, output: Option<String>, text: &str, click: bool) -> Re
     Ok(())
 }
 
-fn serve_test(node: &std::path::Path, addr: &str, frames: usize) -> Result<()> {
+enum TestDecoder {
+    Dual(haver_codec::dual::DualDecoder),
+    Single(haver_codec::single::SingleDecoder),
+}
+impl TestDecoder {
+    fn new(chroma: haver_proto::ChromaMode, w: usize, h: usize) -> Result<Self> {
+        let display = vaapi::open_display(&vaapi::render_node(None))?;
+        Ok(match chroma {
+            haver_proto::ChromaMode::Single420 => TestDecoder::Single(haver_codec::single::SingleDecoder::new(display, w, h)?),
+            _ => TestDecoder::Dual(haver_codec::dual::DualDecoder::new(display, w, h)?),
+        })
+    }
+    fn decode(&mut self, ts: u64, main: &[u8], aux: &[u8]) -> haver_codec::Result<Option<haver_proto::chroma::Yuv444>> {
+        match self { TestDecoder::Dual(d) => d.decode(ts, main, aux), TestDecoder::Single(s) => s.decode(ts, main) }
+    }
+}
+
+fn serve_test(_node: &std::path::Path, addr: &str, frames: usize) -> Result<()> {
     use haver_proto::{ChromaMode, ClientCaps, ClientMsg, Codec, ServerMsg};
     use haver_transport::Framed;
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
@@ -510,8 +527,7 @@ fn serve_test(node: &std::path::Path, addr: &str, frames: usize) -> Result<()> {
         let cfg = reader.read_msg::<ServerMsg>().await?;
         let (mut w, mut h, mut chroma) = match cfg { ServerMsg::StreamConfig { width, height, chroma, .. } => (width as usize, height as usize, chroma), o => bail!("expected StreamConfig, got {o:?}") };
         eprintln!("  StreamConfig: {w}x{h} chroma {chroma:?}");
-        let display = vaapi::open_display(node)?;
-        let mut decoder = haver_codec::dual::DualDecoder::new(display, w, h)?;
+        let mut decoder = TestDecoder::new(chroma, w, h)?;
         let mut got = 0usize;
         let mut keyframes = 0usize;
         while got < frames {
@@ -530,8 +546,7 @@ fn serve_test(node: &std::path::Path, addr: &str, frames: usize) -> Result<()> {
                 ServerMsg::StreamConfig { width, height, chroma: c, .. } => {
                     w = width as usize; h = height as usize; chroma = c;
                     eprintln!("  reconfig to {w}x{h}");
-                    let display = vaapi::open_display(node)?;
-                    decoder = haver_codec::dual::DualDecoder::new(display, w, h)?;
+                    decoder = TestDecoder::new(chroma, w, h)?;
                 }
                 ServerMsg::CursorShape { argb_len, .. } => { let _ = reader.read_payload(argb_len).await?; }
                 ServerMsg::CursorPos { .. } | ServerMsg::Pong { .. } | ServerMsg::Error { .. } => {}

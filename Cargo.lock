@@ -928,6 +928,8 @@ dependencies = [
  "haver-codec",
  "haver-proto",
  "haver-transport",
+ "hypr-input",
+ "hypr-ipc",
  "libadwaita",
  "tokio",
  "tracing",

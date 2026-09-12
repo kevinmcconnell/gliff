@@ -9,11 +9,37 @@ use std::sync::mpsc::{Sender as StdSender, SyncSender};
 
 use haver_codec::color::yuv444_to_bgra;
 use haver_codec::dual::DualDecoder;
+use haver_codec::single::SingleDecoder;
 use haver_codec::vaapi;
+use haver_proto::chroma::Yuv444;
 use haver_proto::{ChromaMode, ClientCaps, ClientMsg, Codec, ServerMsg, PROTOCOL_VERSION};
 use haver_transport::{spawn_ssh, Framed, SshTarget};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
+
+/// The active decoder, matching the server's chroma mode.
+#[allow(clippy::large_enum_variant)]
+enum Decoder {
+    Dual(DualDecoder),
+    Single(SingleDecoder),
+}
+
+impl Decoder {
+    fn new(chroma: ChromaMode, width: usize, height: usize) -> anyhow::Result<Self> {
+        let display = vaapi::open_display(&vaapi::render_node(None))?;
+        Ok(match chroma {
+            ChromaMode::Single420 => Decoder::Single(SingleDecoder::new(display, width, height)?),
+            _ => Decoder::Dual(DualDecoder::new(display, width, height)?),
+        })
+    }
+
+    fn decode(&mut self, ts: u64, main: &[u8], aux: &[u8]) -> haver_codec::Result<Option<Yuv444>> {
+        match self {
+            Decoder::Dual(d) => d.decode(ts, main, aux),
+            Decoder::Single(s) => s.decode(ts, main),
+        }
+    }
+}
 
 /// A decoded frame ready to display, as tightly packed BGRA.
 pub struct DecodedFrame {
@@ -26,11 +52,14 @@ pub struct DecodedFrame {
 pub enum Status {
     Connected { width: u32, height: u32 },
     Stats { fps: f32, mbit: f32, decode_ms: f32 },
+    /// The remote cursor image, for the client to set as its widget cursor.
+    Cursor { width: u32, height: u32, hot_x: i32, hot_y: i32, argb: Vec<u8> },
     Error(String),
     Closed,
 }
 
 /// How to reach the server.
+#[derive(Clone)]
 pub enum Endpoint {
     Tcp(String),
     Ssh(SshTarget),
@@ -99,20 +128,19 @@ where
         max_height: 2160,
         chroma: vec![ChromaMode::Dual420, ChromaMode::Single420],
     };
-    // Keymap sync is not wired yet; the server falls back to a us layout.
-    writer.write_msg(&ClientMsg::Hello { version: PROTOCOL_VERSION, keymap: String::new(), caps }).await?;
+    let keymap = crate::keymap::local_keymap();
+    writer.write_msg(&ClientMsg::Hello { version: PROTOCOL_VERSION, keymap, caps }).await?;
 
     let ack = reader.read_msg::<ServerMsg>().await?;
     let ServerMsg::HelloAck { .. } = ack else {
         anyhow::bail!("expected HelloAck, got {ack:?}");
     };
     let cfg = reader.read_msg::<ServerMsg>().await?;
-    let (mut width, mut height) = match cfg {
-        ServerMsg::StreamConfig { width, height, .. } => (width as usize, height as usize),
+    let (mut width, mut height, mut chroma) = match cfg {
+        ServerMsg::StreamConfig { width, height, chroma, .. } => (width as usize, height as usize, chroma),
         other => anyhow::bail!("expected StreamConfig, got {other:?}"),
     };
-    let display = vaapi::open_display(&vaapi::render_node(None))?;
-    let mut decoder = DualDecoder::new(display, width, height)?;
+    let mut decoder = Decoder::new(chroma, width, height)?;
     let _ = status.send(Status::Connected { width: width as u32, height: height as u32 });
     tracing::info!(width, height, "connected");
     let mut logged_first = false;
@@ -180,15 +208,16 @@ where
                     }
                 }
             }
-            ServerMsg::StreamConfig { width: w, height: h, .. } => {
+            ServerMsg::StreamConfig { width: w, height: h, chroma: c, .. } => {
                 width = w as usize;
                 height = h as usize;
-                let display = vaapi::open_display(&vaapi::render_node(None))?;
-                decoder = DualDecoder::new(display, width, height)?;
+                chroma = c;
+                decoder = Decoder::new(chroma, width, height)?;
                 let _ = status.send(Status::Connected { width: w, height: h });
             }
-            ServerMsg::CursorShape { argb_len, .. } => {
-                let _ = reader.read_payload(argb_len).await?;
+            ServerMsg::CursorShape { width, height, hot_x, hot_y, argb_len, .. } => {
+                let argb = reader.read_payload(argb_len).await?.to_vec();
+                let _ = status.send(Status::Cursor { width, height, hot_x, hot_y, argb });
             }
             ServerMsg::ClipboardData { data_len, .. } => {
                 let _ = reader.read_payload(data_len).await?;

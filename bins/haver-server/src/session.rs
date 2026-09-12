@@ -10,6 +10,7 @@ use tokio::sync::mpsc;
 
 use haver_codec::color::bgra_to_yuv444;
 use haver_codec::dual::DualEncoder;
+use haver_codec::single::SingleEncoder;
 use haver_codec::h264::EncoderSettings;
 use haver_proto::{
     ChromaMode, ClientMsg, Codec, OutputInfo as ProtoOutput, Rect, ServerMsg, SessionInfo, PROTOCOL_VERSION,
@@ -95,7 +96,7 @@ where
     // 6. Encoder.
     let display = haver_codec::vaapi::open_display(&render_node).context("open VA display")?;
     let mut settings = encoder_settings(width, height, cfg.bitrate);
-    let mut encoder = DualEncoder::new(display.clone(), settings.clone()).context("create encoder")?;
+    let mut encoder = Encoder::new(display.clone(), settings.clone(), chroma).context("create encoder")?;
 
     // 7. Loop state.
     let mut pending: Option<(Vec<u8>, usize, usize)> = None;
@@ -161,7 +162,7 @@ where
                             instance.set_monitor_mode(&output_name, rw, rh, 60, 1.0).ok();
                             width = rw; height = rh;
                             settings = encoder_settings(width, height, cfg.bitrate);
-                            encoder = DualEncoder::new(display.clone(), settings.clone()).context("reconfigure encoder")?;
+                            encoder = Encoder::new(display.clone(), settings.clone(), chroma).context("reconfigure encoder")?;
                             input.send(InputCmd::SetExtent { width, height }).ok();
                             pending = None;
                             want_keyframe = true;
@@ -200,25 +201,25 @@ where
                     let src = bgra_to_yuv444(&bgra, fw * 4, fw, fh);
                     let key = std::mem::take(&mut want_keyframe);
                     let t0 = Instant::now();
-                    let packet = encoder.encode(&src, frame_id, key)?;
+                    let (main, aux, keyframe) = encoder.encode(&src, frame_id, key)?;
                     let enc_us = t0.elapsed().as_micros();
                     let damage = vec![Rect { x: 0, y: 0, width: width as i32, height: height as i32 }];
-                    let (aux_len, aux_slice): (u32, &[u8]) =
-                        if chroma == ChromaMode::Dual420 { (packet.aux.len() as u32, &packet.aux) } else { (0, &[]) };
+                    let aux = aux.unwrap_or_default();
+                    let aux_len = aux.len() as u32;
                     writer
                         .write_msg_with_payloads(
                             &ServerMsg::VideoFrame {
                                 frame_id,
                                 pts_us: now_ms() * 1000,
-                                keyframe: packet.keyframe,
+                                keyframe,
                                 damage,
-                                data_len: packet.main.len() as u32,
+                                data_len: main.len() as u32,
                                 aux_len,
                             },
-                            &[&packet.main, aux_slice],
+                            &[&main, &aux],
                         )
                         .await?;
-                    tracing::debug!(frame_id, key = packet.keyframe, main = packet.main.len(), aux = aux_len, enc_us, in_flight, n_limit, "sent frame");
+                    tracing::debug!(frame_id, key = keyframe, main = main.len(), aux = aux_len, enc_us, in_flight, n_limit, "sent frame");
                     rtt.on_sent(frame_id);
                     frame_id += 1;
                     in_flight += 1;
@@ -237,6 +238,37 @@ where
     drop(capturer);
     // `_output_guard` removes the headless output on drop.
     Ok(())
+}
+
+/// The active video encoder: full 4:4:4 over two streams, or a single 4:2:0
+/// stream for `--low-bandwidth`.
+#[allow(clippy::large_enum_variant)]
+enum Encoder {
+    Dual(DualEncoder),
+    Single(SingleEncoder),
+}
+
+impl Encoder {
+    fn new(display: std::rc::Rc<haver_codec::libva::Display>, settings: EncoderSettings, chroma: ChromaMode) -> Result<Self> {
+        Ok(match chroma {
+            ChromaMode::Single420 => Encoder::Single(SingleEncoder::new(display, settings)?),
+            _ => Encoder::Dual(DualEncoder::new(display, settings)?),
+        })
+    }
+
+    /// Encode one 4:4:4 frame; returns (main, optional aux, keyframe).
+    fn encode(&mut self, src: &haver_proto::chroma::Yuv444, ts: u64, force: bool) -> Result<(Vec<u8>, Option<Vec<u8>>, bool)> {
+        match self {
+            Encoder::Dual(d) => {
+                let p = d.encode(src, ts, force)?;
+                Ok((p.main, Some(p.aux), p.keyframe))
+            }
+            Encoder::Single(s) => {
+                let (main, key) = s.encode(src, ts, force)?;
+                Ok((main, None, key))
+            }
+        }
+    }
 }
 
 /// Removes a created headless output when the session ends, on any path.

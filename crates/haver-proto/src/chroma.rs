@@ -114,6 +114,33 @@ pub fn recombine_yuv444(main: &Nv12, aux: &Nv12) -> Yuv444 {
     out
 }
 
+/// Upsample one NV12 (4:2:0) frame to 4:4:4 by duplicating each chroma sample
+/// across its 2x2 block. Used for the low-bandwidth single-stream path.
+pub fn nv12_to_yuv444(main: &Nv12) -> Yuv444 {
+    let (w, h) = (main.width, main.height);
+    let mut out = Yuv444::new(w, h);
+    out.y.copy_from_slice(&main.y);
+    for by in 0..h / 2 {
+        for bx in 0..w / 2 {
+            let u = main.uv[by * w + bx * 2];
+            let v = main.uv[by * w + bx * 2 + 1];
+            for dy in 0..2 {
+                for dx in 0..2 {
+                    let idx = (2 * by + dy) * w + 2 * bx + dx;
+                    out.u[idx] = u;
+                    out.v[idx] = v;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Subsample 4:4:4 to a single NV12 (4:2:0) frame: the main frame of the split.
+pub fn yuv444_to_nv12(src: &Yuv444) -> Nv12 {
+    split_yuv444(src).0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

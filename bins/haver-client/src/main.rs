@@ -4,6 +4,7 @@
 //! Decode runs on a worker thread (see `net`); this file is the UI. There is no
 //! `unsafe` here: decoded frames arrive as BGRA and become a `gdk::MemoryTexture`.
 
+mod keymap;
 mod net;
 
 use std::cell::RefCell;
@@ -45,6 +46,10 @@ struct App {
     status: gtk::Label,
     stream_size: Rc<RefCell<(u32, u32)>>,
     input_tx: Rc<RefCell<Option<UnboundedSender<ClientMsg>>>>,
+    /// The last endpoint, kept so a dropped connection can be retried.
+    endpoint: Rc<RefCell<Option<Endpoint>>>,
+    /// Consecutive failed connection attempts, reset on a successful connect.
+    retries: Rc<RefCell<u32>>,
 }
 
 fn main() -> glib::ExitCode {
@@ -91,6 +96,8 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         status: status.clone(),
         stream_size: Rc::new(RefCell::new((0, 0))),
         input_tx: Rc::new(RefCell::new(None)),
+        endpoint: Rc::new(RefCell::new(None)),
+        retries: Rc::new(RefCell::new(0)),
     });
 
     install_input_handlers(&ui, &picture, &window);
@@ -154,6 +161,7 @@ fn start_session(ui: Rc<App>, endpoint: Endpoint) {
     let (status_tx, status_rx) = channel::<Status>();
     let (input_tx, input_rx) = unbounded_channel::<ClientMsg>();
     *ui.input_tx.borrow_mut() = Some(input_tx);
+    *ui.endpoint.borrow_mut() = Some(endpoint.clone());
     ui.status.set_text("Connecting…");
 
     std::thread::Builder::new()
@@ -165,6 +173,23 @@ fn start_session(ui: Rc<App>, endpoint: Endpoint) {
 
     poll_frames(ui.clone(), frame_rx);
     poll_status(ui, status_rx);
+}
+
+const MAX_RETRIES: u32 = 5;
+
+/// Schedule a reconnect after a short delay, unless we have exhausted retries.
+fn schedule_reconnect(ui: Rc<App>) {
+    let n = { let mut r = ui.retries.borrow_mut(); *r += 1; *r };
+    if n > MAX_RETRIES {
+        ui.status.set_text("Disconnected — press Connect to retry");
+        return;
+    }
+    let Some(endpoint) = ui.endpoint.borrow().clone() else { return };
+    ui.status.set_text(&format!("Reconnecting… (attempt {n})"));
+    let ui2 = ui.clone();
+    glib::timeout_add_local_once(Duration::from_millis(1500), move || {
+        start_session(ui2, endpoint);
+    });
 }
 
 /// Pull decoded frames on the GTK main loop, latest-wins, and paint them.
@@ -189,18 +214,47 @@ fn poll_status(ui: Rc<App>, rx: Receiver<Status>) {
             match s {
                 Status::Connected { width, height } => {
                     *ui.stream_size.borrow_mut() = (width, height);
+                    *ui.retries.borrow_mut() = 0;
                     ui.status.set_text(&format!("Connected — {width}x{height}"));
                 }
                 Status::Stats { fps, mbit, decode_ms } => {
                     ui.stats.set_visible(true);
                     ui.stats.set_text(&format!("{fps:.0} fps  {mbit:.1} Mbit/s  decode {decode_ms:.1} ms"));
                 }
-                Status::Error(e) => ui.status.set_text(&format!("Error: {e}")),
-                Status::Closed => ui.status.set_text("Disconnected"),
+                Status::Cursor { width, height, hot_x, hot_y, argb } => set_remote_cursor(&ui, width, height, hot_x, hot_y, &argb),
+                Status::Error(e) => {
+                    ui.status.set_text(&format!("Error: {e}"));
+                    schedule_reconnect(ui.clone());
+                    return glib::ControlFlow::Break;
+                }
+                Status::Closed => {
+                    schedule_reconnect(ui.clone());
+                    return glib::ControlFlow::Break;
+                }
             }
         }
         glib::ControlFlow::Continue
     });
+}
+
+/// Show the remote cursor as the video widget's own cursor, so the local
+/// compositor draws it at the real pointer position with no added latency.
+fn set_remote_cursor(ui: &App, width: u32, height: u32, hot_x: i32, hot_y: i32, argb: &[u8]) {
+    if width == 0 || height == 0 || argb.len() < (width * height * 4) as usize {
+        return;
+    }
+    let opaque = argb.chunks_exact(4).any(|p| p[3] != 0);
+    if !opaque {
+        // Fully transparent: hide the pointer over the video.
+        if let Some(cursor) = gdk::Cursor::from_name("none", None) {
+            ui.picture.set_cursor(Some(&cursor));
+        }
+        return;
+    }
+    let bytes = glib::Bytes::from(argb);
+    let texture = gdk::MemoryTexture::new(width as i32, height as i32, gdk::MemoryFormat::B8g8r8a8, &bytes, width as usize * 4);
+    let cursor = gdk::Cursor::from_texture(&texture, hot_x, hot_y, None);
+    ui.picture.set_cursor(Some(&cursor));
 }
 
 /// Map a widget-space point to remote output coordinates.
@@ -319,7 +373,26 @@ fn install_input_handlers(ui: &Rc<App>, picture: &gtk::Picture, window: &adw::Ap
         });
     }
 
-    let _ = window;
+    // While the video has focus, route system shortcuts (Super, Alt-Tab, ...)
+    // to the remote session instead of the local compositor.
+    let focus = gtk::EventControllerFocus::new();
+    {
+        let window = window.clone();
+        focus.connect_enter(move |_| {
+            if let Some(toplevel) = window.surface().and_downcast::<gdk::Toplevel>() {
+                toplevel.inhibit_system_shortcuts(None::<&gdk::Event>);
+            }
+        });
+    }
+    {
+        let window = window.clone();
+        focus.connect_leave(move |_| {
+            if let Some(toplevel) = window.surface().and_downcast::<gdk::Toplevel>() {
+                toplevel.restore_system_shortcuts();
+            }
+        });
+    }
+    picture.add_controller(focus);
 }
 
 /// GTK button number to evdev `BTN_*`.

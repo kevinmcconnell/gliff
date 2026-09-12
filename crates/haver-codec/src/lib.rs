@@ -6,6 +6,7 @@
 pub mod annexb;
 pub mod color;
 pub mod dual;
+pub mod single;
 pub mod frame;
 pub mod h264;
 pub mod vaapi;
