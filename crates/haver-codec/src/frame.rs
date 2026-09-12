@@ -13,6 +13,7 @@ use cros_codecs::video_frame::{ReadMapping, VideoFrame, WriteMapping};
 use cros_codecs::{FrameLayout, Fourcc, PlaneLayout, Resolution};
 use drm_fourcc::DrmModifier;
 use gbm::{BufferObjectFlags, Device, Format};
+use haver_proto::chroma::Nv12;
 
 use crate::{Error, Result};
 
@@ -113,6 +114,21 @@ impl Nv12Frame {
         let mapping = self.inner().map().map_err(Error::Gbm)?;
         let planes = mapping.get();
         Ok(f(planes[0], planes[1], pitches[0], pitches[1]))
+    }
+
+    /// Copy the top-left `width` x `height` of the frame into a packed NV12
+    /// buffer (the visible area of a 16-aligned coded frame).
+    pub fn read_nv12(&self, width: usize, height: usize) -> Result<Nv12> {
+        let mut out = Nv12::new(width, height);
+        self.with_planes(|y, uv, y_pitch, uv_pitch| {
+            for (dst, src) in out.y.chunks_exact_mut(width).zip(y.chunks(y_pitch)) {
+                dst.copy_from_slice(&src[..width]);
+            }
+            for (dst, src) in out.uv.chunks_exact_mut(width).zip(uv.chunks(uv_pitch)) {
+                dst.copy_from_slice(&src[..width]);
+            }
+        })?;
+        Ok(out)
     }
 }
 

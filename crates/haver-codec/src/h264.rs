@@ -1,25 +1,24 @@
 //! H.264 encode and decode wrappers over cros-codecs' stateless VA-API path.
 
+use std::borrow::Borrow;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use cros_codecs::backend::vaapi::decoder::VaapiBackend as DecBackend;
 use cros_codecs::backend::vaapi::encoder::VaapiBackend as EncBackend;
 use cros_codecs::backend::vaapi::surface_pool::{PooledVaSurface, VaSurfacePool};
-use cros_codecs::decoder::FramePool as _;
-use cros_codecs::libva::{Image, UsageHint, VAProfile, VA_FOURCC_NV12, VA_RT_FORMAT_YUV420};
 use cros_codecs::codec::h264::parser::{Level, Profile};
 use cros_codecs::decoder::stateless::h264::H264;
 use cros_codecs::decoder::stateless::{DecodeError, StatelessDecoder, StatelessVideoDecoder};
+use cros_codecs::decoder::FramePool as _;
 use cros_codecs::decoder::{DecodedHandle, DecoderEvent};
 use cros_codecs::encoder::h264::EncoderConfig;
 use cros_codecs::encoder::stateless::h264::StatelessEncoder;
 use cros_codecs::encoder::{FrameMetadata, PredictionStructure, RateControl, Tunings, VideoEncoder};
-use cros_codecs::libva::Display;
+use cros_codecs::libva::{Display, Image, UsageHint, VAProfile, VA_FOURCC_NV12, VA_RT_FORMAT_YUV420};
 use cros_codecs::{BlockingMode, FrameLayout, PlaneLayout, Resolution};
 
 use crate::frame::{align_up, nv12, FrameAllocator, FramePool, Nv12Frame};
-use std::borrow::Borrow;
 use crate::{annexb, Error, Result};
 
 #[derive(Debug, Clone)]
@@ -38,9 +37,7 @@ impl EncoderSettings {
         // ~0.1 bits per pixel per frame keeps text crisp on a LAN.
         ((width as u64 * height as u64 * framerate as u64) / 10).min(80_000_000) as u32
     }
-}
 
-impl EncoderSettings {
     pub fn coded_width(&self) -> u32 {
         align_up(self.width, 16)
     }

@@ -3,12 +3,12 @@
 //! halved. This is never the quality baseline; it exists to save bandwidth.
 
 use std::rc::Rc;
+use std::sync::Arc;
 
 use cros_codecs::libva::Display;
-use haver_proto::chroma::{nv12_to_yuv444, yuv444_to_nv12, Nv12, Yuv444};
+use haver_proto::chroma::{nv12_to_yuv444, yuv444_to_nv12, Yuv444};
 
 use crate::frame::{FrameAllocator, Nv12Frame};
-use std::sync::Arc;
 use crate::h264::{EncoderSettings, H264Decoder, H264Encoder};
 use crate::Result;
 
@@ -57,18 +57,9 @@ impl SingleDecoder {
     }
 
     pub fn decode(&mut self, timestamp: u64, main: &[u8]) -> Result<Option<Yuv444>> {
-        let Some(f) = self.dec.decode(timestamp, main)?.into_iter().next() else {
-            return Ok(None);
-        };
-        let mut nv12 = Nv12::new(self.width, self.height);
-        f.frame.with_planes(|y, uv, py, puv| {
-            for row in 0..self.height {
-                nv12.y[row * self.width..row * self.width + self.width].copy_from_slice(&y[row * py..row * py + self.width]);
-            }
-            for row in 0..self.height / 2 {
-                nv12.uv[row * self.width..row * self.width + self.width].copy_from_slice(&uv[row * puv..row * puv + self.width]);
-            }
-        })?;
-        Ok(Some(nv12_to_yuv444(&nv12)))
+        match self.decode_frame(timestamp, main)? {
+            Some(frame) => Ok(Some(nv12_to_yuv444(&frame.read_nv12(self.width, self.height)?))),
+            None => Ok(None),
+        }
     }
 }

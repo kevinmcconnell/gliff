@@ -6,13 +6,15 @@
 pub mod annexb;
 pub mod color;
 pub mod dual;
-pub mod single;
 pub mod frame;
 pub mod gl_split;
 pub mod h264;
+pub mod single;
+pub mod stream;
 pub mod vaapi;
 
 pub use cros_codecs::libva;
+pub use stream::{DecodedPlanes, Decoder, EncodedFrame, Encoder};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

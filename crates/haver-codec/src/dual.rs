@@ -9,7 +9,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use cros_codecs::libva::Display;
-use haver_proto::chroma::{recombine_yuv444, split_yuv444, Nv12, Yuv444};
+use haver_proto::chroma::{recombine_yuv444, split_yuv444, Yuv444};
 
 use crate::frame::Nv12Frame;
 use crate::h264::{EncoderSettings, H264Decoder, H264Encoder};
@@ -133,24 +133,11 @@ impl DualDecoder {
     pub fn decode(&mut self, timestamp: u64, main: &[u8], aux: &[u8]) -> Result<Option<Yuv444>> {
         match self.decode_pair(timestamp, main, aux)? {
             Some(pair) => {
-                let m = read_nv12(&pair.main, self.width, self.height)?;
-                let a = read_nv12(&pair.aux, self.width, self.height)?;
+                let m = pair.main.read_nv12(self.width, self.height)?;
+                let a = pair.aux.read_nv12(self.width, self.height)?;
                 Ok(Some(recombine_yuv444(&m, &a)))
             }
             None => Ok(None),
         }
     }
-}
-
-fn read_nv12(frame: &Nv12Frame, width: usize, height: usize) -> Result<Nv12> {
-    let mut out = Nv12::new(width, height);
-    frame.with_planes(|y, uv, py, puv| {
-        for row in 0..height {
-            out.y[row * width..row * width + width].copy_from_slice(&y[row * py..row * py + width]);
-        }
-        for row in 0..height / 2 {
-            out.uv[row * width..row * width + width].copy_from_slice(&uv[row * puv..row * puv + width]);
-        }
-    })?;
-    Ok(out)
 }
