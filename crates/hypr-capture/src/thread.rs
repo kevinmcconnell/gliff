@@ -1,0 +1,647 @@
+//! The capture thread: Wayland dispatch, buffer ring, session state machine.
+
+use std::fs::File;
+use std::os::fd::AsFd;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use calloop::channel::{self, Sender};
+use calloop::EventLoop;
+use calloop_wayland_source::WaylandSource;
+use drm_fourcc::{DrmFourcc, DrmModifier};
+use gbm::{BufferObjectFlags, Device};
+use wayland_client::globals::GlobalListContents;
+use wayland_client::protocol::wl_buffer::WlBuffer;
+use wayland_client::protocol::wl_output::{self, WlOutput};
+use wayland_client::protocol::wl_pointer::WlPointer;
+use wayland_client::protocol::wl_registry::WlRegistry;
+use wayland_client::protocol::wl_seat::{self, WlSeat};
+use wayland_client::protocol::wl_shm::WlShm;
+use wayland_client::protocol::wl_shm_pool::WlShmPool;
+use wayland_client::{delegate_noop, Connection, Dispatch, QueueHandle};
+use wayland_protocols::ext::image_capture_source::v1::client::ext_image_capture_source_v1::ExtImageCaptureSourceV1;
+use wayland_protocols::ext::image_capture_source::v1::client::ext_output_image_capture_source_manager_v1::ExtOutputImageCaptureSourceManagerV1;
+use wayland_protocols::ext::image_copy_capture::v1::client::ext_image_copy_capture_cursor_session_v1::{
+    self as cursor_session, ExtImageCopyCaptureCursorSessionV1,
+};
+use wayland_protocols::ext::image_copy_capture::v1::client::ext_image_copy_capture_frame_v1::{
+    self as frame_proto, ExtImageCopyCaptureFrameV1,
+};
+use wayland_protocols::ext::image_copy_capture::v1::client::ext_image_copy_capture_manager_v1::{
+    self as manager, ExtImageCopyCaptureManagerV1,
+};
+use wayland_protocols::ext::image_copy_capture::v1::client::ext_image_copy_capture_session_v1::{
+    self as session_proto, ExtImageCopyCaptureSessionV1,
+};
+use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_buffer_params_v1::{self, ZwpLinuxBufferParamsV1};
+use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1;
+
+use crate::cursor::ShmBuffer;
+use crate::{
+    CaptureBuffer, CaptureConfig, CaptureEvent, CapturedFrame, DmabufInfo, Error, EventSink, OutputInfo, Plane, Rect,
+    Result,
+};
+use hypr_wl::{Outputs, Seat, Target};
+
+pub enum Cmd {
+    RequestFrame,
+    Release(usize),
+    Stop,
+}
+
+/// Which session an object belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Screen,
+    Cursor,
+}
+
+struct RingSlot {
+    buffer: Arc<CaptureBuffer>,
+    wl_buffer: WlBuffer,
+    busy: bool,
+}
+
+#[derive(Default)]
+struct Constraints {
+    width: u32,
+    height: u32,
+    formats: Vec<(u32, Vec<u64>)>,
+    shm_formats: Vec<u32>,
+    done: bool,
+}
+
+struct State {
+    cfg: CaptureConfig,
+    sink: EventSink,
+    conn: Connection,
+    qh: QueueHandle<State>,
+    outputs: Outputs,
+    seat: Seat,
+    dmabuf: ZwpLinuxDmabufV1,
+    shm: Option<WlShm>,
+    source_mgr: ExtOutputImageCaptureSourceManagerV1,
+    copy_mgr: ExtImageCopyCaptureManagerV1,
+    device: Arc<Mutex<Device<File>>>,
+    cmd_tx: Sender<Cmd>,
+
+    output: Option<(WlOutput, OutputInfo)>,
+    source: Option<ExtImageCaptureSourceV1>,
+    session: Option<ExtImageCopyCaptureSessionV1>,
+    constraints: Constraints,
+    ring: Vec<RingSlot>,
+    ring_format: Option<(u32, u64)>,
+    in_flight: Option<(ExtImageCopyCaptureFrameV1, usize)>,
+    pending_damage: Vec<Rect>,
+    pending_presentation: u64,
+    want_frame: bool,
+    sequence: u64,
+
+    pointer: Option<WlPointer>,
+    cursor_session: Option<ExtImageCopyCaptureCursorSessionV1>,
+    cursor_capture: Option<ExtImageCopyCaptureSessionV1>,
+    cursor_constraints: Constraints,
+    cursor_buf: Option<ShmBuffer>,
+    cursor_frame: Option<ExtImageCopyCaptureFrameV1>,
+    cursor_hotspot: (i32, i32),
+    cursor_pos: (i32, i32),
+    cursor_visible: bool,
+
+    stopped: bool,
+    quit: bool,
+}
+
+pub fn spawn(cfg: CaptureConfig, sink: EventSink) -> Result<(Sender<Cmd>, std::thread::JoinHandle<()>)> {
+    let (tx, rx) = channel::channel::<Cmd>();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<()>>();
+    let tx2 = tx.clone();
+    let join = std::thread::Builder::new()
+        .name("hypr-capture".into())
+        .spawn(move || {
+            let mut sink = sink;
+            match run(cfg, &mut sink, tx2, rx, ready_tx.clone()) {
+                Ok(()) => {}
+                Err(e) => {
+                    let _ = ready_tx.send(Err(Error::Capture(e.to_string())));
+                    sink(CaptureEvent::Error(e.to_string()));
+                }
+            }
+        })?;
+    match ready_rx.recv() {
+        Ok(Ok(())) => Ok((tx, join)),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(Error::ThreadGone),
+    }
+}
+
+fn run(
+    cfg: CaptureConfig,
+    sink: &mut EventSink,
+    cmd_tx: Sender<Cmd>,
+    rx: channel::Channel<Cmd>,
+    ready_tx: std::sync::mpsc::Sender<Result<()>>,
+) -> Result<()> {
+    let (conn, globals, mut queue) = hypr_wl::init::<State>(&cfg.target)?;
+    let qh = queue.handle();
+    let dmabuf: ZwpLinuxDmabufV1 = globals.bind(&qh, 3..=5, ()).map_err(|_| hypr_wl::Error::MissingGlobal("zwp_linux_dmabuf_v1"))?;
+    let source_mgr: ExtOutputImageCaptureSourceManagerV1 = globals
+        .bind(&qh, 1..=1, ())
+        .map_err(|_| hypr_wl::Error::MissingGlobal("ext_output_image_capture_source_manager_v1"))?;
+    let copy_mgr: ExtImageCopyCaptureManagerV1 =
+        globals.bind(&qh, 1..=1, ()).map_err(|_| hypr_wl::Error::MissingGlobal("ext_image_copy_capture_manager_v1"))?;
+    let shm: Option<WlShm> = globals.bind(&qh, 1..=1, ()).ok();
+    let outputs = Outputs::bind(&globals, &qh)?;
+    let seat = Seat::bind(&globals, &qh)?;
+    let file = File::options().read(true).write(true).open(&cfg.render_node)?;
+    let device = Device::new(file).map_err(|e| Error::Gbm(format!("open {}: {e}", cfg.render_node.display())))?;
+
+    let mut state = State {
+        sink: Box::new(|_| {}),
+        conn: conn.clone(),
+        qh: qh.clone(),
+        outputs,
+        seat,
+        dmabuf,
+        shm,
+        source_mgr,
+        copy_mgr,
+        device: Arc::new(Mutex::new(device)),
+        cmd_tx,
+        output: None,
+        source: None,
+        session: None,
+        constraints: Constraints::default(),
+        ring: Vec::new(),
+        ring_format: None,
+        in_flight: None,
+        pending_damage: Vec::new(),
+        pending_presentation: 0,
+        want_frame: false,
+        sequence: 0,
+        pointer: None,
+        cursor_session: None,
+        cursor_capture: None,
+        cursor_constraints: Constraints::default(),
+        cursor_buf: None,
+        cursor_frame: None,
+        cursor_hotspot: (0, 0),
+        cursor_pos: (0, 0),
+        cursor_visible: false,
+        stopped: false,
+        quit: false,
+        cfg,
+    };
+    std::mem::swap(&mut state.sink, sink);
+
+    queue.roundtrip(&mut state)?;
+    queue.roundtrip(&mut state)?;
+    let (output, info) = state.outputs.find(&state.cfg.output)?;
+    tracing::info!(output = %info.name, w = info.width, h = info.height, scale = info.scale, "capturing output");
+    state.output = Some((output.clone(), info));
+
+    let source = state.source_mgr.create_source(&output, &qh, ());
+    let session = state.copy_mgr.create_session(&source, manager::Options::empty(), &qh, Kind::Screen);
+    state.source = Some(source);
+    state.session = Some(session);
+
+    if state.cfg.cursor && state.shm.is_some() {
+        state.start_cursor_session();
+    }
+    let _ = ready_tx.send(Ok(()));
+
+    let mut event_loop: EventLoop<State> = EventLoop::try_new().map_err(|e| Error::Capture(e.to_string()))?;
+    let handle = event_loop.handle();
+    WaylandSource::new(conn, queue).insert(handle.clone()).map_err(|e| Error::Capture(e.to_string()))?;
+    handle
+        .insert_source(rx, |evt, _, state: &mut State| match evt {
+            channel::Event::Msg(cmd) => state.on_cmd(cmd),
+            channel::Event::Closed => state.quit = true,
+        })
+        .map_err(|e| Error::Capture(e.to_string()))?;
+    let signal = event_loop.get_signal();
+    event_loop
+        .run(Duration::from_millis(500), &mut state, |state| {
+            if state.quit {
+                signal.stop();
+            }
+        })
+        .map_err(|e| Error::Capture(e.to_string()))?;
+    state.teardown();
+    std::mem::swap(&mut state.sink, sink);
+    Ok(())
+}
+
+pub fn list_outputs(target: &Target) -> Result<Vec<OutputInfo>> {
+    struct S {
+        outputs: Outputs,
+    }
+    impl Dispatch<WlRegistry, GlobalListContents> for S {
+        fn event(_: &mut Self, _: &WlRegistry, _: wayland_client::protocol::wl_registry::Event, _: &GlobalListContents, _: &Connection, _: &QueueHandle<Self>) {}
+    }
+    impl Dispatch<WlOutput, ()> for S {
+        fn event(s: &mut Self, o: &WlOutput, e: wl_output::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+            s.outputs.handle(o, e);
+        }
+    }
+    let (_conn, globals, mut queue) = hypr_wl::init::<S>(target)?;
+    let qh = queue.handle();
+    let mut s = S { outputs: Outputs::bind(&globals, &qh)? };
+    queue.roundtrip(&mut s)?;
+    queue.roundtrip(&mut s)?;
+    Ok(s.outputs.infos())
+}
+
+impl State {
+    fn emit(&mut self, ev: CaptureEvent) {
+        (self.sink)(ev);
+    }
+
+    fn on_cmd(&mut self, cmd: Cmd) {
+        match cmd {
+            Cmd::RequestFrame => {
+                self.want_frame = true;
+                self.maybe_capture();
+            }
+            Cmd::Release(idx) => {
+                if let Some(slot) = self.ring.get_mut(idx) {
+                    slot.busy = false;
+                }
+                self.maybe_capture();
+            }
+            Cmd::Stop => self.quit = true,
+        }
+    }
+
+    fn teardown(&mut self) {
+        if let Some((frame, _)) = self.in_flight.take() {
+            frame.destroy();
+        }
+        if let Some(f) = self.cursor_frame.take() {
+            f.destroy();
+        }
+        self.cursor_buf = None;
+        if let Some(s) = self.cursor_capture.take() {
+            s.destroy();
+        }
+        if let Some(s) = self.cursor_session.take() {
+            s.destroy();
+        }
+        for slot in self.ring.drain(..) {
+            slot.wl_buffer.destroy();
+        }
+        if let Some(s) = self.session.take() {
+            s.destroy();
+        }
+        if let Some(s) = self.source.take() {
+            s.destroy();
+        }
+        let _ = self.conn.flush();
+    }
+
+    fn choose_format(&self) -> Option<(u32, Vec<u64>)> {
+        const PREFERRED: [DrmFourcc; 4] = [DrmFourcc::Xrgb8888, DrmFourcc::Argb8888, DrmFourcc::Xbgr8888, DrmFourcc::Abgr8888];
+        for want in PREFERRED {
+            if let Some((f, mods)) = self.constraints.formats.iter().find(|(f, _)| *f == want as u32) {
+                let linear = u64::from(DrmModifier::Linear);
+                let mut mods = mods.clone();
+                if self.cfg.prefer_linear && mods.contains(&linear) {
+                    mods = vec![linear];
+                }
+                if mods.is_empty() {
+                    mods.push(linear);
+                }
+                return Some((*f, mods));
+            }
+        }
+        None
+    }
+
+    fn allocate_ring(&mut self) -> Result<()> {
+        let (fourcc, modifiers) = self.choose_format().ok_or_else(|| {
+            Error::Capture(format!("no usable dmabuf format offered (got {:x?})", self.constraints.formats))
+        })?;
+        let (w, h) = (self.constraints.width, self.constraints.height);
+        for slot in self.ring.drain(..) {
+            slot.wl_buffer.destroy();
+        }
+        let format = DrmFourcc::try_from(fourcc).map_err(|e| Error::Gbm(e.to_string()))?;
+        let mut chosen_modifier = None;
+        for index in 0..self.cfg.buffers {
+            let device = self.device.lock().map_err(|_| Error::Gbm("device mutex poisoned".into()))?;
+            let bo = device
+                .create_buffer_object_with_modifiers2::<()>(
+                    w,
+                    h,
+                    format,
+                    modifiers.iter().map(|m| DrmModifier::from(*m)),
+                    BufferObjectFlags::RENDERING,
+                )
+                .or_else(|_| device.create_buffer_object::<()>(w, h, format, BufferObjectFlags::RENDERING | BufferObjectFlags::LINEAR))
+                .map_err(|e| Error::Gbm(format!("allocate {w}x{h} {format:?}: {e}")))?;
+            drop(device);
+            let modifier: u64 = bo.modifier().map_err(|e| Error::Gbm(e.to_string()))?.into();
+            let plane_count = bo.plane_count().map_err(|e| Error::Gbm(e.to_string()))?;
+            let mut planes = Vec::new();
+            for p in 0..plane_count as i32 {
+                planes.push(Plane {
+                    offset: bo.offset(p).map_err(|e| Error::Gbm(e.to_string()))?,
+                    stride: bo.stride_for_plane(p).map_err(|e| Error::Gbm(e.to_string()))?,
+                });
+            }
+            let fd = bo.fd().map_err(|e| Error::Gbm(e.to_string()))?;
+            let params = self.dmabuf.create_params(&self.qh, ());
+            for (i, p) in planes.iter().enumerate() {
+                params.add(fd.as_fd(), i as u32, p.offset, p.stride, (modifier >> 32) as u32, (modifier & 0xffff_ffff) as u32);
+            }
+            let wl_buffer = params.create_immed(w as i32, h as i32, fourcc, zwp_linux_buffer_params_v1::Flags::empty(), &self.qh, ());
+            params.destroy();
+            chosen_modifier = Some(modifier);
+            let buffer = Arc::new(CaptureBuffer {
+                index,
+                info: DmabufInfo { fd, width: w, height: h, fourcc, modifier, planes },
+                bo: Mutex::new(bo),
+                device: Arc::clone(&self.device),
+            });
+            self.ring.push(RingSlot { buffer, wl_buffer, busy: false });
+        }
+        let modifier = chosen_modifier.unwrap_or(0);
+        self.ring_format = Some((fourcc, modifier));
+        tracing::info!(w, h, fourcc = format!("{:?}", format), modifier = format!("{modifier:#x}"), buffers = self.cfg.buffers, "capture ring allocated");
+        let output = self.output.as_ref().map(|(_, i)| i.clone()).unwrap_or_default();
+        self.emit(CaptureEvent::Ready { output, width: w, height: h, fourcc, modifier });
+        Ok(())
+    }
+
+    fn maybe_capture(&mut self) {
+        if !self.want_frame || self.in_flight.is_some() || self.stopped || self.ring.is_empty() {
+            return;
+        }
+        let Some(session) = self.session.clone() else { return };
+        let Some(idx) = self.ring.iter().position(|s| !s.busy) else { return };
+        let frame = session.create_frame(&self.qh, Kind::Screen);
+        frame.attach_buffer(&self.ring[idx].wl_buffer);
+        frame.damage_buffer(0, 0, i32::MAX, i32::MAX);
+        frame.capture();
+        self.pending_damage.clear();
+        self.pending_presentation = 0;
+        self.in_flight = Some((frame, idx));
+        self.want_frame = false;
+    }
+
+    fn on_session_event(&mut self, kind: Kind, event: session_proto::Event) {
+        let c = match kind {
+            Kind::Screen => &mut self.constraints,
+            Kind::Cursor => &mut self.cursor_constraints,
+        };
+        match event {
+            session_proto::Event::BufferSize { width, height } => {
+                c.width = width;
+                c.height = height;
+            }
+            session_proto::Event::ShmFormat { format } => {
+                if let wayland_client::WEnum::Value(f) = format {
+                    c.shm_formats.push(f as u32);
+                }
+            }
+            session_proto::Event::DmabufDevice { .. } => {}
+            session_proto::Event::DmabufFormat { format, modifiers } => {
+                let mods = modifiers.chunks_exact(8).map(|b| u64::from_ne_bytes(b.try_into().unwrap_or([0; 8]))).collect();
+                c.formats.push((format, mods));
+            }
+            session_proto::Event::Done => {
+                c.done = true;
+                match kind {
+                    Kind::Screen => {
+                        let size_changed = self
+                            .ring
+                            .first()
+                            .map(|s| s.buffer.info.width != self.constraints.width || s.buffer.info.height != self.constraints.height)
+                            .unwrap_or(true);
+                        if size_changed {
+                            if let Some((frame, _)) = self.in_flight.take() {
+                                frame.destroy();
+                                self.want_frame = true;
+                            }
+                            if let Err(e) = self.allocate_ring() {
+                                self.emit(CaptureEvent::Error(e.to_string()));
+                                self.quit = true;
+                                return;
+                            }
+                        }
+                        self.constraints.formats.clear();
+                        self.constraints.shm_formats.clear();
+                        self.maybe_capture();
+                    }
+                    Kind::Cursor => {
+                        self.cursor_constraints.shm_formats.clear();
+                        self.cursor_constraints.formats.clear();
+                        self.realloc_cursor_buffer();
+                    }
+                }
+            }
+            session_proto::Event::Stopped => {
+                if kind == Kind::Screen {
+                    self.stopped = true;
+                    self.emit(CaptureEvent::Stopped);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn on_frame_event(&mut self, kind: Kind, frame: &ExtImageCopyCaptureFrameV1, event: frame_proto::Event) {
+        match kind {
+            Kind::Screen => self.on_screen_frame_event(frame, event),
+            Kind::Cursor => self.on_cursor_frame_event(frame, event),
+        }
+    }
+
+    fn on_screen_frame_event(&mut self, frame: &ExtImageCopyCaptureFrameV1, event: frame_proto::Event) {
+        let Some((cur, idx)) = self.in_flight.as_ref() else { return };
+        if cur != frame {
+            return;
+        }
+        let idx = *idx;
+        match event {
+            frame_proto::Event::Damage { x, y, width, height } => self.pending_damage.push(Rect { x, y, width, height }),
+            frame_proto::Event::PresentationTime { tv_sec_hi, tv_sec_lo, tv_nsec } => {
+                let secs = ((tv_sec_hi as u64) << 32) | tv_sec_lo as u64;
+                self.pending_presentation = secs * 1_000_000_000 + tv_nsec as u64;
+            }
+            frame_proto::Event::Ready => {
+                let (frame, _) = self.in_flight.take().expect("checked above");
+                frame.destroy();
+                self.ring[idx].busy = true;
+                self.sequence += 1;
+                let captured = CapturedFrame {
+                    buffer: Arc::clone(&self.ring[idx].buffer),
+                    damage: std::mem::take(&mut self.pending_damage),
+                    presentation_ns: self.pending_presentation,
+                    sequence: self.sequence,
+                    release: Some(self.cmd_tx.clone()),
+                };
+                self.emit(CaptureEvent::Frame(captured));
+                self.maybe_capture();
+            }
+            frame_proto::Event::Failed { reason } => {
+                let (frame, _) = self.in_flight.take().expect("checked above");
+                frame.destroy();
+                tracing::warn!(?reason, "capture frame failed");
+                match reason {
+                    wayland_client::WEnum::Value(frame_proto::FailureReason::Stopped) => {
+                        self.stopped = true;
+                        self.emit(CaptureEvent::Stopped);
+                    }
+                    _ => {
+                        // Constraints changed or a transient error: the session
+                        // sends new constraints and `done`, which retries.
+                        self.want_frame = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn start_cursor_session(&mut self) {
+        let (Some(seat), Some(source)) = (self.seat.seat.clone(), self.source.clone()) else { return };
+        let pointer = seat.get_pointer(&self.qh, ());
+        let cs = self.copy_mgr.create_pointer_cursor_session(&source, &pointer, &self.qh, ());
+        let capture = cs.get_capture_session(&self.qh, Kind::Cursor);
+        self.pointer = Some(pointer);
+        self.cursor_session = Some(cs);
+        self.cursor_capture = Some(capture);
+    }
+
+    fn realloc_cursor_buffer(&mut self) {
+        let (w, h) = (self.cursor_constraints.width, self.cursor_constraints.height);
+        if let Some(f) = self.cursor_frame.take() {
+            f.destroy();
+        }
+        let same = self.cursor_buf.as_ref().is_some_and(|b| b.width == w && b.height == h);
+        if !same {
+            self.cursor_buf = None;
+            if w == 0 || h == 0 {
+                return;
+            }
+            let Some(shm) = self.shm.as_ref() else { return };
+            match ShmBuffer::new(shm, &self.qh, w, h) {
+                Ok(b) => self.cursor_buf = Some(b),
+                Err(e) => {
+                    tracing::warn!(error = %e, "cursor buffer allocation failed");
+                    return;
+                }
+            }
+        }
+        self.capture_cursor();
+    }
+
+    fn capture_cursor(&mut self) {
+        if self.cursor_frame.is_some() {
+            return;
+        }
+        let (Some(session), Some(buf)) = (self.cursor_capture.clone(), self.cursor_buf.as_ref()) else { return };
+        let frame = session.create_frame(&self.qh, Kind::Cursor);
+        frame.attach_buffer(&buf.buffer);
+        frame.damage_buffer(0, 0, i32::MAX, i32::MAX);
+        frame.capture();
+        self.cursor_frame = Some(frame);
+    }
+
+    fn on_cursor_frame_event(&mut self, frame: &ExtImageCopyCaptureFrameV1, event: frame_proto::Event) {
+        if self.cursor_frame.as_ref() != Some(frame) {
+            return;
+        }
+        match event {
+            frame_proto::Event::Ready => {
+                if let Some(f) = self.cursor_frame.take() {
+                    f.destroy();
+                }
+                if let Some(buf) = self.cursor_buf.as_ref() {
+                    match buf.read_argb() {
+                        Ok(argb) => {
+                            let (hot_x, hot_y) = self.cursor_hotspot;
+                            let (width, height) = (buf.width, buf.height);
+                            self.emit(CaptureEvent::CursorShape { width, height, hot_x, hot_y, argb });
+                        }
+                        Err(e) => tracing::warn!(error = %e, "cursor read failed"),
+                    }
+                }
+                self.capture_cursor();
+            }
+            frame_proto::Event::Failed { reason } => {
+                if let Some(f) = self.cursor_frame.take() {
+                    f.destroy();
+                }
+                tracing::debug!(?reason, "cursor frame failed; waiting for new constraints");
+            }
+            _ => {}
+        }
+    }
+
+    fn on_cursor_session_event(&mut self, event: cursor_session::Event) {
+        match event {
+            cursor_session::Event::Enter => {
+                self.cursor_visible = true;
+                let (x, y) = self.cursor_pos;
+                self.emit(CaptureEvent::CursorPos { x, y, visible: true });
+            }
+            cursor_session::Event::Leave => {
+                self.cursor_visible = false;
+                let (x, y) = self.cursor_pos;
+                self.emit(CaptureEvent::CursorPos { x, y, visible: false });
+            }
+            cursor_session::Event::Position { x, y } => {
+                self.cursor_pos = (x, y);
+                let visible = self.cursor_visible;
+                self.emit(CaptureEvent::CursorPos { x, y, visible });
+            }
+            cursor_session::Event::Hotspot { x, y } => self.cursor_hotspot = (x, y),
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<WlRegistry, GlobalListContents> for State {
+    fn event(_: &mut Self, _: &WlRegistry, _: wayland_client::protocol::wl_registry::Event, _: &GlobalListContents, _: &Connection, _: &QueueHandle<Self>) {}
+}
+
+impl Dispatch<WlOutput, ()> for State {
+    fn event(s: &mut Self, o: &WlOutput, e: wl_output::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        s.outputs.handle(o, e);
+    }
+}
+
+impl Dispatch<WlSeat, ()> for State {
+    fn event(s: &mut Self, _: &WlSeat, e: wl_seat::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        s.seat.handle(e);
+    }
+}
+
+impl Dispatch<ExtImageCopyCaptureSessionV1, Kind> for State {
+    fn event(s: &mut Self, _: &ExtImageCopyCaptureSessionV1, e: session_proto::Event, kind: &Kind, _: &Connection, _: &QueueHandle<Self>) {
+        s.on_session_event(*kind, e);
+    }
+}
+
+impl Dispatch<ExtImageCopyCaptureFrameV1, Kind> for State {
+    fn event(s: &mut Self, f: &ExtImageCopyCaptureFrameV1, e: frame_proto::Event, kind: &Kind, _: &Connection, _: &QueueHandle<Self>) {
+        s.on_frame_event(*kind, f, e);
+    }
+}
+
+impl Dispatch<ExtImageCopyCaptureCursorSessionV1, ()> for State {
+    fn event(s: &mut Self, _: &ExtImageCopyCaptureCursorSessionV1, e: cursor_session::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        s.on_cursor_session_event(e);
+    }
+}
+
+delegate_noop!(State: ignore ZwpLinuxDmabufV1);
+delegate_noop!(State: ignore ZwpLinuxBufferParamsV1);
+delegate_noop!(State: ignore WlBuffer);
+delegate_noop!(State: ignore WlShm);
+delegate_noop!(State: ignore WlShmPool);
+delegate_noop!(State: ignore WlPointer);
+delegate_noop!(State: ExtOutputImageCaptureSourceManagerV1);
+delegate_noop!(State: ExtImageCaptureSourceV1);
+delegate_noop!(State: ExtImageCopyCaptureManagerV1);

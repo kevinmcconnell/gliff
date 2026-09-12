@@ -1,0 +1,21 @@
+[package]
+name = "hypr-capture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+wayland-client.workspace = true
+wayland-protocols.workspace = true
+calloop.workspace = true
+calloop-wayland-source.workspace = true
+gbm.workspace = true
+drm-fourcc.workspace = true
+nix.workspace = true
+hypr-wl.workspace = true
