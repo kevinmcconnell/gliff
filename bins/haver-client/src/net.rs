@@ -5,65 +5,22 @@
 //! cros-codecs' decoder is `!Send`, so it lives entirely on this worker thread;
 //! only plain byte buffers cross to the GTK thread.
 
-use std::sync::mpsc::{Sender as StdSender, SyncSender};
-
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Sender as StdSender, SyncSender};
 use std::sync::Arc;
 
 use haver_codec::color::yuv444_to_bgra;
-use haver_codec::frame::Nv12Frame;
-use haver_codec::dual::DualDecoder;
-use haver_codec::single::SingleDecoder;
-use haver_codec::vaapi;
+use haver_codec::{vaapi, DecodedPlanes, Decoder};
 use haver_proto::{ChromaMode, ClientCaps, ClientMsg, Codec, ServerMsg, PROTOCOL_VERSION};
 use haver_transport::{spawn_ssh, Framed, SshTarget};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 
-/// The active decoder, matching the server's chroma mode.
-#[allow(clippy::large_enum_variant)]
-enum Decoder {
-    Dual(DualDecoder),
-    Single(SingleDecoder),
-}
-
-impl Decoder {
-    fn new(chroma: ChromaMode, width: usize, height: usize) -> anyhow::Result<Self> {
-        let display = vaapi::open_display(&vaapi::render_node(None))?;
-        Ok(match chroma {
-            ChromaMode::Single420 => Decoder::Single(SingleDecoder::new(display, width, height)?),
-            _ => Decoder::Dual(DualDecoder::new(display, width, height)?),
-        })
-    }
-
-    /// GPU path: return the decoded dmabuf planes without CPU recombine.
-    fn decode_planes(&mut self, ts: u64, main: &[u8], aux: &[u8]) -> haver_codec::Result<Option<DecodedFrame>> {
-        match self {
-            Decoder::Dual(d) => Ok(d.decode_pair(ts, main, aux)?.map(|p| DecodedFrame::Planes {
-                width: p.width, height: p.height, main: p.main, aux: Some(p.aux),
-            })),
-            Decoder::Single(s) => {
-                let (w, h) = s.dims();
-                Ok(s.decode_frame(ts, main)?.map(|f| DecodedFrame::Planes { width: w, height: h, main: f, aux: None }))
-            }
-        }
-    }
-
-    /// CPU fallback: recombine to 4:4:4 and convert to BGRA.
-    fn decode_rgba(&mut self, ts: u64, main: &[u8], aux: &[u8]) -> haver_codec::Result<Option<DecodedFrame>> {
-        let yuv = match self {
-            Decoder::Dual(d) => d.decode(ts, main, aux)?,
-            Decoder::Single(s) => s.decode(ts, main)?,
-        };
-        Ok(yuv.map(|y| DecodedFrame::Rgba { width: y.width, height: y.height, bgra: yuv444_to_bgra(&y) }))
-    }
-}
-
 /// A decoded frame ready to display: either GPU dmabuf planes (fast path) or
 /// CPU-recombined BGRA (fallback).
 pub enum DecodedFrame {
     Rgba { width: usize, height: usize, bgra: Vec<u8> },
-    Planes { width: usize, height: usize, main: Arc<Nv12Frame>, aux: Option<Arc<Nv12Frame>> },
+    Planes(DecodedPlanes),
 }
 
 /// Status/telemetry the worker reports to the UI.
@@ -160,12 +117,13 @@ where
         anyhow::bail!("expected HelloAck, got {ack:?}");
     };
     let cfg = reader.read_msg::<ServerMsg>().await?;
-    let (mut width, mut height, mut chroma) = match cfg {
-        ServerMsg::StreamConfig { width, height, chroma, .. } => (width as usize, height as usize, chroma),
+    let (width, height, chroma) = match cfg {
+        ServerMsg::StreamConfig { width, height, chroma, .. } => (width, height, chroma),
         other => anyhow::bail!("expected StreamConfig, got {other:?}"),
     };
-    let mut decoder = Decoder::new(chroma, width, height)?;
-    let _ = status.send(Status::Connected { width: width as u32, height: height as u32 });
+    let display = vaapi::open_display(&vaapi::render_node(None))?;
+    let mut decoder = Decoder::new(display.clone(), chroma, width as usize, height as usize)?;
+    let _ = status.send(Status::Connected { width, height });
     tracing::info!(width, height, "connected");
     let mut logged_first = false;
 
@@ -216,9 +174,11 @@ where
                 let t0 = std::time::Instant::now();
                 let use_gpu = gpu.load(Ordering::Relaxed);
                 let decoded = if use_gpu {
-                    decoder.decode_planes(frame_id, &main, &aux)
+                    decoder.decode_planes(frame_id, &main, &aux).map(|p| p.map(DecodedFrame::Planes))
                 } else {
-                    decoder.decode_rgba(frame_id, &main, &aux)
+                    decoder.decode(frame_id, &main, &aux).map(|y| {
+                        y.map(|y| DecodedFrame::Rgba { width: y.width, height: y.height, bgra: yuv444_to_bgra(&y) })
+                    })
                 };
                 let dec_ms = t0.elapsed().as_secs_f32() * 1000.0;
                 // Ack immediately so the server keeps pacing.
@@ -241,12 +201,9 @@ where
                     }
                 }
             }
-            ServerMsg::StreamConfig { width: w, height: h, chroma: c, .. } => {
-                width = w as usize;
-                height = h as usize;
-                chroma = c;
-                decoder = Decoder::new(chroma, width, height)?;
-                let _ = status.send(Status::Connected { width: w, height: h });
+            ServerMsg::StreamConfig { width, height, chroma, .. } => {
+                decoder = Decoder::new(display.clone(), chroma, width as usize, height as usize)?;
+                let _ = status.send(Status::Connected { width, height });
             }
             ServerMsg::CursorShape { width, height, hot_x, hot_y, argb_len, .. } => {
                 let argb = reader.read_payload(argb_len).await?.to_vec();

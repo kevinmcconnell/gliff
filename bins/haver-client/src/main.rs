@@ -8,7 +8,7 @@
 mod keymap;
 mod net;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -41,9 +41,10 @@ struct Cli {
     /// Remote haver-server path.
     #[arg(long, default_value = "haver-server")]
     server_bin: String,
-    /// Pass --headless to the remote server.
-    #[arg(long, default_value_t = true)]
-    headless: bool,
+    /// Mirror this remote output instead of creating a headless one sized to
+    /// the window.
+    #[arg(long)]
+    output: Option<String>,
     /// Hotkey that releases captured shortcuts and hands the keyboard back to
     /// the local compositor. Forms: a chord like `shift+escape`, `ctrl+alt+q`
     /// or `super+escape`; `double-<key>` for a double-tap (e.g.
@@ -71,17 +72,22 @@ struct App {
     gpu: Arc<AtomicBool>,
     stats: gtk::Label,
     status: gtk::Label,
-    stream_size: Rc<RefCell<(u32, u32)>>,
-    input_tx: Rc<RefCell<Option<OutSender>>>,
+    /// Size of the stream the server is sending, from the last StreamConfig.
+    stream_size: Cell<(u32, u32)>,
+    /// Size of the video widget in device pixels, rounded down to even.
+    view_size: Cell<(u32, u32)>,
+    /// The size last asked of the server, so a pending resize is not repeated.
+    resize_requested: Cell<(u32, u32)>,
+    input_tx: RefCell<Option<OutSender>>,
     /// Evdev codes currently held on the remote, so they can all be released
     /// when the keyboard is handed back to the local compositor.
-    pressed_keys: Rc<RefCell<BTreeSet<u32>>>,
+    pressed_keys: RefCell<BTreeSet<u32>>,
     /// Last text we set on the local clipboard from the remote, to avoid echo.
-    last_remote_clip: Rc<RefCell<Option<String>>>,
+    last_remote_clip: RefCell<Option<String>>,
     /// The last endpoint, kept so a dropped connection can be retried.
-    endpoint: Rc<RefCell<Option<Endpoint>>>,
+    endpoint: RefCell<Option<Endpoint>>,
     /// Consecutive failed connection attempts, reset on a successful connect.
-    retries: Rc<RefCell<u32>>,
+    retries: Cell<u32>,
 }
 
 fn main() -> glib::ExitCode {
@@ -161,12 +167,14 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         gpu,
         stats: stats.clone(),
         status: status.clone(),
-        stream_size: Rc::new(RefCell::new((0, 0))),
-        input_tx: Rc::new(RefCell::new(None)),
-        pressed_keys: Rc::new(RefCell::new(BTreeSet::new())),
-        endpoint: Rc::new(RefCell::new(None)),
-        retries: Rc::new(RefCell::new(0)),
-        last_remote_clip: Rc::new(RefCell::new(None)),
+        stream_size: Cell::new((0, 0)),
+        view_size: Cell::new((0, 0)),
+        resize_requested: Cell::new((0, 0)),
+        input_tx: RefCell::new(None),
+        pressed_keys: RefCell::new(BTreeSet::new()),
+        endpoint: RefCell::new(None),
+        retries: Cell::new(0),
+        last_remote_clip: RefCell::new(None),
     });
 
     let hotkey = ReleaseHotkey::parse(&cli.release_hotkey).unwrap_or_else(|e| {
@@ -174,6 +182,7 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         ReleaseHotkey::None
     });
     install_input_handlers(&ui, &video, &window, hotkey);
+    install_resize_handler(&ui, &ui.gl.area);
 
     // Fullscreen toggle.
     {
@@ -193,7 +202,7 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         let host_entry = host_entry.clone();
         let connect = cli.connect.clone();
         let server_bin = cli.server_bin.clone();
-        let headless = cli.headless;
+        let output = cli.output.clone();
         connect_btn.connect_clicked(move |_| {
             let endpoint = match &connect {
                 Some(addr) => Endpoint::Tcp(addr.clone()),
@@ -205,13 +214,14 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
                     }
                     let mut t = SshTarget::new(host);
                     t.server_bin = server_bin.clone();
-                    if headless {
-                        t.server_args.push("--headless".into());
-                    }
+                    t.server_args = match &output {
+                        Some(name) => vec!["--output".into(), name.clone()],
+                        None => vec!["--headless".into()],
+                    };
                     Endpoint::Ssh(t)
                 }
             };
-            *ui.retries.borrow_mut() = 0;
+            ui.retries.set(0);
             start_session(ui.clone(), endpoint);
         });
     }
@@ -285,7 +295,8 @@ const MAX_RETRIES: u32 = 5;
 
 /// Schedule a reconnect after a short delay, unless we have exhausted retries.
 fn schedule_reconnect(ui: Rc<App>) {
-    let n = { let mut r = ui.retries.borrow_mut(); *r += 1; *r };
+    let n = ui.retries.get() + 1;
+    ui.retries.set(n);
     if n > MAX_RETRIES {
         ui.status.set_text("Disconnected — press Connect to retry");
         return;
@@ -360,9 +371,9 @@ fn render_gl(area: &gtk::GLArea, renderer: &Rc<RefCell<Option<haver_gl::Renderer
     let scale = area.scale_factor();
     let (fb_w, fb_h) = (area.width() * scale, area.height() * scale);
     match frame {
-        net::DecodedFrame::Planes { width, height, main, aux } => {
-            let (main_y, main_uv) = nv12_planes(main);
-            let planes = FramePlanes { main_y, main_uv, aux: aux.as_ref().map(|a| nv12_planes(a)), width: *width as u32, height: *height as u32 };
+        net::DecodedFrame::Planes(p) => {
+            let (main_y, main_uv) = nv12_planes(&p.main);
+            let planes = FramePlanes { main_y, main_uv, aux: p.aux.as_ref().map(|a| nv12_planes(a)), width: p.width as u32, height: p.height as u32 };
             if let Err(e) = renderer.draw_planes(&planes, fb_w, fb_h) {
                 tracing::warn!(error = %e, "GL plane draw failed; falling back to CPU");
                 gpu.store(false, Ordering::Relaxed);
@@ -381,9 +392,13 @@ fn poll_status(ui: Rc<App>, rx: Receiver<Status>) {
         while let Ok(s) = rx.try_recv() {
             match s {
                 Status::Connected { width, height } => {
-                    *ui.stream_size.borrow_mut() = (width, height);
-                    *ui.retries.borrow_mut() = 0;
+                    ui.stream_size.set((width, height));
+                    ui.resize_requested.set((0, 0));
+                    ui.retries.set(0);
                     ui.status.set_text(&format!("Connected — {width}x{height}"));
+                    // A fresh server starts at its own default size; a
+                    // reconnect must bring it back to the window.
+                    request_resize(&ui);
                 }
                 Status::Stats { fps, mbit, decode_ms } => {
                     ui.stats.set_visible(true);
@@ -433,12 +448,12 @@ fn set_remote_cursor(ui: &App, width: u32, height: u32, hot_x: i32, hot_y: i32, 
 
 /// Map a widget-space point to remote output coordinates.
 fn to_remote(ui: &App, x: f64, y: f64) -> (f64, f64) {
-    let (rw, rh) = *ui.stream_size.borrow();
+    let (rw, rh) = ui.stream_size.get();
     if rw == 0 || rh == 0 {
         return (0.0, 0.0);
     }
     let (aw, ah) = (ui.video.width() as f64, ui.video.height() as f64);
-    // content_fit=Contain: the video is letterboxed; compute the fitted rect.
+    // The renderer letterboxes the video; compute the fitted rect.
     let scale = (aw / rw as f64).min(ah / rh as f64);
     let (fw, fh) = (rw as f64 * scale, rh as f64 * scale);
     let (ox, oy) = ((aw - fw) / 2.0, (ah - fh) / 2.0);
@@ -679,33 +694,6 @@ fn install_input_handlers(ui: &Rc<App>, video: &gtk::Widget, window: &adw::Appli
     }
     video.add_controller(scroll);
 
-    // Debounced resize: GTK4 Picture has no resize signal, so poll the widget
-    // allocation and, once it has been stable for ~200 ms, tell the server.
-    {
-        let ui = ui.clone();
-        let video = video.clone();
-        let last_sent = Rc::new(RefCell::new((0i32, 0i32)));
-        let stable = Rc::new(RefCell::new((0i32, 0i32, 0u32)));
-        glib::timeout_add_local(Duration::from_millis(100), move || {
-            let scale = video.scale_factor();
-            let (w, h) = (video.width() * scale, video.height() * scale);
-            if w < 64 || h < 64 {
-                return glib::ControlFlow::Continue;
-            }
-            let mut st = stable.borrow_mut();
-            if (st.0, st.1) == (w, h) {
-                st.2 += 1;
-            } else {
-                *st = (w, h, 0);
-            }
-            if st.2 == 2 && (last_sent.borrow().0, last_sent.borrow().1) != (w, h) {
-                *last_sent.borrow_mut() = (w, h);
-                send(&ui, ClientMsg::Resize { width: w as u32, height: h as u32, scale: scale as f32 });
-            }
-            glib::ControlFlow::Continue
-        });
-    }
-
     // While the video has focus, route system shortcuts (Super, Alt-Tab, ...)
     // to the remote session instead of the local compositor.
     let focus = gtk::EventControllerFocus::new();
@@ -736,6 +724,32 @@ fn install_input_handlers(ui: &Rc<App>, video: &gtk::Widget, window: &adw::Appli
         });
     }
     video.add_controller(focus);
+}
+
+/// Ask the server to match the window, once the size has settled for 200 ms
+/// so a drag-resize does not restart the encoder on every step.
+fn install_resize_handler(ui: &Rc<App>, area: &gtk::GLArea) {
+    let ui = ui.clone();
+    area.connect_resize(move |_, w, h| {
+        let size = (w.max(0) as u32 & !1, h.max(0) as u32 & !1);
+        ui.view_size.set(size);
+        let ui = ui.clone();
+        glib::timeout_add_local_once(Duration::from_millis(200), move || {
+            if ui.view_size.get() == size {
+                request_resize(&ui);
+            }
+        });
+    });
+}
+
+/// Send a Resize if the stream does not already match the view.
+fn request_resize(ui: &App) {
+    let size = ui.view_size.get();
+    if size.0 < 64 || size.1 < 64 || size == ui.stream_size.get() || size == ui.resize_requested.get() {
+        return;
+    }
+    ui.resize_requested.set(size);
+    send(ui, ClientMsg::Resize { width: size.0, height: size.1, scale: ui.video.scale_factor() as f32 });
 }
 
 /// GTK button number to evdev `BTN_*`.
