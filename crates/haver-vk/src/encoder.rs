@@ -450,13 +450,13 @@ impl H264Encoder {
     /// Encode `input` (already in VIDEO_ENCODE_SRC layout, or transitioned
     /// here) after the timeline reaches `wait`. Blocks until the bitstream
     /// is ready.
-    pub(crate) fn encode(
+    pub(crate) fn submit(
         &mut self,
         input: &Image,
         timeline: &Timeline,
         wait: Option<u64>,
         force_keyframe: bool,
-    ) -> Result<EncodedPacket> {
+    ) -> Result<PendingEncode> {
         let idr = force_keyframe || !self.started || self.current_ref.is_none();
         if idr {
             self.frame_num = 0;
@@ -649,7 +649,7 @@ impl H264Encoder {
             let query_pool = self.query_pool;
             let dpb = &self.dpb;
             self.commands
-                .run(timeline.semaphore, wait, None, true, |cmd| {
+                .run(timeline.semaphore, wait, None, false, |cmd| {
                     input.transition(cmd, vk::ImageLayout::VIDEO_ENCODE_SRC_KHR);
                     dpb.transition(cmd, vk::ImageLayout::VIDEO_ENCODE_DPB_KHR);
                     // SAFETY: recording valid video commands in order on a queue
@@ -686,9 +686,23 @@ impl H264Encoder {
             Ok::<(), Error>(())
         })?;
 
+        // The DPB and counters describe the picture just recorded; the
+        // bitstream itself is collected by `finish`.
+        self.slots[setup_slot] = Some(current);
+        self.current_ref = Some(setup_slot);
+        self.frame_num = (self.frame_num + 1) % (1 << (LOG2_MAX_FRAME_NUM_MINUS4 + 4));
+        self.poc += 2;
+        self.started = true;
+        Ok(PendingEncode { idr })
+    }
+
+    /// Wait for a submitted encode and collect its access unit.
+    pub(crate) fn finish(&mut self, pending: PendingEncode) -> Result<EncodedPacket> {
+        let idr = pending.idr;
+        self.commands.wait()?;
         // Feedback for the one query: [offset, bytes written, status].
         let mut results = [[0u32; 3]; 1];
-        // SAFETY: the submission completed (blocking run), the pool has one query.
+        // SAFETY: the submission completed (fence waited), the pool has one query.
         unsafe {
             self.gpu.device.get_query_pool_results(
                 self.query_pool,
@@ -712,17 +726,16 @@ impl H264Encoder {
             data.extend_from_slice(&[0, 0, 0, 1]);
         }
         data.extend_from_slice(&slice);
-
-        self.slots[setup_slot] = Some(current);
-        self.current_ref = Some(setup_slot);
-        self.frame_num = (self.frame_num + 1) % (1 << (LOG2_MAX_FRAME_NUM_MINUS4 + 4));
-        self.poc += 2;
-        self.started = true;
         Ok(EncodedPacket {
             keyframe: idr,
             data,
         })
     }
+}
+
+/// An encode that has been submitted but not yet read back.
+pub(crate) struct PendingEncode {
+    idr: bool,
 }
 
 /// The CBR rate control state: one layer at the target bitrate and frame

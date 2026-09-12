@@ -10,7 +10,9 @@
 
 use std::collections::HashMap;
 use std::os::fd::{AsFd, OwnedFd};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
+use std::time::Duration;
 
 use ash::vk;
 
@@ -133,7 +135,9 @@ impl Encoder {
                 Ok(())
             },
         )?;
-        let main = self.main.encode(
+        // Submit both encodes, then wait: the main stream's readback overlaps
+        // the aux encode on the GPU.
+        let main = self.main.submit(
             &self.main_in,
             &self.timeline,
             Some(split_done),
@@ -141,8 +145,13 @@ impl Encoder {
         )?;
         let aux = match (&mut self.aux, &self.aux_in) {
             (Some(enc), Some(input)) => {
-                Some(enc.encode(input, &self.timeline, Some(split_done), force_keyframe)?)
+                Some(enc.submit(input, &self.timeline, Some(split_done), force_keyframe)?)
             }
+            _ => None,
+        };
+        let main = self.main.finish(main)?;
+        let aux = match (&mut self.aux, aux) {
+            (Some(enc), Some(pending)) => Some(enc.finish(pending)?),
             _ => None,
         };
         Ok(EncodedFrame {
@@ -154,7 +163,9 @@ impl Encoder {
 }
 
 /// A finished display frame: a linear BGRX dmabuf the display side imports.
-/// The fd is a fresh duplicate the receiver owns.
+/// The fd is a fresh duplicate the receiver owns. Dropping the frame returns
+/// its image to the decoder's ring, so keep it alive until the display side
+/// has finished with the texture.
 #[derive(Debug)]
 pub struct DisplayFrame {
     pub fd: OwnedFd,
@@ -164,10 +175,18 @@ pub struct DisplayFrame {
     pub offset: u32,
     pub fourcc: drm_fourcc::DrmFourcc,
     pub modifier: u64,
+    index: usize,
+    release: Sender<usize>,
 }
 
-/// Display images kept by the client decoder. A frame handed out is not
-/// written again until this many newer frames have been produced.
+impl Drop for DisplayFrame {
+    fn drop(&mut self) {
+        let _ = self.release.send(self.index);
+    }
+}
+
+/// Display images kept by the client decoder: one being written, one on
+/// screen, one in transit between the two.
 const DISPLAY_RING: usize = 3;
 
 /// Client side: one decoder object per stream.
@@ -179,7 +198,10 @@ pub struct Decoder {
     main: H264Decoder,
     aux: Option<H264Decoder>,
     outputs: Vec<(Image, ExportedDmabuf)>,
-    next_output: usize,
+    /// Images handed out as `DisplayFrame`s and not yet dropped.
+    busy: Vec<bool>,
+    release_tx: Sender<usize>,
+    release_rx: Receiver<usize>,
     /// CPU readback staging, allocated on first use (tests and the probe).
     readback: Option<HostBuffer>,
     width: u32,
@@ -188,6 +210,7 @@ pub struct Decoder {
 
 impl Decoder {
     pub fn new(gpu: &Arc<Gpu>, dual: bool, width: u32, height: u32) -> Result<Self> {
+        let (release_tx, release_rx) = channel();
         let outputs = (0..DISPLAY_RING)
             .map(|_| {
                 let img = Image::exportable_bgra(gpu, width, height)?;
@@ -207,7 +230,9 @@ impl Decoder {
                 None
             },
             outputs,
-            next_output: 0,
+            busy: vec![false; DISPLAY_RING],
+            release_tx,
+            release_rx,
             readback: None,
             width,
             height,
@@ -220,6 +245,7 @@ impl Decoder {
         let idx = self.decode_to_output(main, aux)?;
         let Some(idx) = idx else { return Ok(None) };
         let (_, dmabuf) = &self.outputs[idx];
+        self.busy[idx] = true;
         Ok(Some(DisplayFrame {
             fd: dmabuf.fd.as_fd().try_clone_to_owned()?,
             width: dmabuf.width,
@@ -228,6 +254,8 @@ impl Decoder {
             offset: dmabuf.offset,
             fourcc: dmabuf.fourcc,
             modifier: dmabuf.modifier,
+            index: idx,
+            release: self.release_tx.clone(),
         }))
     }
 
@@ -249,14 +277,35 @@ impl Decoder {
         let buf = self.readback.as_ref().expect("allocated above");
         self.compute
             .run(self.timeline.semaphore, None, None, true, |cmd| {
-                image.copy_rgba_to_buffer(cmd, &buf);
+                image.copy_rgba_to_buffer(cmd, buf);
                 Ok(())
             })?;
         Ok(Some(buf.read(0, size)))
     }
 
+    /// An output image no `DisplayFrame` holds. Waits briefly for a release
+    /// when all are out; a display that never releases gets the oldest reused.
+    fn free_output(&mut self) -> usize {
+        loop {
+            while let Ok(i) = self.release_rx.try_recv() {
+                self.busy[i] = false;
+            }
+            if let Some(i) = self.busy.iter().position(|b| !b) {
+                return i;
+            }
+            match self.release_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(i) => self.busy[i] = false,
+                Err(_) => {
+                    tracing::warn!("display frames not released; reusing one");
+                    self.busy.fill(false);
+                }
+            }
+        }
+    }
+
     fn decode_to_output(&mut self, main: &[u8], aux: &[u8]) -> Result<Option<usize>> {
         let t0 = std::time::Instant::now();
+        let idx = self.free_output();
         let main_done = self.timeline.advance();
         let Some(main_img) = self.main.decode(main, &self.timeline, main_done)? else {
             return Ok(None);
@@ -273,8 +322,6 @@ impl Decoder {
             None => (None, main_done),
         };
         let t_aux = t0.elapsed() - t_main;
-        let idx = self.next_output;
-        self.next_output = (self.next_output + 1) % DISPLAY_RING;
         let (dst, _) = &self.outputs[idx];
         let (recombine, w, h) = (&self.recombine, self.width, self.height);
         self.compute

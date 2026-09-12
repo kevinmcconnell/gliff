@@ -332,7 +332,7 @@ fn poll_frames(ui: Rc<App>, rx: Receiver<DisplayFrame>) {
             }
         }
         if let Some(f) = latest {
-            match dmabuf_texture(&f) {
+            match dmabuf_texture(f) {
                 Ok(texture) => ui.picture.set_paintable(Some(&texture)),
                 Err(e) => tracing::warn!(error = %e, "dmabuf texture import failed"),
             }
@@ -341,14 +341,12 @@ fn poll_frames(ui: Rc<App>, rx: Receiver<DisplayFrame>) {
     });
 }
 
-/// Wrap a decoded frame's dmabuf as a GDK texture. The fd stays open until
-/// GTK releases the texture.
-fn dmabuf_texture(f: &DisplayFrame) -> Result<gdk::Texture, glib::Error> {
+/// Wrap a decoded frame's dmabuf as a GDK texture. The frame (and its fd)
+/// lives until GTK releases the texture, which returns the image to the
+/// decoder's ring.
+fn dmabuf_texture(f: DisplayFrame) -> Result<gdk::Texture, glib::Error> {
     let display = gdk::Display::default()
         .ok_or_else(|| glib::Error::new(glib::FileError::Failed, "no display"))?;
-    let fd =
-        f.fd.try_clone()
-            .map_err(|e| glib::Error::new(glib::FileError::Failed, &e.to_string()))?;
     let builder = gdk::DmabufTextureBuilder::new()
         .set_display(&display)
         .set_width(f.width)
@@ -359,13 +357,13 @@ fn dmabuf_texture(f: &DisplayFrame) -> Result<gdk::Texture, glib::Error> {
         .set_offset(0, f.offset)
         .set_stride(0, f.stride)
         .set_premultiplied(false);
-    // SAFETY: `fd` is a dmabuf describing exactly one linear plane of the
-    // stated size, stride and format, and it is kept open by the release
-    // closure until GTK is done with the texture.
+    // SAFETY: the fd is a dmabuf describing exactly one linear plane of the
+    // stated size, stride and format, and the frame that owns it is kept
+    // alive by the release closure until GTK is done with the texture.
     unsafe {
         builder
-            .set_fd(0, fd.as_raw_fd())
-            .build_with_release_func(move || drop(fd))
+            .set_fd(0, f.fd.as_raw_fd())
+            .build_with_release_func(move || drop(f))
     }
 }
 
