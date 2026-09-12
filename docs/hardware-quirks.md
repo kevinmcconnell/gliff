@@ -62,3 +62,24 @@ change so a requested keyframe is a real random-access point.
   none), so `Dual420` is the only 4:4:4 path on this GPU. Needs an Intel/again
   GPU that advertises HEVC 4:4:4 or AV1 to exercise `Native444`.
 - Multiple GPUs / non-renderD128 nodes: `--render-node` exists but is untested.
+
+## Known limitations recorded from the code review (not yet fixed)
+
+These are low-severity and do not affect the validated paths, but are worth
+knowing before wider testing:
+
+- **Instance discovery tie-break.** `hypr-ipc` picks the newest instance by
+  directory mtime; two Hyprland instances started within the same coarse
+  filesystem timestamp are tie-broken by name, which could pick the older one.
+- **`wl_output` bound at version 4.** A compositor offering an older `wl_output`
+  would fail to bind. Hyprland always offers v4.
+- **Capture dmabuf uses one buffer-object fd for all planes.** Correct for the
+  single-plane XRGB/ARGB formats we select; wrong if a multi-fd planar format is
+  ever chosen. The reported `Ready` modifier is the last buffer's, and buffers
+  are allocated independently, so a divergent modifier is possible in theory.
+- **Access-unit delimiter is appended, not prepended.** Each encoded access unit
+  ends with its delimiter. This works because each unit is framed and decoded
+  on its own, but differs from the usual layout.
+- **ssh environment.** The `--stdio` path is built but not yet tested from a cold
+  machine; the ssh session must expose `WAYLAND_DISPLAY` and `XDG_RUNTIME_DIR`.
+- **No keymap upload, no clipboard, no client-side cursor drawing yet.**
