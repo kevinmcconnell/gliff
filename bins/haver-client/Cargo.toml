@@ -19,5 +19,7 @@ libadwaita.workspace = true
 haver-proto.workspace = true
 haver-transport.workspace = true
 haver-codec.workspace = true
+haver-gl.workspace = true
+drm-fourcc.workspace = true
 hypr-ipc.workspace = true
 hypr-input.workspace = true

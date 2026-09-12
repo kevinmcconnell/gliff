@@ -39,12 +39,13 @@ video, cursor and pongs flow server→client.
 | `hypr-capture` | output + cursor capture into GBM dmabufs on a calloop thread | none |
 | `hypr-input` | virtual keyboard (xkb state) + virtual pointer on a calloop thread | none |
 | `haver-codec` | VA-API H.264 encode/decode, CPU colour, Dual420 and Single420 | none |
+| `haver-gl` | GPU dmabuf import + AVC444 recombine shader (client display) | **yes, isolated here** |
 | `haver-server` | ties capture+input+codec to the protocol; `--stdio`/`--listen` | none |
 | `haver-client` | GTK4/libadwaita UI, decode worker | none |
 | `haver-probe` | environment checks and the headless test client | none |
 | `vendor/cros-*` | patched cros-libva and cros-codecs | in the libraries only |
 
-There is no `unsafe` in haver's own code. The GBM, VA-API and xkb crates wrap
+All `unsafe` in haver is confined to the `haver-gl` crate (GL/EGL are C APIs). The GBM, VA-API and xkb crates wrap
 the C libraries; the vendored codec libraries contain the only `unsafe`, and our
 patches to them are documented in their `README.haver.md`.
 
@@ -83,10 +84,12 @@ patches to them are documented in their `README.haver.md`.
   tasks so an input burst cannot starve video and a blocked write cannot block
   reads.
 
-- **Client rendering is CPU, for now.** Decoded NV12 is recombined and colour-
-  converted on the CPU into BGRA and shown as a `gdk::MemoryTexture`. This keeps
-  the client free of `unsafe` GL. The zero-copy GL path is a documented future
-  optimisation (see below).
+- **Client rendering: GPU when available, CPU fallback.** At startup the client
+  probes EGL dmabuf import (via a GBM render-node display). If supported, it
+  shows a `gtk::GLArea` and the decoder hands the decoded NV12 dmabufs straight
+  to a recombine shader (`haver-gl`) that reconstructs 4:4:4 and converts to RGB
+  on the GPU, with no CPU pixel work. If not, it falls back to CPU recombine to
+  BGRA in a `gdk::MemoryTexture`. All GL/EGL `unsafe` lives only in `haver-gl`.
 
 - **Cursor.** The remote cursor is shown as the video widget's own cursor, so
   the local compositor draws it at the real pointer with no added latency; it is
@@ -120,11 +123,12 @@ tested against wl-clipboard).
 
 Not yet built, roughly in priority order:
 
-1. **`GlSplitter` / GL client recombine.** Zero-copy chroma split on the server
-   and a recombine shader on the client, replacing the CPU colour passes. This
-   is the main throughput optimisation. It requires `unsafe` GL/EGL (a C API),
-   so it is deferred per the project's no-unsafe preference and needs a display
-   to validate.
+1. **Server-side `GlSplitter`.** The client GL recombine is built (`haver-gl`);
+   the server still colour-converts and splits on the CPU. A server GL split is
+   possible but bounded on AMD: the radeonsi VA encoder will not import a dmabuf
+   as input, so a GL split there still needs one `vaPutImage` upload (it removes
+   the CPU colour pass but is not fully zero-copy). It is verifiable headlessly
+   via the pipeline PSNR, unlike the client path which needs a display.
 2. **Native single-stream 4:4:4, and AV1/HEVC.** Probe-gated; this GPU exposes
    no such VA-API encode entrypoint, so they cannot be validated here. Needs an
    Intel or newer GPU.

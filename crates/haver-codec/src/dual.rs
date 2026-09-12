@@ -6,10 +6,12 @@
 
 use std::collections::BTreeMap;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use cros_codecs::libva::Display;
 use haver_proto::chroma::{recombine_yuv444, split_yuv444, Nv12, Yuv444};
 
+use crate::frame::Nv12Frame;
 use crate::h264::{EncoderSettings, H264Decoder, H264Encoder};
 use crate::{frame::FrameAllocator, Result};
 
@@ -60,16 +62,25 @@ impl DualEncoder {
     }
 }
 
+/// A decoded pair of NV12 dmabuf frames (main + auxiliary) plus display size.
+pub struct DecodedPair {
+    pub main: Arc<Nv12Frame>,
+    pub aux: Arc<Nv12Frame>,
+    pub width: usize,
+    pub height: usize,
+}
+
 pub struct DualDecoder {
     main: H264Decoder,
     aux: H264Decoder,
     width: usize,
     height: usize,
-    // Ready main/aux NV12 frames not yet paired, keyed by their timestamp. The
-    // two decoders are independent and may return a frame on different calls,
-    // so we pair by timestamp rather than by arrival order.
-    main_ready: BTreeMap<u64, Nv12>,
-    aux_ready: BTreeMap<u64, Nv12>,
+    // Ready main/aux frames not yet paired, keyed by their timestamp. The two
+    // decoders are independent and may return a frame on different calls, so we
+    // pair by timestamp rather than by arrival order. We keep the dmabuf frames
+    // themselves (not CPU copies) so the GPU path stays zero-copy.
+    main_ready: BTreeMap<u64, Arc<Nv12Frame>>,
+    aux_ready: BTreeMap<u64, Arc<Nv12Frame>>,
 }
 
 impl DualDecoder {
@@ -77,8 +88,8 @@ impl DualDecoder {
         let a = FrameAllocator::open(&crate::vaapi::render_node(None))?;
         let b = FrameAllocator::open(&crate::vaapi::render_node(None))?;
         Ok(Self {
-            main: H264Decoder::new(display.clone(), a, 2)?,
-            aux: H264Decoder::new(display, b, 2)?,
+            main: H264Decoder::new(display.clone(), a, 3)?,
+            aux: H264Decoder::new(display, b, 3)?,
             width,
             height,
             main_ready: BTreeMap::new(),
@@ -86,34 +97,43 @@ impl DualDecoder {
         })
     }
 
-    /// Decode one dual access unit. Returns a 4:4:4 frame once both streams have
-    /// produced the frame for a matching timestamp.
-    pub fn decode(&mut self, timestamp: u64, main: &[u8], aux: &[u8]) -> Result<Option<Yuv444>> {
+    /// Decode one dual access unit and pair by timestamp. Returns the two NV12
+    /// dmabuf frames once both streams have produced a matching timestamp.
+    pub fn decode_pair(&mut self, timestamp: u64, main: &[u8], aux: &[u8]) -> Result<Option<DecodedPair>> {
         for f in self.main.decode(timestamp, main)? {
-            let nv12 = read_nv12(&f, self.width, self.height)?;
-            self.main_ready.insert(f.timestamp, nv12);
+            self.main_ready.insert(f.timestamp, f.frame);
         }
         for f in self.aux.decode(timestamp, aux)? {
-            let nv12 = read_nv12(&f, self.width, self.height)?;
-            self.aux_ready.insert(f.timestamp, nv12);
+            self.aux_ready.insert(f.timestamp, f.frame);
         }
-        // Pair the lowest timestamp present in both maps.
         let ts = self.main_ready.keys().find(|k| self.aux_ready.contains_key(k)).copied();
         if let Some(ts) = ts {
             // Drop any older unpaired frames; their partner was lost.
             self.main_ready.retain(|k, _| *k >= ts);
             self.aux_ready.retain(|k, _| *k >= ts);
-            let m = self.main_ready.remove(&ts).expect("present");
-            let a = self.aux_ready.remove(&ts).expect("present");
-            return Ok(Some(recombine_yuv444(&m, &a)));
+            let main = self.main_ready.remove(&ts).expect("present");
+            let aux = self.aux_ready.remove(&ts).expect("present");
+            return Ok(Some(DecodedPair { main, aux, width: self.width, height: self.height }));
         }
         Ok(None)
     }
+
+    /// Decode and recombine into a 4:4:4 frame on the CPU (fallback display).
+    pub fn decode(&mut self, timestamp: u64, main: &[u8], aux: &[u8]) -> Result<Option<Yuv444>> {
+        match self.decode_pair(timestamp, main, aux)? {
+            Some(pair) => {
+                let m = read_nv12(&pair.main, self.width, self.height)?;
+                let a = read_nv12(&pair.aux, self.width, self.height)?;
+                Ok(Some(recombine_yuv444(&m, &a)))
+            }
+            None => Ok(None),
+        }
+    }
 }
 
-fn read_nv12(frame: &crate::h264::DecodedFrame, width: usize, height: usize) -> Result<Nv12> {
+fn read_nv12(frame: &Nv12Frame, width: usize, height: usize) -> Result<Nv12> {
     let mut out = Nv12::new(width, height);
-    frame.frame.with_planes(|y, uv, py, puv| {
+    frame.with_planes(|y, uv, py, puv| {
         for row in 0..height {
             out.y[row * width..row * width + width].copy_from_slice(&y[row * py..row * py + width]);
         }

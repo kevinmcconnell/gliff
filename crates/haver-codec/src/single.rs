@@ -7,7 +7,8 @@ use std::rc::Rc;
 use cros_codecs::libva::Display;
 use haver_proto::chroma::{nv12_to_yuv444, yuv444_to_nv12, Nv12, Yuv444};
 
-use crate::frame::FrameAllocator;
+use crate::frame::{FrameAllocator, Nv12Frame};
+use std::sync::Arc;
 use crate::h264::{EncoderSettings, H264Decoder, H264Encoder};
 use crate::Result;
 
@@ -44,6 +45,15 @@ impl SingleDecoder {
     pub fn new(display: Rc<Display>, width: usize, height: usize) -> Result<Self> {
         let alloc = FrameAllocator::open(&crate::vaapi::render_node(None))?;
         Ok(Self { dec: H264Decoder::new(display, alloc, 2)?, width, height })
+    }
+
+    /// Decode and return the raw NV12 dmabuf frame (for the GPU display path).
+    pub fn decode_frame(&mut self, timestamp: u64, main: &[u8]) -> Result<Option<Arc<Nv12Frame>>> {
+        Ok(self.dec.decode(timestamp, main)?.into_iter().next().map(|f| f.frame))
+    }
+
+    pub fn dims(&self) -> (usize, usize) {
+        (self.width, self.height)
     }
 
     pub fn decode(&mut self, timestamp: u64, main: &[u8]) -> Result<Option<Yuv444>> {

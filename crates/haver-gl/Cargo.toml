@@ -1,0 +1,21 @@
+[package]
+name = "haver-gl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# This crate is the ONLY place in haver that uses unsafe: GL and EGL are C APIs.
+# Every block carries a SAFETY comment. The lint stays at workspace default
+# (deny unsafe_op_in_unsafe_fn) rather than forbidding unsafe outright.
+[lints]
+workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+glow.workspace = true
+khronos-egl = { workspace = true }
+drm-fourcc.workspace = true
+gbm.workspace = true
+libc = "0.2"

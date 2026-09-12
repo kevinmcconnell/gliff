@@ -7,11 +7,13 @@
 
 use std::sync::mpsc::{Sender as StdSender, SyncSender};
 
+use std::sync::Arc;
+
 use haver_codec::color::yuv444_to_bgra;
+use haver_codec::frame::Nv12Frame;
 use haver_codec::dual::DualDecoder;
 use haver_codec::single::SingleDecoder;
 use haver_codec::vaapi;
-use haver_proto::chroma::Yuv444;
 use haver_proto::{ChromaMode, ClientCaps, ClientMsg, Codec, ServerMsg, PROTOCOL_VERSION};
 use haver_transport::{spawn_ssh, Framed, SshTarget};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -33,19 +35,34 @@ impl Decoder {
         })
     }
 
-    fn decode(&mut self, ts: u64, main: &[u8], aux: &[u8]) -> haver_codec::Result<Option<Yuv444>> {
+    /// GPU path: return the decoded dmabuf planes without CPU recombine.
+    fn decode_planes(&mut self, ts: u64, main: &[u8], aux: &[u8]) -> haver_codec::Result<Option<DecodedFrame>> {
         match self {
-            Decoder::Dual(d) => d.decode(ts, main, aux),
-            Decoder::Single(s) => s.decode(ts, main),
+            Decoder::Dual(d) => Ok(d.decode_pair(ts, main, aux)?.map(|p| DecodedFrame::Planes {
+                width: p.width, height: p.height, main: p.main, aux: Some(p.aux),
+            })),
+            Decoder::Single(s) => {
+                let (w, h) = s.dims();
+                Ok(s.decode_frame(ts, main)?.map(|f| DecodedFrame::Planes { width: w, height: h, main: f, aux: None }))
+            }
         }
+    }
+
+    /// CPU fallback: recombine to 4:4:4 and convert to BGRA.
+    fn decode_rgba(&mut self, ts: u64, main: &[u8], aux: &[u8]) -> haver_codec::Result<Option<DecodedFrame>> {
+        let yuv = match self {
+            Decoder::Dual(d) => d.decode(ts, main, aux)?,
+            Decoder::Single(s) => s.decode(ts, main)?,
+        };
+        Ok(yuv.map(|y| DecodedFrame::Rgba { width: y.width, height: y.height, bgra: yuv444_to_bgra(&y) }))
     }
 }
 
-/// A decoded frame ready to display, as tightly packed BGRA.
-pub struct DecodedFrame {
-    pub width: usize,
-    pub height: usize,
-    pub bgra: Vec<u8>,
+/// A decoded frame ready to display: either GPU dmabuf planes (fast path) or
+/// CPU-recombined BGRA (fallback).
+pub enum DecodedFrame {
+    Rgba { width: usize, height: usize, bgra: Vec<u8> },
+    Planes { width: usize, height: usize, main: Arc<Nv12Frame>, aux: Option<Arc<Nv12Frame>> },
 }
 
 /// Status/telemetry the worker reports to the UI.
@@ -69,6 +86,8 @@ pub enum Endpoint {
 
 pub struct Worker {
     pub endpoint: Endpoint,
+    /// Use the GPU dmabuf display path when the client supports it.
+    pub gpu: bool,
     /// Bounded so a stalled UI thread cannot make the decoder buffer frames
     /// without limit; when full, the newest frame is dropped (latest-wins).
     pub frames: SyncSender<DecodedFrame>,
@@ -94,11 +113,11 @@ impl Worker {
                     let stream = tokio::net::TcpStream::connect(addr).await?;
                     stream.set_nodelay(true)?;
                     let (rd, wr) = tokio::io::split(stream);
-                    session(rd, wr, self.frames, self.status, self.input).await
+                    session(rd, wr, self.frames, self.status, self.input, self.gpu).await
                 }
                 Endpoint::Ssh(ref target) => {
                     let ssh = spawn_ssh(target)?;
-                    session(ssh.stdout, ssh.stdin, self.frames, self.status, self.input).await
+                    session(ssh.stdout, ssh.stdin, self.frames, self.status, self.input, self.gpu).await
                 }
             }
         });
@@ -116,6 +135,7 @@ async fn session<R, W>(
     frames: SyncSender<DecodedFrame>,
     status: StdSender<Status>,
     mut input: UnboundedReceiver<(ClientMsg, Vec<u8>)>,
+    gpu: bool,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin + 'static,
@@ -192,19 +212,22 @@ where
                 let aux = if aux_len > 0 { reader.read_payload(aux_len).await?.to_vec() } else { Vec::new() };
                 bytes_since += (data_len + aux_len) as u64;
                 let t0 = std::time::Instant::now();
-                let decoded = decoder.decode(frame_id, &main, &aux);
+                let decoded = if gpu {
+                    decoder.decode_planes(frame_id, &main, &aux)
+                } else {
+                    decoder.decode_rgba(frame_id, &main, &aux)
+                };
                 let dec_ms = t0.elapsed().as_secs_f32() * 1000.0;
                 // Ack immediately so the server keeps pacing.
                 let _ = out_tx.send((ClientMsg::FrameAck { frame_id, decoded_at_ms: now_ms() }, Vec::new()));
                 match decoded {
-                    Ok(Some(yuv)) => {
-                        let bgra = yuv444_to_bgra(&yuv);
+                    Ok(Some(frame)) => {
                         if !logged_first {
-                            tracing::info!(w = yuv.width, h = yuv.height, "first frame decoded and displayed");
+                            tracing::info!(gpu, "first frame decoded and displayed");
                             logged_first = true;
                         }
                         // Latest-wins: drop this frame if the UI hasn't drained.
-                        let _ = frames.try_send(DecodedFrame { width: yuv.width, height: yuv.height, bgra });
+                        let _ = frames.try_send(frame);
                         frames_since += 1;
                         decode_ms_acc += dec_ms;
                     }

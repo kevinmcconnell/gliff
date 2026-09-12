@@ -1,7 +1,7 @@
 //! haver-client: a GTK4/libadwaita window that connects to a haver server,
 //! decodes the video, shows it, and forwards keyboard and pointer input.
 //!
-//! Decode runs on a worker thread (see `net`); this file is the UI. There is no
+//! Decode runs on a worker thread (see `net`); this file is the UI. All GL
 //! `unsafe` here: decoded frames arrive as BGRA and become a `gdk::MemoryTexture`.
 
 mod keymap;
@@ -42,9 +42,22 @@ struct Cli {
     headless: bool,
 }
 
+/// GPU display: a GLArea whose render callback recombines dmabuf planes.
+struct GlView {
+    area: gtk::GLArea,
+    frame: Rc<RefCell<Option<net::DecodedFrame>>>,
+}
+
 /// Everything the UI shares with its callbacks.
 struct App {
-    picture: gtk::Picture,
+    /// The widget input controllers attach to and we measure (GLArea or Picture).
+    video: gtk::Widget,
+    /// CPU display path (BGRA -> MemoryTexture), when the GPU path is off.
+    picture: Option<gtk::Picture>,
+    /// GPU display path, when EGL dmabuf import is available.
+    gl: Option<GlView>,
+    /// Whether the worker should hand us dmabuf planes (GPU) or BGRA (CPU).
+    gpu: bool,
     stats: gtk::Label,
     status: gtk::Label,
     stream_size: Rc<RefCell<(u32, u32)>>,
@@ -81,12 +94,35 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
     header.pack_start(&connect_btn);
     header.pack_end(&fullscreen_btn);
 
-    let picture = gtk::Picture::builder().hexpand(true).vexpand(true).content_fit(gtk::ContentFit::Contain).build();
+    // Probe once whether this machine's EGL can import dmabufs; if so the GPU
+    // display path (GLArea + recombine shader) is used, else the CPU path.
+    let gpu = haver_gl::supports_dmabuf_import();
+    tracing::info!(gpu, "display path");
+
     let stats = gtk::Label::builder().halign(gtk::Align::Start).valign(gtk::Align::Start).css_classes(["stats"]).visible(false).build();
     let status = gtk::Label::builder().label("Not connected").build();
 
+    let (video, picture, gl): (gtk::Widget, Option<gtk::Picture>, Option<GlView>) = if gpu {
+        let area = gtk::GLArea::builder().hexpand(true).vexpand(true).build();
+        let renderer: Rc<RefCell<Option<haver_gl::Renderer>>> = Rc::new(RefCell::new(None));
+        let frame: Rc<RefCell<Option<net::DecodedFrame>>> = Rc::new(RefCell::new(None));
+        {
+            let renderer = renderer.clone();
+            let frame = frame.clone();
+            area.connect_render(move |area, _| {
+                render_gl(area, &renderer, &frame);
+                glib::Propagation::Stop
+            });
+        }
+        let gl = GlView { area: area.clone(), frame };
+        (area.upcast(), None, Some(gl))
+    } else {
+        let p = gtk::Picture::builder().hexpand(true).vexpand(true).content_fit(gtk::ContentFit::Contain).build();
+        (p.clone().upcast(), Some(p), None)
+    };
+
     let overlay = gtk::Overlay::new();
-    overlay.set_child(Some(&picture));
+    overlay.set_child(Some(&video));
     overlay.add_overlay(&stats);
 
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -96,7 +132,10 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
     window.set_content(Some(&content));
 
     let ui = Rc::new(App {
-        picture: picture.clone(),
+        video: video.clone(),
+        picture,
+        gl,
+        gpu,
         stats: stats.clone(),
         status: status.clone(),
         stream_size: Rc::new(RefCell::new((0, 0))),
@@ -106,7 +145,7 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         last_remote_clip: Rc::new(RefCell::new(None)),
     });
 
-    install_input_handlers(&ui, &picture, &window);
+    install_input_handlers(&ui, &video, &window);
 
     // Fullscreen toggle.
     {
@@ -198,10 +237,11 @@ fn start_session(ui: Rc<App>, endpoint: Endpoint) {
     *ui.endpoint.borrow_mut() = Some(endpoint.clone());
     ui.status.set_text("Connecting…");
 
+    let gpu = ui.gpu;
     std::thread::Builder::new()
         .name("haver-net".into())
         .spawn(move || {
-            Worker { endpoint, frames: frame_tx, status: status_tx, input: input_rx }.run();
+            Worker { endpoint, gpu, frames: frame_tx, status: status_tx, input: input_rx }.run();
         })
         .expect("spawn network thread");
 
@@ -234,12 +274,68 @@ fn poll_frames(ui: Rc<App>, rx: Receiver<DecodedFrame>) {
             latest = Some(f);
         }
         if let Some(f) = latest {
-            let bytes = glib::Bytes::from(&f.bgra);
-            let texture = gdk::MemoryTexture::new(f.width as i32, f.height as i32, gdk::MemoryFormat::B8g8r8a8, &bytes, f.width * 4);
-            ui.picture.set_paintable(Some(&texture));
+            match (&ui.gl, &ui.picture) {
+                (Some(gl), _) => {
+                    // GPU path: hand the planes to the render callback and redraw.
+                    *gl.frame.borrow_mut() = Some(f);
+                    gl.area.queue_render();
+                }
+                (None, Some(picture)) => {
+                    if let DecodedFrame::Rgba { width, height, bgra } = f {
+                        let bytes = glib::Bytes::from(&bgra);
+                        let texture = gdk::MemoryTexture::new(width as i32, height as i32, gdk::MemoryFormat::B8g8r8a8, &bytes, width * 4);
+                        picture.set_paintable(Some(&texture));
+                    }
+                }
+                _ => {}
+            }
         }
         glib::ControlFlow::Continue
     });
+}
+
+/// The Y (R8) and UV (GR88) dmabuf planes of an NV12 frame.
+fn nv12_planes(frame: &haver_codec::frame::Nv12Frame) -> (haver_gl::DmabufPlane<'_>, haver_gl::DmabufPlane<'_>) {
+    use drm_fourcc::DrmFourcc;
+    use haver_gl::DmabufPlane;
+    let info = frame.info();
+    (
+        DmabufPlane { fd: info.fd(), width: info.width, height: info.height, offset: info.planes[0].offset, stride: info.planes[0].stride, fourcc: DrmFourcc::R8, modifier: info.modifier },
+        DmabufPlane { fd: info.fd(), width: info.width / 2, height: info.height / 2, offset: info.planes[1].offset, stride: info.planes[1].stride, fourcc: DrmFourcc::Gr88, modifier: info.modifier },
+    )
+}
+
+/// Render one dmabuf-planes frame in the GLArea's current context.
+fn render_gl(area: &gtk::GLArea, renderer: &Rc<RefCell<Option<haver_gl::Renderer>>>, frame: &Rc<RefCell<Option<net::DecodedFrame>>>) {
+    use haver_gl::FramePlanes;
+
+    if renderer.borrow().is_none() {
+        match haver_gl::Renderer::new() {
+            Ok(r) => *renderer.borrow_mut() = Some(r),
+            Err(e) => {
+                tracing::error!(error = %e, "GL renderer init failed");
+                return;
+            }
+        }
+    }
+    let renderer = renderer.borrow();
+    let Some(renderer) = renderer.as_ref() else { return };
+    let frame = frame.borrow();
+    let Some(net::DecodedFrame::Planes { width, height, main, aux }) = frame.as_ref() else { return };
+
+    let (main_y, main_uv) = nv12_planes(main);
+    let planes = FramePlanes {
+        main_y,
+        main_uv,
+        aux: aux.as_ref().map(|a| nv12_planes(a)),
+        width: *width as u32,
+        height: *height as u32,
+    };
+    let scale = area.scale_factor();
+    let (fb_w, fb_h) = (area.width() * scale, area.height() * scale);
+    if let Err(e) = renderer.draw(&planes, fb_w, fb_h) {
+        tracing::warn!(error = %e, "GL draw failed");
+    }
 }
 
 fn poll_status(ui: Rc<App>, rx: Receiver<Status>) {
@@ -287,14 +383,14 @@ fn set_remote_cursor(ui: &App, width: u32, height: u32, hot_x: i32, hot_y: i32, 
     if !opaque {
         // Fully transparent: hide the pointer over the video.
         if let Some(cursor) = gdk::Cursor::from_name("none", None) {
-            ui.picture.set_cursor(Some(&cursor));
+            ui.video.set_cursor(Some(&cursor));
         }
         return;
     }
     let bytes = glib::Bytes::from(argb);
     let texture = gdk::MemoryTexture::new(width as i32, height as i32, gdk::MemoryFormat::B8g8r8a8, &bytes, width as usize * 4);
     let cursor = gdk::Cursor::from_texture(&texture, hot_x, hot_y, None);
-    ui.picture.set_cursor(Some(&cursor));
+    ui.video.set_cursor(Some(&cursor));
 }
 
 /// Map a widget-space point to remote output coordinates.
@@ -303,7 +399,7 @@ fn to_remote(ui: &App, x: f64, y: f64) -> (f64, f64) {
     if rw == 0 || rh == 0 {
         return (0.0, 0.0);
     }
-    let (aw, ah) = (ui.picture.width() as f64, ui.picture.height() as f64);
+    let (aw, ah) = (ui.video.width() as f64, ui.video.height() as f64);
     // content_fit=Contain: the video is letterboxed; compute the fitted rect.
     let scale = (aw / rw as f64).min(ah / rh as f64);
     let (fw, fh) = (rw as f64 * scale, rh as f64 * scale);
@@ -326,9 +422,9 @@ fn send_payload(ui: &App, msg: ClientMsg, payload: Vec<u8>) {
     }
 }
 
-fn install_input_handlers(ui: &Rc<App>, picture: &gtk::Picture, window: &adw::ApplicationWindow) {
-    picture.set_focusable(true);
-    picture.set_can_focus(true);
+fn install_input_handlers(ui: &Rc<App>, video: &gtk::Widget, window: &adw::ApplicationWindow) {
+    video.set_focusable(true);
+    video.set_can_focus(true);
 
     // Keyboard: hardware keycode minus 8 is the evdev code.
     let key = gtk::EventControllerKey::new();
@@ -345,7 +441,7 @@ fn install_input_handlers(ui: &Rc<App>, picture: &gtk::Picture, window: &adw::Ap
             send(&ui, ClientMsg::Key { keycode: keycode.saturating_sub(8), pressed: false });
         });
     }
-    picture.add_controller(key);
+    video.add_controller(key);
 
     // Pointer motion.
     let motion = gtk::EventControllerMotion::new();
@@ -356,16 +452,16 @@ fn install_input_handlers(ui: &Rc<App>, picture: &gtk::Picture, window: &adw::Ap
             send(&ui, ClientMsg::PointerMotion { x: rx, y: ry });
         });
     }
-    picture.add_controller(motion);
+    video.add_controller(motion);
 
     // Buttons.
     let click = gtk::GestureClick::new();
     click.set_button(0); // any button
     {
         let ui = ui.clone();
-        let picture = picture.clone();
+        let video = video.clone();
         click.connect_pressed(move |g, _, _, _| {
-            picture.grab_focus();
+            video.grab_focus();
             send(&ui, ClientMsg::PointerButton { button: evdev_button(g.current_button()), pressed: true });
         });
     }
@@ -375,7 +471,7 @@ fn install_input_handlers(ui: &Rc<App>, picture: &gtk::Picture, window: &adw::Ap
             send(&ui, ClientMsg::PointerButton { button: evdev_button(g.current_button()), pressed: false });
         });
     }
-    picture.add_controller(click);
+    video.add_controller(click);
 
     // Scroll.
     let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
@@ -391,18 +487,18 @@ fn install_input_handlers(ui: &Rc<App>, picture: &gtk::Picture, window: &adw::Ap
             glib::Propagation::Stop
         });
     }
-    picture.add_controller(scroll);
+    video.add_controller(scroll);
 
     // Debounced resize: GTK4 Picture has no resize signal, so poll the widget
     // allocation and, once it has been stable for ~200 ms, tell the server.
     {
         let ui = ui.clone();
-        let picture = picture.clone();
+        let video = video.clone();
         let last_sent = Rc::new(RefCell::new((0i32, 0i32)));
         let stable = Rc::new(RefCell::new((0i32, 0i32, 0u32)));
         glib::timeout_add_local(Duration::from_millis(100), move || {
-            let scale = picture.scale_factor();
-            let (w, h) = (picture.width() * scale, picture.height() * scale);
+            let scale = video.scale_factor();
+            let (w, h) = (video.width() * scale, video.height() * scale);
             if w < 64 || h < 64 {
                 return glib::ControlFlow::Continue;
             }
@@ -439,7 +535,7 @@ fn install_input_handlers(ui: &Rc<App>, picture: &gtk::Picture, window: &adw::Ap
             }
         });
     }
-    picture.add_controller(focus);
+    video.add_controller(focus);
 }
 
 /// GTK button number to evdev `BTN_*`.
