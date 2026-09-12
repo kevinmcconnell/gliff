@@ -179,7 +179,7 @@ where
                         input.send(InputCmd::Axis { axis, value, discrete, stop }).ok();
                     }
                     ClientMsg::Resize { width: rw, height: rh, .. } => {
-                        let (rw, rh) = (rw & !1, rh & !1);
+                        let (rw, rh) = (rw.min(caps.max_width) & !1, rh.min(caps.max_height) & !1);
                         if created_headless && rw >= 320 && rh >= 240 && (rw != width || rh != height) {
                             tracing::info!(rw, rh, "resizing headless output");
                             instance.set_monitor_mode(&output_name, rw, rh, 60, 1.0).ok();
@@ -193,7 +193,9 @@ where
                         }
                     }
                     ClientMsg::Ping { t } => { writer.write_msg(&ServerMsg::Pong { t, server_now_ms: now_ms() }).await?; }
-                    ClientMsg::ClipboardData { .. } | ClientMsg::ClipboardOffer { .. } | ClientMsg::ClipboardRequest { .. } => { /* clipboard: not yet wired */ }
+                    // ClipboardData is consumed by the reader task; the
+                    // offer/request negotiation is not used for text.
+                    ClientMsg::ClipboardData { .. } | ClientMsg::ClipboardOffer { .. } | ClientMsg::ClipboardRequest { .. } => {}
                     ClientMsg::Hello { .. } => anyhow::bail!("unexpected second Hello"),
                 }
             }

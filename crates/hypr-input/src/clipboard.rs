@@ -309,8 +309,13 @@ impl Dispatch<ExtDataControlSourceV1, ()> for State {
             source::Event::Send { mime_type: _, fd } => {
                 if let Some((cur, text)) = &s.our_source {
                     if cur == src {
-                        let mut file = File::from(fd);
-                        let _ = file.write_all(text.as_bytes());
+                        // Write off the Wayland thread: a paste target that
+                        // reads slowly would otherwise stall dispatch once the
+                        // pipe buffer fills.
+                        let text = text.clone();
+                        std::thread::spawn(move || {
+                            let _ = File::from(fd).write_all(text.as_bytes());
+                        });
                     }
                 }
             }

@@ -144,10 +144,7 @@ impl Renderer {
             let recombine = build_program(&gl, VERT, FRAG_RECOMBINE)?;
             let blit = build_program(&gl, VERT, FRAG_BLIT)?;
             let vao = gl.create_vertex_array().map_err(Error::Gl)?;
-            let mut plane_textures = [new_texture(&gl)?; 4];
-            for t in &mut plane_textures {
-                *t = new_texture(&gl)?;
-            }
+            let plane_textures = [new_texture(&gl)?, new_texture(&gl)?, new_texture(&gl)?, new_texture(&gl)?];
             let rgba_texture = new_texture(&gl)?;
             (recombine, blit, vao, plane_textures, rgba_texture)
         };
