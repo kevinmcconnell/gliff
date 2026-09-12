@@ -48,6 +48,7 @@ pub struct H264Decoder {
     bitstream: HostBuffer,
     bitstream_align: usize,
     max_dpb_slots: u32,
+    max_coded_extent: vk::Extent2D,
     sps_bytes: Vec<u8>,
     pps_bytes: Vec<u8>,
     stream: Option<Stream>,
@@ -69,7 +70,7 @@ impl H264Decoder {
         let queue = gpu
             .decode_queue
             .ok_or_else(|| Error::Unsupported("no decode queue".into()))?;
-        let (align, max_dpb_slots) = with_h264_profile(false, |profile| {
+        let (align, max_dpb_slots, max_coded_extent) = with_h264_profile(false, |profile| {
             let mut h264_caps = vk::VideoDecodeH264CapabilitiesKHR::default();
             let mut dec_caps = vk::VideoDecodeCapabilitiesKHR::default();
             let mut caps = vk::VideoCapabilitiesKHR::default()
@@ -88,6 +89,7 @@ impl H264Decoder {
                 .min_bitstream_buffer_size_alignment
                 .max(caps.min_bitstream_buffer_offset_alignment) as usize;
             let max_dpb_slots = caps.max_dpb_slots;
+            let max_coded_extent = caps.max_coded_extent;
             if !dec_caps
                 .flags
                 .contains(vk::VideoDecodeCapabilityFlagsKHR::DPB_AND_OUTPUT_DISTINCT)
@@ -96,7 +98,7 @@ impl H264Decoder {
                     "decoder requires DPB and output to coincide; not implemented".into(),
                 ));
             }
-            Ok((align, max_dpb_slots))
+            Ok((align, max_dpb_slots, max_coded_extent))
         })?;
         let bitstream = with_h264_profile(false, |profile| {
             HostBuffer::new(
@@ -112,6 +114,7 @@ impl H264Decoder {
             bitstream,
             bitstream_align: align.max(1),
             max_dpb_slots,
+            max_coded_extent,
             sps_bytes: Vec::new(),
             pps_bytes: Vec::new(),
             stream: None,
@@ -384,9 +387,19 @@ impl H264Decoder {
                 None => sliding_window(&mut stream.slots, header.frame_num, &stream.sps),
             }
         }
-        if is_ref {
-            self.poc.prev_frame_num = header.frame_num;
-        }
+        // prevFrameNum is the previous picture in decoding order, reference
+        // or not (8.2.1); an MMCO 5 makes the current picture look like
+        // frame 0 to the next one.
+        let mmco5 = header
+            .mmcos
+            .as_ref()
+            .is_some_and(|ops| ops.iter().any(|m| m.op == 5));
+        self.poc.prev_frame_num = if mmco5 {
+            self.poc.prev_frame_num_offset = 0;
+            0
+        } else {
+            header.frame_num
+        };
         Ok(Some(&stream.outputs[output_index]))
     }
 
@@ -397,6 +410,16 @@ impl H264Decoder {
 
     fn open_stream(&mut self, sps: Sps, pps: Option<Pps>) -> Result<()> {
         let (cw, ch) = sps.coded_size();
+        if cw == 0
+            || ch == 0
+            || cw > self.max_coded_extent.width
+            || ch > self.max_coded_extent.height
+        {
+            return Err(Error::Unsupported(format!(
+                "stream size {cw}x{ch} exceeds the decoder limit {:?}",
+                self.max_coded_extent
+            )));
+        }
         let coded = vk::Extent2D {
             width: cw,
             height: ch,

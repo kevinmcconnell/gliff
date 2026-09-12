@@ -712,8 +712,12 @@ impl H264Encoder {
             )?;
         }
         let results = results[0];
-        if results[2] == 0 {
-            return Err(Error::Unsupported("encode query reported no status".into()));
+        // VkQueryResultStatusKHR: 1 = complete, 0 = not ready, < 0 = error.
+        if results[2] as i32 != 1 {
+            return Err(Error::Unsupported(format!(
+                "encode failed with query status {}",
+                results[2] as i32
+            )));
         }
         let (offset, len) = (results[0] as usize, results[1] as usize);
         let slice = self.bitstream.read(offset, len);

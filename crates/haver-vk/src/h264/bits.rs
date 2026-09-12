@@ -43,6 +43,9 @@ impl<'a> BitReader<'a> {
     }
 
     pub fn bits(&mut self, n: u32) -> Result<u32> {
+        if n > 32 {
+            return Err(Error::Bitstream("field wider than 32 bits"));
+        }
         let mut v = 0u32;
         for _ in 0..n {
             v = (v << 1) | self.flag()?;

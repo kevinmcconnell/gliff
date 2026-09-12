@@ -398,7 +398,11 @@ impl Image {
                     return Err(e.into());
                 }
             };
-            gpu.device.bind_image_memory(image, memory, 0)?;
+            if let Err(e) = gpu.device.bind_image_memory(image, memory, 0) {
+                gpu.device.destroy_image(image, None);
+                gpu.device.free_memory(memory, None);
+                return Err(e.into());
+            }
             (image, memory)
         };
         let mut img = Self {

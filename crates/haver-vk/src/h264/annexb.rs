@@ -30,8 +30,9 @@ pub fn nal_units(data: &[u8]) -> Vec<Nal<'_>> {
         .iter()
         .enumerate()
         .filter_map(|(n, &body)| {
-            // The next start code may be 3 or 4 bytes; trim the leading zero
-            // of a 4-byte one from this unit's tail.
+            // Trailing zero bytes are never part of a NAL unit (the RBSP stop
+            // bit and cabac_zero_words both end in a nonzero byte): they are
+            // the leading zero of a 4-byte start code or trailing_zero_8bits.
             let mut end = starts.get(n + 1).map(|s| s - 3).unwrap_or(data.len());
             while end > body && data[end - 1] == 0 {
                 end -= 1;

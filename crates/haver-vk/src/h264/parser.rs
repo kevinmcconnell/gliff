@@ -73,8 +73,12 @@ impl Sps {
     pub fn coded_size(&self) -> (u32, u32) {
         let mult = if self.frame_mbs_only { 1 } else { 2 };
         (
-            (self.pic_width_in_mbs_minus1 + 1) * 16,
-            (self.pic_height_in_map_units_minus1 + 1) * 16 * mult,
+            self.pic_width_in_mbs_minus1
+                .saturating_add(1)
+                .saturating_mul(16),
+            self.pic_height_in_map_units_minus1
+                .saturating_add(1)
+                .saturating_mul(16 * mult),
         )
     }
 
@@ -155,6 +159,17 @@ impl SliceHeader {
     }
 }
 
+/// An `ue(v)` field with a syntax-defined upper bound; larger values are a
+/// malformed (or hostile) stream.
+fn ue_max(r: &mut BitReader, max: u32, what: &'static str) -> Result<u32> {
+    let v = r.ue()?;
+    if v > max {
+        tracing::debug!(field = what, value = v, max, "out-of-range header field");
+        return Err(Error::Bitstream("header field out of range"));
+    }
+    Ok(v)
+}
+
 fn scaling_list(r: &mut BitReader, size: usize) -> Result<(Vec<u8>, bool)> {
     let mut list = vec![0u8; size];
     let mut last = 8i32;
@@ -163,7 +178,7 @@ fn scaling_list(r: &mut BitReader, size: usize) -> Result<(Vec<u8>, bool)> {
     for (j, v) in list.iter_mut().enumerate() {
         if next != 0 {
             let delta = r.se()?;
-            next = (last + delta + 256) % 256;
+            next = ((last as i64 + delta as i64 + 256).rem_euclid(256)) as i32;
             use_default = j == 0 && next == 0;
         }
         *v = if next == 0 { last } else { next } as u8;
@@ -219,15 +234,18 @@ pub fn parse_sps(nal: &[u8]) -> Result<Sps> {
             sps.scaling_lists = Some(scaling_lists(&mut r, count)?);
         }
     }
-    sps.log2_max_frame_num_minus4 = r.ue()? as u8;
+    sps.log2_max_frame_num_minus4 = ue_max(&mut r, 12, "log2_max_frame_num_minus4")? as u8;
     sps.pic_order_cnt_type = r.ue()? as u8;
     match sps.pic_order_cnt_type {
-        0 => sps.log2_max_pic_order_cnt_lsb_minus4 = r.ue()? as u8,
+        0 => {
+            sps.log2_max_pic_order_cnt_lsb_minus4 =
+                ue_max(&mut r, 12, "log2_max_pic_order_cnt_lsb_minus4")? as u8
+        }
         1 => {
             sps.delta_pic_order_always_zero = r.bit()?;
             sps.offset_for_non_ref_pic = r.se()?;
             sps.offset_for_top_to_bottom_field = r.se()?;
-            let n = r.ue()?;
+            let n = ue_max(&mut r, 255, "num_ref_frames_in_pic_order_cnt_cycle")?;
             for _ in 0..n {
                 sps.offset_for_ref_frame.push(r.se()?);
             }
@@ -235,10 +253,12 @@ pub fn parse_sps(nal: &[u8]) -> Result<Sps> {
         2 => {}
         _ => return Err(Error::Bitstream("bad pic_order_cnt_type")),
     }
-    sps.max_num_ref_frames = r.ue()? as u8;
+    sps.max_num_ref_frames = ue_max(&mut r, 16, "max_num_ref_frames")? as u8;
     sps.gaps_in_frame_num_allowed = r.bit()?;
-    sps.pic_width_in_mbs_minus1 = r.ue()?;
-    sps.pic_height_in_map_units_minus1 = r.ue()?;
+    // 16384 pixels each way is beyond any level; the decoder checks the
+    // device limit, this only keeps the arithmetic sane.
+    sps.pic_width_in_mbs_minus1 = ue_max(&mut r, 1023, "pic_width_in_mbs_minus1")?;
+    sps.pic_height_in_map_units_minus1 = ue_max(&mut r, 1023, "pic_height_in_map_units_minus1")?;
     sps.frame_mbs_only = r.bit()?;
     if !sps.frame_mbs_only {
         sps.mb_adaptive_frame_field = r.bit()?;
@@ -518,5 +538,50 @@ mod tests {
     #[test]
     fn rejects_truncated() {
         assert!(parse_sps(&unit(NAL_SPS)[..4]).is_err());
+    }
+
+    /// Hostile headers must error, never panic or allocate wildly: a
+    /// High-profile SPS with an absurd `pic_width_in_mbs_minus1`, and one with
+    /// `log2_max_frame_num_minus4` beyond the syntax limit.
+    #[test]
+    fn rejects_out_of_range_fields() {
+        // profile 100, constraints 0, level 40, then ue fields:
+        // sps_id=0 chroma=1 bd_luma=0 bd_chroma=0 bypass=0 scaling=0
+        // log2_max_frame_num_minus4=<n> poc_type=0 log2_max_poc_lsb_minus4=0
+        // max_num_ref_frames=1 gaps=0 width_mbs_minus1=<w> ...
+        fn sps_with(log2_fn: u32, width_mbs: u32) -> Vec<u8> {
+            let mut bits = String::new();
+            let ue = |v: u32| {
+                let n = (v + 1).ilog2();
+                format!("{}{:b}", "0".repeat(n as usize), v + 1)
+            };
+            for v in [0, 1, 0, 0] {
+                bits += &ue(v);
+            }
+            bits += "00"; // transform bypass, scaling matrix
+            bits += &ue(log2_fn);
+            bits += &ue(0); // poc type 0
+            bits += &ue(0);
+            bits += &ue(1);
+            bits += "0";
+            bits += &ue(width_mbs);
+            bits += &ue(10);
+            bits += "1"; // frame_mbs_only
+            bits += "1"; // direct_8x8
+            bits += "0"; // cropping
+            bits += "0"; // vui
+            bits += "1"; // stop bit
+            while bits.len() % 8 != 0 {
+                bits += "0";
+            }
+            let mut out = vec![0x67, 100, 0, 40];
+            for chunk in bits.as_bytes().chunks(8) {
+                out.push(u8::from_str_radix(std::str::from_utf8(chunk).unwrap(), 2).unwrap());
+            }
+            out
+        }
+        assert!(parse_sps(&sps_with(4, 10)).is_ok());
+        assert!(parse_sps(&sps_with(250, 10)).is_err());
+        assert!(parse_sps(&sps_with(4, 100_000)).is_err());
     }
 }
