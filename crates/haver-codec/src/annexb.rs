@@ -24,15 +24,34 @@ fn start_codes(data: &[u8]) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     let mut i = 0;
     while i + 3 <= data.len() {
-        if data[i] == 0 && data[i + 1] == 0 {
-            if data[i + 2] == 1 {
-                let sc_start = if i > 0 && data[i - 1] == 0 { i - 1 } else { i };
-                out.push((sc_start, i + 3));
-                i += 3;
-                continue;
-            }
+        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+            let sc_start = if i > 0 && data[i - 1] == 0 { i - 1 } else { i };
+            out.push((sc_start, i + 3));
+            i += 3;
+        } else {
+            i += 1;
         }
-        i += 1;
+    }
+    out
+}
+
+pub fn has_start_code(data: &[u8]) -> bool {
+    data.windows(3).any(|w| w == [0, 0, 1])
+}
+
+/// Byte offset of each NAL unit's header (the byte after its start code).
+pub fn nal_header_offsets(data: &[u8]) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 3 <= data.len() {
+        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+            if i + 3 < data.len() {
+                out.push(i + 3);
+            }
+            i += 3;
+        } else {
+            i += 1;
+        }
     }
     out
 }

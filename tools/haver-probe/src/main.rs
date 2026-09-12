@@ -52,8 +52,9 @@ enum Cmd {
         height: u32,
         #[arg(long, default_value_t = 10)]
         frames: usize,
-        #[arg(long, default_value_t = 20)]
-        qp: u32,
+        /// Target bitrate in bits per second (default: derived from size)
+        #[arg(long)]
+        bitrate: Option<u32>,
     },
     /// Capture one frame of an output and write it as PNG
     Capture {
@@ -89,7 +90,7 @@ fn main() -> Result<()> {
         Cmd::Outputs => outputs(&target)?,
         Cmd::Permissions => permissions(&target)?,
         Cmd::Vaapi => vaapi_probe(&node)?,
-        Cmd::Roundtrip { width, height, frames, qp } => roundtrip(&node, width, height, frames, qp)?,
+        Cmd::Roundtrip { width, height, frames, bitrate } => roundtrip(&node, width, height, frames, bitrate)?,
         Cmd::Capture { output, png, cursor } => capture(&target, &node, output, &png, cursor)?,
         Cmd::Input { output, text, click } => input(&target, output, &text, click)?,
         Cmd::All => {
@@ -97,7 +98,7 @@ fn main() -> Result<()> {
             outputs(&target)?;
             permissions(&target)?;
             vaapi_probe(&node)?;
-            roundtrip(&node, 640, 360, 10, 20)?;
+            roundtrip(&node, 640, 360, 10, None)?;
         }
     }
     Ok(())
@@ -175,16 +176,19 @@ fn vaapi_probe(node: &std::path::Path) -> Result<()> {
 }
 
 fn fill_synthetic(frame: &mut haver_codec::frame::Nv12Frame, w: u32, h: u32, t: usize) -> Result<()> {
+    let shift = t as f64 * 3.0;
     frame.with_planes_mut(|y, uv, py, puv| {
         for row in 0..h as usize {
             for col in 0..w as usize {
-                y[row * py + col] = ((col + row + t * 4) & 0xff) as u8;
+        let base = 16.0 + 200.0 * (col as f64 / w as f64);
+                let wave = 16.0 * ((row as f64 / 24.0 + shift).sin());
+                y[row * py + col] = (base + wave).clamp(16.0, 235.0) as u8;
             }
         }
         for row in 0..(h / 2) as usize {
             for col in 0..(w / 2) as usize {
-                uv[row * puv + col * 2] = ((col * 2 + t) & 0xff) as u8;
-                uv[row * puv + col * 2 + 1] = ((row * 2) & 0xff) as u8;
+                uv[row * puv + col * 2] = 128;
+                uv[row * puv + col * 2 + 1] = 128;
             }
         }
     })?;
@@ -200,9 +204,10 @@ fn psnr(a: &[u8], b: &[u8]) -> f64 {
     }
 }
 
-fn roundtrip(node: &std::path::Path, width: u32, height: u32, frames: usize, qp: u32) -> Result<()> {
+fn roundtrip(node: &std::path::Path, width: u32, height: u32, frames: usize, bitrate: Option<u32>) -> Result<()> {
     let display = vaapi::open_display(node)?;
-    let settings = EncoderSettings { width, height, qp, framerate: 60, low_power: false };
+    let bitrate = bitrate.unwrap_or_else(|| EncoderSettings::default_bitrate(width, height, 60));
+    let settings = EncoderSettings { width, height, bitrate, framerate: 60, low_power: false };
     let (cw, ch) = (settings.coded_width(), settings.coded_height());
     let alloc = FrameAllocator::open(node)?;
     let pool = FramePool::new(&alloc, cw, ch, 4)?;
@@ -223,8 +228,9 @@ fn roundtrip(node: &std::path::Path, width: u32, height: u32, frames: usize, qp:
             }
         })?;
         let force = i == frames / 2;
+        let (yb, uvb, yp, uvp) = frame.with_planes(|y, uv, py, puv| (y.to_vec(), uv.to_vec(), py, puv))?;
         let t0 = std::time::Instant::now();
-        let packet = encoder.encode(frame, i as u64, force).with_context(|| format!("encode frame {i}"))?;
+        let packet = encoder.encode_planes(&yb, yp, &uvb, uvp, i as u64, force).with_context(|| format!("encode frame {i}"))?;
         let enc_ms = t0.elapsed().as_secs_f64() * 1000.0;
         total_bytes += packet.data.len();
         let t1 = std::time::Instant::now();
@@ -250,8 +256,7 @@ fn roundtrip(node: &std::path::Path, width: u32, height: u32, frames: usize, qp:
                     y_out[row * width as usize..(row + 1) * width as usize].copy_from_slice(&y[row * py..row * py + width as usize]);
                 }
             })?;
-            let p = psnr(&source_y, &y_out);
-            min_psnr = min_psnr.min(p);
+            min_psnr = min_psnr.min(psnr(&source_y, &y_out));
             if d.timestamp != i as u64 {
                 println!("  WARN decoded timestamp {} for input {i}: decoder is not zero-latency", d.timestamp);
             }

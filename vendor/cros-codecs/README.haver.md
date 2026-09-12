@@ -11,3 +11,11 @@ Vendored copy of cros-codecs 0.0.6 (crates.io) with low-latency patches:
 4. `decoder/stateless/h264.rs`: an access-unit delimiter NAL finishes the
    picture in progress, so the decoder does not hold the last frame until the
    next one arrives.
+5. `backend/vaapi/decoder.rs`: the placeholder VA context is 320x240 instead
+   of 16x16, which radeonsi rejects (RESOLUTION_NOT_SUPPORTED).
+6. `encoder/stateless/predictor.rs`: a forced keyframe is now a true IDR
+   (resets the sequence), not just an intra frame. Random access needs it.
+7. `encoder/stateless/h264.rs`: `new_h264` made `pub` so the encoder can be
+   built for a `Surface`/`PooledVaSurface` input handle (image-upload path)
+   instead of only the dmabuf `VideoFrame` path, which AMD/radeonsi will not
+   read as encode input.

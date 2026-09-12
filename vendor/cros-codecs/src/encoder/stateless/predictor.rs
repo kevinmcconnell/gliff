@@ -111,10 +111,15 @@ where
                 // TODO: Maybe don't clear references on just keyframe (!= IDR)
                 self.references.clear();
 
-                let request = self.request_keyframe(input, meta, self.counter == 0)?;
+                // A forced keyframe is made a true IDR (not just an intra
+                // frame): it resets the sequence, so it is a clean random
+                // access point that a reconnecting or recovering decoder can
+                // resync on. The stock code only made the first frame an IDR.
+                let idr = true;
+                let request = self.request_keyframe(input, meta, idr)?;
 
                 requests.push(request);
-                self.counter = self.counter.wrapping_add(1) % (self.limit as usize);
+                self.counter = if idr { 1 } else { self.counter.wrapping_add(1) % (self.limit as usize) };
             } else if self.references.is_empty() {
                 log::trace!("Awaiting more reconstructed frames");
                 // There is no enough frames reconstructed

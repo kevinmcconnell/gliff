@@ -380,8 +380,10 @@ impl State {
         let Some(idx) = self.ring.iter().position(|s| !s.busy) else { return };
         let frame = session.create_frame(&self.qh, Kind::Screen);
         frame.attach_buffer(&self.ring[idx].wl_buffer);
-        frame.damage_buffer(0, 0, i32::MAX, i32::MAX);
+        let (w, h) = (self.ring[idx].buffer.info.width as i32, self.ring[idx].buffer.info.height as i32);
+        frame.damage_buffer(0, 0, w, h);
         frame.capture();
+        tracing::debug!(slot = idx, "capture requested");
         self.pending_damage.clear();
         self.pending_presentation = 0;
         self.in_flight = Some((frame, idx));
@@ -389,6 +391,7 @@ impl State {
     }
 
     fn on_session_event(&mut self, kind: Kind, event: session_proto::Event) {
+        tracing::debug!(?kind, ?event, "session event");
         let c = match kind {
             Kind::Screen => &mut self.constraints,
             Kind::Cursor => &mut self.cursor_constraints,
@@ -398,10 +401,8 @@ impl State {
                 c.width = width;
                 c.height = height;
             }
-            session_proto::Event::ShmFormat { format } => {
-                if let wayland_client::WEnum::Value(f) = format {
-                    c.shm_formats.push(f as u32);
-                }
+            session_proto::Event::ShmFormat { format: wayland_client::WEnum::Value(f) } => {
+                c.shm_formats.push(f as u32);
             }
             session_proto::Event::DmabufDevice { .. } => {}
             session_proto::Event::DmabufFormat { format, modifiers } => {
@@ -439,17 +440,16 @@ impl State {
                     }
                 }
             }
-            session_proto::Event::Stopped => {
-                if kind == Kind::Screen {
-                    self.stopped = true;
-                    self.emit(CaptureEvent::Stopped);
-                }
+            session_proto::Event::Stopped if kind == Kind::Screen => {
+                self.stopped = true;
+                self.emit(CaptureEvent::Stopped);
             }
             _ => {}
         }
     }
 
     fn on_frame_event(&mut self, kind: Kind, frame: &ExtImageCopyCaptureFrameV1, event: frame_proto::Event) {
+        tracing::debug!(?kind, ?event, in_flight = self.in_flight.as_ref().map(|(f, _)| f == frame), "frame event");
         match kind {
             Kind::Screen => self.on_screen_frame_event(frame, event),
             Kind::Cursor => self.on_cursor_frame_event(frame, event),
@@ -543,7 +543,7 @@ impl State {
         let (Some(session), Some(buf)) = (self.cursor_capture.clone(), self.cursor_buf.as_ref()) else { return };
         let frame = session.create_frame(&self.qh, Kind::Cursor);
         frame.attach_buffer(&buf.buffer);
-        frame.damage_buffer(0, 0, i32::MAX, i32::MAX);
+        frame.damage_buffer(0, 0, buf.width as i32, buf.height as i32);
         frame.capture();
         self.cursor_frame = Some(frame);
     }

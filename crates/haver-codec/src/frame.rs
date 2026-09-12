@@ -11,6 +11,7 @@ use cros_codecs::libva::{Display, Surface};
 use cros_codecs::video_frame::generic_dma_video_frame::GenericDmaVideoFrame;
 use cros_codecs::video_frame::{ReadMapping, VideoFrame, WriteMapping};
 use cros_codecs::{FrameLayout, Fourcc, PlaneLayout, Resolution};
+use drm_fourcc::DrmModifier;
 use gbm::{BufferObjectFlags, Device, Format};
 
 use crate::{Error, Result};
@@ -52,7 +53,7 @@ pub struct Nv12Frame {
     id: u64,
     inner: Option<GenericDmaVideoFrame>,
     info: Arc<DmabufInfo>,
-    pool: Weak<Mutex<Vec<(GenericDmaVideoFrame, Arc<DmabufInfo>, u64)>>>,
+    pool: Weak<Mutex<Vec<PoolEntry>>>,
 }
 
 impl Nv12Frame {
@@ -170,23 +171,23 @@ impl FrameAllocator {
         Ok(Self { device })
     }
 
+    /// Allocate an NV12 image as one linear R8 buffer of `height * 3 / 2`
+    /// rows: the UV plane starts at `stride * height`. Mesa's GBM refuses
+    /// multi-planar formats on some drivers (radeonsi), and every importer we
+    /// use (VA-API DRM PRIME 2, EGL per-plane) takes explicit offsets anyway.
     fn allocate(&self, width: u32, height: u32) -> Result<(GenericDmaVideoFrame, Arc<DmabufInfo>)> {
+        let rows = height + height / 2;
         let bo = self
             .device
-            .create_buffer_object::<()>(width, height, Format::Nv12, BufferObjectFlags::LINEAR)
-            .map_err(|e| Error::Gbm(format!("create NV12 {width}x{height}: {e}")))?;
-        let plane_count = bo.plane_count().map_err(|e| Error::Gbm(e.to_string()))?;
-        if plane_count != 2 {
-            return Err(Error::Gbm(format!("NV12 buffer has {plane_count} planes, expected 2")));
-        }
+            .create_buffer_object::<()>(width, rows, Format::R8, BufferObjectFlags::LINEAR)
+            .map_err(|e| Error::Gbm(format!("create R8 {width}x{rows}: {e}")))?;
+        let stride = bo.stride().map_err(|e| Error::Gbm(e.to_string()))?;
         let modifier: u64 = bo.modifier().map_err(|e| Error::Gbm(e.to_string()))?.into();
-        let mut planes = Vec::with_capacity(2);
-        for i in 0..2 {
-            planes.push(Plane {
-                offset: bo.offset(i).map_err(|e| Error::Gbm(e.to_string()))?,
-                stride: bo.stride_for_plane(i).map_err(|e| Error::Gbm(e.to_string()))?,
-            });
-        }
+        let modifier = match DrmModifier::from(modifier) {
+            DrmModifier::Linear | DrmModifier::Invalid => 0,
+            other => return Err(Error::Gbm(format!("expected a linear buffer, got modifier {other:?}"))),
+        };
+        let planes = vec![Plane { offset: 0, stride }, Plane { offset: stride * height, stride }];
         let fd = bo.fd().map_err(|e| Error::Gbm(e.to_string()))?;
         let info = Arc::new(DmabufInfo {
             fd,
@@ -211,7 +212,8 @@ impl FrameAllocator {
     }
 }
 
-type FreeList = Arc<Mutex<Vec<(GenericDmaVideoFrame, Arc<DmabufInfo>, u64)>>>;
+type PoolEntry = (GenericDmaVideoFrame, Arc<DmabufInfo>, u64);
+type FreeList = Arc<Mutex<Vec<PoolEntry>>>;
 
 /// Fixed-size pool of NV12 frames of one resolution. Frames return on drop.
 pub struct FramePool {
