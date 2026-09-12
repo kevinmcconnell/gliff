@@ -3,6 +3,7 @@
 //!
 //! Runs on its own thread; the owner sends [`InputCmd`]s through [`Input`].
 
+mod clipboard;
 mod keymap;
 mod thread;
 
@@ -10,6 +11,7 @@ use std::sync::mpsc;
 
 use calloop::channel::Sender;
 
+pub use clipboard::{Clipboard, ClipboardEvent, ClipboardSink};
 pub use hypr_wl::{OutputInfo, Target};
 pub use keymap::{keymap_from_names, KeymapNames};
 

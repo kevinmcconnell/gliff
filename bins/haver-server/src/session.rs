@@ -93,6 +93,22 @@ where
     let input = start_input(&cfg.target, &output_name, &keymap)?;
     input.send(InputCmd::SetExtent { width, height }).ok();
 
+    // 5b. Clipboard bridge (text). Compositor selection -> client, and back.
+    let (clip_out_tx, mut clip_out_rx) = mpsc::unbounded_channel::<String>();
+    let clipboard = match hypr_input::Clipboard::start(
+        cfg.target.clone(),
+        Box::new(move |ev| {
+            let hypr_input::ClipboardEvent::Text(t) = ev;
+            let _ = clip_out_tx.send(t);
+        }),
+    ) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            tracing::warn!(error = %e, "clipboard bridge unavailable");
+            None
+        }
+    };
+
     // 6. Encoder.
     let display = haver_codec::vaapi::open_display(&render_node).context("open VA display")?;
     let mut settings = encoder_settings(width, height, cfg.bitrate);
@@ -113,12 +129,18 @@ where
     // starve frame capture, and a blocked write can never block reads. The task
     // drains the socket into `msg_rx`; clipboard payloads are consumed inline.
     let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<ClientMsg>();
+    let (clip_in_tx, mut clip_in_rx) = mpsc::unbounded_channel::<String>();
     tokio::task::spawn_local(async move {
         loop {
             match reader.read_msg::<ClientMsg>().await {
                 Ok(ClientMsg::ClipboardData { data_len, .. }) => {
-                    if reader.read_payload(data_len).await.is_err() {
-                        break;
+                    match reader.read_payload(data_len).await {
+                        Ok(bytes) => {
+                            if let Ok(text) = String::from_utf8(bytes.to_vec()) {
+                                let _ = clip_in_tx.send(text);
+                            }
+                        }
+                        Err(_) => break,
                     }
                 }
                 Ok(m) => {
@@ -172,6 +194,21 @@ where
                     ClientMsg::Ping { t } => { writer.write_msg(&ServerMsg::Pong { t, server_now_ms: now_ms() }).await?; }
                     ClientMsg::ClipboardData { .. } | ClientMsg::ClipboardOffer { .. } | ClientMsg::ClipboardRequest { .. } => { /* clipboard: not yet wired */ }
                     ClientMsg::Hello { .. } => anyhow::bail!("unexpected second Hello"),
+                }
+            }
+            text = clip_out_rx.recv() => {
+                if let Some(text) = text {
+                    let bytes = text.into_bytes();
+                    let total = bytes.len() as u64;
+                    writer.write_msg_with_payloads(
+                        &ServerMsg::ClipboardData { mime_type: "text/plain;charset=utf-8".into(), offset: 0, total, data_len: bytes.len() as u32 },
+                        &[&bytes],
+                    ).await?;
+                }
+            }
+            text = clip_in_rx.recv() => {
+                if let (Some(text), Some(clip)) = (text, clipboard.as_ref()) {
+                    clip.set_text(text);
                 }
             }
             ev = cap_rx.recv() => {

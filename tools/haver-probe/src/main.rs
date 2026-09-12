@@ -90,6 +90,15 @@ enum Cmd {
         #[arg(long, default_value_t = 30)]
         frames: usize,
     },
+    /// Watch or set the compositor's text clipboard (ext-data-control)
+    Clipboard {
+        /// Set the selection to this text and hold it, instead of watching.
+        #[arg(long)]
+        set: Option<String>,
+        /// Seconds to run.
+        #[arg(long, default_value_t = 3)]
+        secs: u64,
+    },
     /// Run every non-interactive check
     All,
 }
@@ -109,6 +118,7 @@ fn main() -> Result<()> {
         Cmd::Input { output, text, click } => input(&target, output, &text, click)?,
         Cmd::Pipeline { output } => pipeline(&target, &node, output)?,
         Cmd::ServeTest { connect, frames } => serve_test(&node, &connect, frames)?,
+        Cmd::Clipboard { set, secs } => clipboard(&target, set, secs)?,
         Cmd::All => {
             protocols(&target)?;
             outputs(&target)?;
@@ -543,6 +553,12 @@ fn serve_test(_node: &std::path::Path, addr: &str, frames: usize) -> Result<()> 
                     if got == 1 { eprintln!("  first decoded frame ok ({}x{}, main {} aux {} bytes, key {keyframe})", w, h, data_len, aux_len); }
                     writer.write_msg(&ClientMsg::FrameAck { frame_id, decoded_at_ms: 0 }).await?;
                     if got == 3 { writer.write_msg(&ClientMsg::Resize { width: 800, height: 600, scale: 1.0 }).await?; }
+                    if got == 4 {
+                        if let Ok(text) = std::env::var("HAVER_SEND_CLIP") {
+                            let bytes = text.into_bytes();
+                            writer.write_msg_with_payloads(&ClientMsg::ClipboardData { mime_type: "text/plain;charset=utf-8".into(), offset: 0, total: bytes.len() as u64, data_len: bytes.len() as u32 }, &[&bytes]).await?;
+                        }
+                    }
                 }
                 ServerMsg::StreamConfig { width, height, chroma: c, .. } => {
                     w = width as usize; h = height as usize; chroma = c;
@@ -550,8 +566,11 @@ fn serve_test(_node: &std::path::Path, addr: &str, frames: usize) -> Result<()> 
                     decoder = TestDecoder::new(chroma, w, h)?;
                 }
                 ServerMsg::CursorShape { argb_len, .. } => { let _ = reader.read_payload(argb_len).await?; }
+                ServerMsg::ClipboardData { data_len, .. } => {
+                    let bytes = reader.read_payload(data_len).await?;
+                    if let Ok(t) = String::from_utf8(bytes.to_vec()) { eprintln!("CLIP-RECV: {t}"); }
+                }
                 ServerMsg::CursorPos { .. } | ServerMsg::Pong { .. } | ServerMsg::Error { .. } => {}
-                ServerMsg::ClipboardData { data_len, .. } => { let _ = reader.read_payload(data_len).await?; }
                 _ => {}
             }
         }
@@ -561,5 +580,31 @@ fn serve_test(_node: &std::path::Path, addr: &str, frames: usize) -> Result<()> 
         status(got >= frames && keyframes >= 1, &format!("decoded {got} frames from the server ({keyframes} keyframes, resize honoured)"));
         Ok::<(), anyhow::Error>(())
     })?;
+    Ok(())
+}
+
+fn clipboard(target: &Target, set: Option<String>, secs: u64) -> Result<()> {
+    use hypr_input::{Clipboard, ClipboardEvent};
+    use std::sync::mpsc;
+    let (tx, rx) = mpsc::channel();
+    let clip = Clipboard::start(target.clone(), Box::new(move |ev| { let _ = tx.send(ev); }))?;
+    if let Some(text) = set {
+        clip.set_text(text.clone());
+        println!("  set selection to {text:?}; holding {secs}s");
+        std::thread::sleep(std::time::Duration::from_secs(secs));
+        status(true, "clipboard set");
+    } else {
+        println!("  watching selection for {secs}s");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        let mut got = false;
+        while std::time::Instant::now() < deadline {
+            if let Ok(ClipboardEvent::Text(t)) = rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                println!("  selection: {t:?}");
+                got = true;
+            }
+        }
+        status(got, "observed a clipboard selection");
+    }
+    drop(clip);
     Ok(())
 }

@@ -82,4 +82,3 @@ knowing before wider testing:
   on its own, but differs from the usual layout.
 - **ssh environment.** The `--stdio` path is built but not yet tested from a cold
   machine; the ssh session must expose `WAYLAND_DISPLAY` and `XDG_RUNTIME_DIR`.
-- **No keymap upload, no clipboard, no client-side cursor drawing yet.**

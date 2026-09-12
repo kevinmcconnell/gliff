@@ -81,4 +81,21 @@ run_server_test 9040 "Dual420 stream"
 echo "== 4. server + client, Single420 (--low-bandwidth) =="
 run_server_test 9041 "Single420 stream" --low-bandwidth
 
+echo "== 5. clipboard both directions =="
+command -v wl-copy >/dev/null && command -v wl-paste >/dev/null || fail "wl-clipboard not installed"
+wl-copy "e2e-clip-in" 2>/dev/null
+"$SERVER" --listen 127.0.0.1:9042 --headless --instance "$NEST_SIG" >/tmp/haver-e2e-server.log 2>&1 &
+csp=$!; PIDS+=("$csp"); sleep 2
+damage & cdp=$!; PIDS+=("$cdp")
+clipf=$(mktemp)
+HAVER_SEND_CLIP="e2e-clip-out" timeout 20 $PROBE serve-test --connect 127.0.0.1:9042 --frames 200 >"$clipf" 2>&1 &
+clipc=$!; PIDS+=("$clipc")
+sleep 5
+pasted=$(wl-paste -n 2>/dev/null)
+kill "$clipc" "$cdp" "$csp" 2>/dev/null
+grep -q "CLIP-RECV: e2e-clip-in" "$clipf" || fail "compositor->client clipboard (got: $(grep CLIP-RECV "$clipf"))"
+[ "$pasted" = "e2e-clip-out" ] || fail "client->compositor clipboard (got: $pasted)"
+rm -f "$clipf"
+echo "   clipboard both directions PASS"
+
 echo "E2E PASS: all checks passed"

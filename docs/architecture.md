@@ -92,6 +92,11 @@ patches to them are documented in their `README.haver.md`.
   the local compositor draws it at the real pointer with no added latency; it is
   never baked into the video.
 
+- **Clipboard (text).** The server bridges the compositor's text selection with
+  `ext-data-control-v1` on its own thread; the client bridges `gdk::Clipboard`.
+  A loop guard on each side stops a value it just set from bouncing back. Images
+  and large non-text types are not carried.
+
 ## Testing
 
 - **Unit tests** cover the pure logic: AVC444 split/recombine losslessness,
@@ -110,25 +115,23 @@ patches to them are documented in their `README.haver.md`.
 
 Built and validated on AMD: capture, input, H.264 encode/decode, Dual420 and
 Single420, the server loop, the GTK client, keymap upload, remote cursor,
-shortcut inhibit, and reconnect.
+shortcut inhibit, reconnect, and the text clipboard bridge (both directions,
+tested against wl-clipboard).
 
 Not yet built, roughly in priority order:
 
-1. **Clipboard bridge** (`ext-data-control` on the server, `gdk::Clipboard` on
-   the client). Useful and on the roadmap; deferred because it is a sizeable
-   bidirectional subsystem with limited automated testability.
-2. **`GlSplitter` / GL client recombine.** Zero-copy chroma split on the server
+1. **`GlSplitter` / GL client recombine.** Zero-copy chroma split on the server
    and a recombine shader on the client, replacing the CPU colour passes. This
    is the main throughput optimisation. It requires `unsafe` GL/EGL (a C API),
    so it is deferred per the project's no-unsafe preference and needs a display
    to validate.
-3. **Native single-stream 4:4:4, and AV1/HEVC.** Probe-gated; this GPU exposes
+2. **Native single-stream 4:4:4, and AV1/HEVC.** Probe-gated; this GPU exposes
    no such VA-API encode entrypoint, so they cannot be validated here. Needs an
    Intel or newer GPU.
-4. **Verified ssh path** from a cold machine, including the `WAYLAND_DISPLAY` /
+3. **Verified ssh path** from a cold machine, including the `WAYLAND_DISPLAY` /
    `XDG_RUNTIME_DIR` environment setup, and a systemd user unit if wanted.
-5. **Polish**: multi-output selection UI, a configurable escape key for shortcut
-   inhibit, and `tc netem` tuning of the adaptive ack window.
+4. **Polish**: multi-output selection UI, a configurable escape key for shortcut
+   inhibit, image clipboard, and `tc netem` tuning of the adaptive ack window.
 
 See `docs/hardware-quirks.md` for driver-specific behaviour and the low-severity
 items surfaced by code review.

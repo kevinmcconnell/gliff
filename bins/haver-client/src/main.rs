@@ -23,6 +23,9 @@ use libadwaita as adw;
 use net::{DecodedFrame, Endpoint, Status, Worker};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
+/// A message plus optional trailing payload, sent from the UI to the worker.
+type OutSender = UnboundedSender<(ClientMsg, Vec<u8>)>;
+
 #[derive(Parser)]
 #[command(name = "haver-client", about = "Remote-desktop a Hyprland session over ssh")]
 struct Cli {
@@ -45,7 +48,9 @@ struct App {
     stats: gtk::Label,
     status: gtk::Label,
     stream_size: Rc<RefCell<(u32, u32)>>,
-    input_tx: Rc<RefCell<Option<UnboundedSender<ClientMsg>>>>,
+    input_tx: Rc<RefCell<Option<OutSender>>>,
+    /// Last text we set on the local clipboard from the remote, to avoid echo.
+    last_remote_clip: Rc<RefCell<Option<String>>>,
     /// The last endpoint, kept so a dropped connection can be retried.
     endpoint: Rc<RefCell<Option<Endpoint>>>,
     /// Consecutive failed connection attempts, reset on a successful connect.
@@ -98,6 +103,7 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         input_tx: Rc::new(RefCell::new(None)),
         endpoint: Rc::new(RefCell::new(None)),
         retries: Rc::new(RefCell::new(0)),
+        last_remote_clip: Rc::new(RefCell::new(None)),
     });
 
     install_input_handlers(&ui, &picture, &window);
@@ -148,6 +154,34 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         gtk::style_context_add_provider_for_display(&display, &css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
     }
 
+    // Watch the local clipboard: when it changes to text we did not just
+    // receive from the remote, forward it to the server.
+    if let Some(display) = gdk::Display::default() {
+        let clipboard = display.clipboard();
+        let ui = ui.clone();
+        clipboard.connect_changed(move |cb| {
+            let ui = ui.clone();
+            cb.read_text_async(gtk::gio::Cancellable::NONE, move |res| {
+                if let Ok(Some(text)) = res {
+                    let text = text.to_string();
+                    if ui.last_remote_clip.borrow().as_deref() == Some(text.as_str()) {
+                        return;
+                    }
+                    if text.len() as u64 > haver_proto::CLIPBOARD_MAX {
+                        return;
+                    }
+                    let bytes = text.into_bytes();
+                    let total = bytes.len() as u64;
+                    send_payload(
+                        &ui,
+                        ClientMsg::ClipboardData { mime_type: "text/plain;charset=utf-8".into(), offset: 0, total, data_len: bytes.len() as u32 },
+                        bytes,
+                    );
+                }
+            });
+        });
+    }
+
     window.present();
 
     // Auto-connect when an endpoint was given on the command line.
@@ -159,7 +193,7 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
 fn start_session(ui: Rc<App>, endpoint: Endpoint) {
     let (frame_tx, frame_rx) = sync_channel::<DecodedFrame>(2);
     let (status_tx, status_rx) = channel::<Status>();
-    let (input_tx, input_rx) = unbounded_channel::<ClientMsg>();
+    let (input_tx, input_rx) = unbounded_channel::<(ClientMsg, Vec<u8>)>();
     *ui.input_tx.borrow_mut() = Some(input_tx);
     *ui.endpoint.borrow_mut() = Some(endpoint.clone());
     ui.status.set_text("Connecting…");
@@ -222,6 +256,12 @@ fn poll_status(ui: Rc<App>, rx: Receiver<Status>) {
                     ui.stats.set_text(&format!("{fps:.0} fps  {mbit:.1} Mbit/s  decode {decode_ms:.1} ms"));
                 }
                 Status::Cursor { width, height, hot_x, hot_y, argb } => set_remote_cursor(&ui, width, height, hot_x, hot_y, &argb),
+                Status::Clipboard(text) => {
+                    *ui.last_remote_clip.borrow_mut() = Some(text.clone());
+                    if let Some(display) = gdk::Display::default() {
+                        display.clipboard().set_text(&text);
+                    }
+                }
                 Status::Error(e) => {
                     ui.status.set_text(&format!("Error: {e}"));
                     schedule_reconnect(ui.clone());
@@ -275,7 +315,14 @@ fn to_remote(ui: &App, x: f64, y: f64) -> (f64, f64) {
 
 fn send(ui: &App, msg: ClientMsg) {
     if let Some(tx) = ui.input_tx.borrow().as_ref() {
-        let _ = tx.send(msg);
+        let _ = tx.send((msg, Vec::new()));
+    }
+}
+
+/// Send a message with a trailing payload (used for clipboard text).
+fn send_payload(ui: &App, msg: ClientMsg, payload: Vec<u8>) {
+    if let Some(tx) = ui.input_tx.borrow().as_ref() {
+        let _ = tx.send((msg, payload));
     }
 }
 

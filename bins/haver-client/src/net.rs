@@ -54,6 +54,8 @@ pub enum Status {
     Stats { fps: f32, mbit: f32, decode_ms: f32 },
     /// The remote cursor image, for the client to set as its widget cursor.
     Cursor { width: u32, height: u32, hot_x: i32, hot_y: i32, argb: Vec<u8> },
+    /// The remote text selection, for the client to put on its local clipboard.
+    Clipboard(String),
     Error(String),
     Closed,
 }
@@ -71,7 +73,7 @@ pub struct Worker {
     /// without limit; when full, the newest frame is dropped (latest-wins).
     pub frames: SyncSender<DecodedFrame>,
     pub status: StdSender<Status>,
-    pub input: UnboundedReceiver<ClientMsg>,
+    pub input: UnboundedReceiver<(ClientMsg, Vec<u8>)>,
 }
 
 impl Worker {
@@ -113,7 +115,7 @@ async fn session<R, W>(
     wr: W,
     frames: SyncSender<DecodedFrame>,
     status: StdSender<Status>,
-    mut input: UnboundedReceiver<ClientMsg>,
+    mut input: UnboundedReceiver<(ClientMsg, Vec<u8>)>,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin + 'static,
@@ -148,10 +150,15 @@ where
     // Writes run on their own task, fed by `out_tx`, so reads (draining video)
     // never block on a write and the two peers cannot deadlock. Both the reader
     // loop (acks, keyframe requests) and the UI thread (input) feed `out_tx`.
-    let (out_tx, mut out_rx) = unbounded_channel::<ClientMsg>();
+    let (out_tx, mut out_rx) = unbounded_channel::<(ClientMsg, Vec<u8>)>();
     tokio::task::spawn_local(async move {
-        while let Some(m) = out_rx.recv().await {
-            if writer.write_msg(&m).await.is_err() {
+        while let Some((m, payload)) = out_rx.recv().await {
+            let r = if payload.is_empty() {
+                writer.write_msg(&m).await
+            } else {
+                writer.write_msg_with_payloads(&m, &[&payload]).await
+            };
+            if r.is_err() {
                 break;
             }
         }
@@ -160,8 +167,8 @@ where
     {
         let out_tx = out_tx.clone();
         tokio::task::spawn_local(async move {
-            while let Some(m) = input.recv().await {
-                if out_tx.send(m).is_err() {
+            while let Some(mp) = input.recv().await {
+                if out_tx.send(mp).is_err() {
                     break;
                 }
             }
@@ -188,7 +195,7 @@ where
                 let decoded = decoder.decode(frame_id, &main, &aux);
                 let dec_ms = t0.elapsed().as_secs_f32() * 1000.0;
                 // Ack immediately so the server keeps pacing.
-                let _ = out_tx.send(ClientMsg::FrameAck { frame_id, decoded_at_ms: now_ms() });
+                let _ = out_tx.send((ClientMsg::FrameAck { frame_id, decoded_at_ms: now_ms() }, Vec::new()));
                 match decoded {
                     Ok(Some(yuv)) => {
                         let bgra = yuv444_to_bgra(&yuv);
@@ -204,7 +211,7 @@ where
                     Ok(None) => {}
                     Err(e) => {
                         tracing::warn!(error = %e, "decode error; requesting keyframe");
-                        let _ = out_tx.send(ClientMsg::RequestKeyframe);
+                        let _ = out_tx.send((ClientMsg::RequestKeyframe, Vec::new()));
                     }
                 }
             }
@@ -220,7 +227,10 @@ where
                 let _ = status.send(Status::Cursor { width, height, hot_x, hot_y, argb });
             }
             ServerMsg::ClipboardData { data_len, .. } => {
-                let _ = reader.read_payload(data_len).await?;
+                let bytes = reader.read_payload(data_len).await?;
+                if let Ok(text) = String::from_utf8(bytes.to_vec()) {
+                    let _ = status.send(Status::Clipboard(text));
+                }
             }
             ServerMsg::CursorPos { .. } | ServerMsg::Pong { .. } => {}
             ServerMsg::Error { code, message } => anyhow::bail!("server error {code}: {message}"),
