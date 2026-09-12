@@ -65,6 +65,7 @@ on PATH over ssh, pass `--server-bin /path/to/haver-server`.
 
 ```
 cargo test --workspace     # pure-logic unit tests, no GPU needed
+cargo fmt --all --check    # formatting (rustfmt defaults)
 ./scripts/e2e.sh           # full stack against a nested Hyprland (needs a GPU)
 ```
 

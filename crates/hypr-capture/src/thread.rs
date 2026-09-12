@@ -35,8 +35,8 @@ use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1::ZwpLi
 
 use crate::cursor::ShmBuffer;
 use crate::{
-    CaptureBuffer, CaptureConfig, CaptureEvent, CapturedFrame, DmabufInfo, Error, EventSink, OutputInfo, Plane, Rect,
-    Result,
+    CaptureBuffer, CaptureConfig, CaptureEvent, CapturedFrame, DmabufInfo, Error, EventSink,
+    OutputInfo, Plane, Rect, Result,
 };
 use hypr_wl::{LoopState, Outputs, Seat, Target};
 
@@ -109,7 +109,10 @@ struct State {
     quit: bool,
 }
 
-pub fn spawn(cfg: CaptureConfig, sink: EventSink) -> Result<(Sender<Cmd>, std::thread::JoinHandle<()>)> {
+pub fn spawn(
+    cfg: CaptureConfig,
+    sink: EventSink,
+) -> Result<(Sender<Cmd>, std::thread::JoinHandle<()>)> {
     let (tx, rx) = channel::channel::<Cmd>();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<()>>();
     let tx2 = tx.clone();
@@ -139,17 +142,24 @@ fn run(
 ) -> Result<()> {
     let (conn, globals, queue) = hypr_wl::init::<State>(&cfg.target)?;
     let qh = queue.handle();
-    let dmabuf: ZwpLinuxDmabufV1 = globals.bind(&qh, 3..=5, ()).map_err(|_| hypr_wl::Error::MissingGlobal("zwp_linux_dmabuf_v1"))?;
+    let dmabuf: ZwpLinuxDmabufV1 = globals
+        .bind(&qh, 3..=5, ())
+        .map_err(|_| hypr_wl::Error::MissingGlobal("zwp_linux_dmabuf_v1"))?;
     let source_mgr: ExtOutputImageCaptureSourceManagerV1 = globals
         .bind(&qh, 1..=1, ())
         .map_err(|_| hypr_wl::Error::MissingGlobal("ext_output_image_capture_source_manager_v1"))?;
-    let copy_mgr: ExtImageCopyCaptureManagerV1 =
-        globals.bind(&qh, 1..=1, ()).map_err(|_| hypr_wl::Error::MissingGlobal("ext_image_copy_capture_manager_v1"))?;
+    let copy_mgr: ExtImageCopyCaptureManagerV1 = globals
+        .bind(&qh, 1..=1, ())
+        .map_err(|_| hypr_wl::Error::MissingGlobal("ext_image_copy_capture_manager_v1"))?;
     let shm: Option<WlShm> = globals.bind(&qh, 1..=1, ()).ok();
     let outputs = Outputs::bind(&globals, &qh)?;
     let seat = Seat::bind(&globals, &qh)?;
-    let file = File::options().read(true).write(true).open(&cfg.render_node)?;
-    let device = Device::new(file).map_err(|e| Error::Gbm(format!("open {}: {e}", cfg.render_node.display())))?;
+    let file = File::options()
+        .read(true)
+        .write(true)
+        .open(&cfg.render_node)?;
+    let device = Device::new(file)
+        .map_err(|e| Error::Gbm(format!("open {}: {e}", cfg.render_node.display())))?;
 
     let mut state = State {
         sink: Box::new(|_| {}),
@@ -217,7 +227,10 @@ fn run_loop(
     state.output = Some((output.clone(), info));
 
     let source = state.source_mgr.create_source(&output, &qh, ());
-    let session = state.copy_mgr.create_session(&source, manager::Options::empty(), &qh, Kind::Screen);
+    let session =
+        state
+            .copy_mgr
+            .create_session(&source, manager::Options::empty(), &qh, Kind::Screen);
     state.source = Some(source);
     state.session = Some(session);
 
@@ -233,16 +246,33 @@ pub fn list_outputs(target: &Target) -> Result<Vec<OutputInfo>> {
         outputs: Outputs,
     }
     impl Dispatch<WlRegistry, GlobalListContents> for S {
-        fn event(_: &mut Self, _: &WlRegistry, _: wayland_client::protocol::wl_registry::Event, _: &GlobalListContents, _: &Connection, _: &QueueHandle<Self>) {}
+        fn event(
+            _: &mut Self,
+            _: &WlRegistry,
+            _: wayland_client::protocol::wl_registry::Event,
+            _: &GlobalListContents,
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+        }
     }
     impl Dispatch<WlOutput, ()> for S {
-        fn event(s: &mut Self, o: &WlOutput, e: wl_output::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        fn event(
+            s: &mut Self,
+            o: &WlOutput,
+            e: wl_output::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
             s.outputs.handle(o, e);
         }
     }
     let (_conn, globals, mut queue) = hypr_wl::init::<S>(target)?;
     let qh = queue.handle();
-    let mut s = S { outputs: Outputs::bind(&globals, &qh)? };
+    let mut s = S {
+        outputs: Outputs::bind(&globals, &qh)?,
+    };
     queue.roundtrip(&mut s)?;
     queue.roundtrip(&mut s)?;
     Ok(s.outputs.infos())
@@ -313,9 +343,19 @@ impl State {
     }
 
     fn choose_format(&self) -> Option<(u32, Vec<u64>)> {
-        const PREFERRED: [DrmFourcc; 4] = [DrmFourcc::Xrgb8888, DrmFourcc::Argb8888, DrmFourcc::Xbgr8888, DrmFourcc::Abgr8888];
+        const PREFERRED: [DrmFourcc; 4] = [
+            DrmFourcc::Xrgb8888,
+            DrmFourcc::Argb8888,
+            DrmFourcc::Xbgr8888,
+            DrmFourcc::Abgr8888,
+        ];
         for want in PREFERRED {
-            if let Some((f, mods)) = self.constraints.formats.iter().find(|(f, _)| *f == want as u32) {
+            if let Some((f, mods)) = self
+                .constraints
+                .formats
+                .iter()
+                .find(|(f, _)| *f == want as u32)
+            {
                 let linear = u64::from(DrmModifier::Linear);
                 let mut mods = mods.clone();
                 if self.cfg.prefer_linear && mods.contains(&linear) {
@@ -333,7 +373,10 @@ impl State {
     fn allocate_ring(&mut self) -> Result<()> {
         self.ring_generation += 1;
         let (fourcc, modifiers) = self.choose_format().ok_or_else(|| {
-            Error::Capture(format!("no usable dmabuf format offered (got {:x?})", self.constraints.formats))
+            Error::Capture(format!(
+                "no usable dmabuf format offered (got {:x?})",
+                self.constraints.formats
+            ))
         })?;
         let (w, h) = (self.constraints.width, self.constraints.height);
         for slot in self.ring.drain(..) {
@@ -342,7 +385,10 @@ impl State {
         let format = DrmFourcc::try_from(fourcc).map_err(|e| Error::Gbm(e.to_string()))?;
         let mut chosen_modifier = None;
         for index in 0..self.cfg.buffers {
-            let device = self.device.lock().map_err(|_| Error::Gbm("device mutex poisoned".into()))?;
+            let device = self
+                .device
+                .lock()
+                .map_err(|_| Error::Gbm("device mutex poisoned".into()))?;
             let bo = device
                 .create_buffer_object_with_modifiers2::<()>(
                     w,
@@ -351,7 +397,14 @@ impl State {
                     modifiers.iter().map(|m| DrmModifier::from(*m)),
                     BufferObjectFlags::RENDERING,
                 )
-                .or_else(|_| device.create_buffer_object::<()>(w, h, format, BufferObjectFlags::RENDERING | BufferObjectFlags::LINEAR))
+                .or_else(|_| {
+                    device.create_buffer_object::<()>(
+                        w,
+                        h,
+                        format,
+                        BufferObjectFlags::RENDERING | BufferObjectFlags::LINEAR,
+                    )
+                })
                 .map_err(|e| Error::Gbm(format!("allocate {w}x{h} {format:?}: {e}")))?;
             drop(device);
             let modifier: u64 = bo.modifier().map_err(|e| Error::Gbm(e.to_string()))?.into();
@@ -360,31 +413,75 @@ impl State {
             for p in 0..plane_count as i32 {
                 planes.push(Plane {
                     offset: bo.offset(p).map_err(|e| Error::Gbm(e.to_string()))?,
-                    stride: bo.stride_for_plane(p).map_err(|e| Error::Gbm(e.to_string()))?,
+                    stride: bo
+                        .stride_for_plane(p)
+                        .map_err(|e| Error::Gbm(e.to_string()))?,
                 });
             }
             let fd = bo.fd().map_err(|e| Error::Gbm(e.to_string()))?;
             let params = self.dmabuf.create_params(&self.qh, ());
             for (i, p) in planes.iter().enumerate() {
-                params.add(fd.as_fd(), i as u32, p.offset, p.stride, (modifier >> 32) as u32, (modifier & 0xffff_ffff) as u32);
+                params.add(
+                    fd.as_fd(),
+                    i as u32,
+                    p.offset,
+                    p.stride,
+                    (modifier >> 32) as u32,
+                    (modifier & 0xffff_ffff) as u32,
+                );
             }
-            let wl_buffer = params.create_immed(w as i32, h as i32, fourcc, zwp_linux_buffer_params_v1::Flags::empty(), &self.qh, ());
+            let wl_buffer = params.create_immed(
+                w as i32,
+                h as i32,
+                fourcc,
+                zwp_linux_buffer_params_v1::Flags::empty(),
+                &self.qh,
+                (),
+            );
             params.destroy();
             chosen_modifier = Some(modifier);
             let buffer = Arc::new(CaptureBuffer {
                 index,
                 generation: self.ring_generation,
-                info: DmabufInfo { fd, width: w, height: h, fourcc, modifier, planes },
+                info: DmabufInfo {
+                    fd,
+                    width: w,
+                    height: h,
+                    fourcc,
+                    modifier,
+                    planes,
+                },
                 bo: Mutex::new(bo),
                 device: Arc::clone(&self.device),
             });
-            self.ring.push(RingSlot { buffer, wl_buffer, busy: false });
+            self.ring.push(RingSlot {
+                buffer,
+                wl_buffer,
+                busy: false,
+            });
         }
         let modifier = chosen_modifier.unwrap_or(0);
         self.ring_format = Some((fourcc, modifier));
-        tracing::info!(w, h, fourcc = format!("{:?}", format), modifier = format!("{modifier:#x}"), buffers = self.cfg.buffers, "capture ring allocated");
-        let output = self.output.as_ref().map(|(_, i)| i.clone()).unwrap_or_default();
-        self.emit(CaptureEvent::Ready { output, width: w, height: h, fourcc, modifier });
+        tracing::info!(
+            w,
+            h,
+            fourcc = format!("{:?}", format),
+            modifier = format!("{modifier:#x}"),
+            buffers = self.cfg.buffers,
+            "capture ring allocated"
+        );
+        let output = self
+            .output
+            .as_ref()
+            .map(|(_, i)| i.clone())
+            .unwrap_or_default();
+        self.emit(CaptureEvent::Ready {
+            output,
+            width: w,
+            height: h,
+            fourcc,
+            modifier,
+        });
         Ok(())
     }
 
@@ -392,11 +489,18 @@ impl State {
         if !self.want_frame || self.in_flight.is_some() || self.stopped || self.ring.is_empty() {
             return;
         }
-        let Some(session) = self.session.clone() else { return };
-        let Some(idx) = self.ring.iter().position(|s| !s.busy) else { return };
+        let Some(session) = self.session.clone() else {
+            return;
+        };
+        let Some(idx) = self.ring.iter().position(|s| !s.busy) else {
+            return;
+        };
         let frame = session.create_frame(&self.qh, Kind::Screen);
         frame.attach_buffer(&self.ring[idx].wl_buffer);
-        let (w, h) = (self.ring[idx].buffer.info.width as i32, self.ring[idx].buffer.info.height as i32);
+        let (w, h) = (
+            self.ring[idx].buffer.info.width as i32,
+            self.ring[idx].buffer.info.height as i32,
+        );
         frame.damage_buffer(0, 0, w, h);
         frame.capture();
         tracing::debug!(slot = idx, "capture requested");
@@ -417,12 +521,17 @@ impl State {
                 c.width = width;
                 c.height = height;
             }
-            session_proto::Event::ShmFormat { format: wayland_client::WEnum::Value(f) } => {
+            session_proto::Event::ShmFormat {
+                format: wayland_client::WEnum::Value(f),
+            } => {
                 c.shm_formats.push(f as u32);
             }
             session_proto::Event::DmabufDevice { .. } => {}
             session_proto::Event::DmabufFormat { format, modifiers } => {
-                let mods = modifiers.chunks_exact(8).map(|b| u64::from_ne_bytes(b.try_into().unwrap_or([0; 8]))).collect();
+                let mods = modifiers
+                    .chunks_exact(8)
+                    .map(|b| u64::from_ne_bytes(b.try_into().unwrap_or([0; 8])))
+                    .collect();
                 c.formats.push((format, mods));
             }
             session_proto::Event::Done => {
@@ -432,7 +541,10 @@ impl State {
                         let size_changed = self
                             .ring
                             .first()
-                            .map(|s| s.buffer.info.width != self.constraints.width || s.buffer.info.height != self.constraints.height)
+                            .map(|s| {
+                                s.buffer.info.width != self.constraints.width
+                                    || s.buffer.info.height != self.constraints.height
+                            })
                             .unwrap_or(true);
                         if size_changed {
                             if let Some((frame, _)) = self.in_flight.take() {
@@ -464,23 +576,53 @@ impl State {
         }
     }
 
-    fn on_frame_event(&mut self, kind: Kind, frame: &ExtImageCopyCaptureFrameV1, event: frame_proto::Event) {
-        tracing::debug!(?kind, ?event, in_flight = self.in_flight.as_ref().map(|(f, _)| f == frame), "frame event");
+    fn on_frame_event(
+        &mut self,
+        kind: Kind,
+        frame: &ExtImageCopyCaptureFrameV1,
+        event: frame_proto::Event,
+    ) {
+        tracing::debug!(
+            ?kind,
+            ?event,
+            in_flight = self.in_flight.as_ref().map(|(f, _)| f == frame),
+            "frame event"
+        );
         match kind {
             Kind::Screen => self.on_screen_frame_event(frame, event),
             Kind::Cursor => self.on_cursor_frame_event(frame, event),
         }
     }
 
-    fn on_screen_frame_event(&mut self, frame: &ExtImageCopyCaptureFrameV1, event: frame_proto::Event) {
-        let Some((cur, idx)) = self.in_flight.as_ref() else { return };
+    fn on_screen_frame_event(
+        &mut self,
+        frame: &ExtImageCopyCaptureFrameV1,
+        event: frame_proto::Event,
+    ) {
+        let Some((cur, idx)) = self.in_flight.as_ref() else {
+            return;
+        };
         if cur != frame {
             return;
         }
         let idx = *idx;
         match event {
-            frame_proto::Event::Damage { x, y, width, height } => self.pending_damage.push(Rect { x, y, width, height }),
-            frame_proto::Event::PresentationTime { tv_sec_hi, tv_sec_lo, tv_nsec } => {
+            frame_proto::Event::Damage {
+                x,
+                y,
+                width,
+                height,
+            } => self.pending_damage.push(Rect {
+                x,
+                y,
+                width,
+                height,
+            }),
+            frame_proto::Event::PresentationTime {
+                tv_sec_hi,
+                tv_sec_lo,
+                tv_nsec,
+            } => {
                 let secs = ((tv_sec_hi as u64) << 32) | tv_sec_lo as u64;
                 self.pending_presentation = secs * 1_000_000_000 + tv_nsec as u64;
             }
@@ -522,9 +664,13 @@ impl State {
     }
 
     fn start_cursor_session(&mut self) {
-        let (Some(seat), Some(source)) = (self.seat.seat.clone(), self.source.clone()) else { return };
+        let (Some(seat), Some(source)) = (self.seat.seat.clone(), self.source.clone()) else {
+            return;
+        };
         let pointer = seat.get_pointer(&self.qh, ());
-        let cs = self.copy_mgr.create_pointer_cursor_session(&source, &pointer, &self.qh, ());
+        let cs = self
+            .copy_mgr
+            .create_pointer_cursor_session(&source, &pointer, &self.qh, ());
         let capture = cs.get_capture_session(&self.qh, Kind::Cursor);
         self.pointer = Some(pointer);
         self.cursor_session = Some(cs);
@@ -532,11 +678,17 @@ impl State {
     }
 
     fn realloc_cursor_buffer(&mut self) {
-        let (w, h) = (self.cursor_constraints.width, self.cursor_constraints.height);
+        let (w, h) = (
+            self.cursor_constraints.width,
+            self.cursor_constraints.height,
+        );
         if let Some(f) = self.cursor_frame.take() {
             f.destroy();
         }
-        let same = self.cursor_buf.as_ref().is_some_and(|b| b.width == w && b.height == h);
+        let same = self
+            .cursor_buf
+            .as_ref()
+            .is_some_and(|b| b.width == w && b.height == h);
         if !same {
             self.cursor_buf = None;
             if w == 0 || h == 0 {
@@ -558,7 +710,10 @@ impl State {
         if self.cursor_frame.is_some() {
             return;
         }
-        let (Some(session), Some(buf)) = (self.cursor_capture.clone(), self.cursor_buf.as_ref()) else { return };
+        let (Some(session), Some(buf)) = (self.cursor_capture.clone(), self.cursor_buf.as_ref())
+        else {
+            return;
+        };
         let frame = session.create_frame(&self.qh, Kind::Cursor);
         frame.attach_buffer(&buf.buffer);
         frame.damage_buffer(0, 0, buf.width as i32, buf.height as i32);
@@ -566,7 +721,11 @@ impl State {
         self.cursor_frame = Some(frame);
     }
 
-    fn on_cursor_frame_event(&mut self, frame: &ExtImageCopyCaptureFrameV1, event: frame_proto::Event) {
+    fn on_cursor_frame_event(
+        &mut self,
+        frame: &ExtImageCopyCaptureFrameV1,
+        event: frame_proto::Event,
+    ) {
         if self.cursor_frame.as_ref() != Some(frame) {
             return;
         }
@@ -580,7 +739,13 @@ impl State {
                         Ok(argb) => {
                             let (hot_x, hot_y) = self.cursor_hotspot;
                             let (width, height) = (buf.width, buf.height);
-                            self.emit(CaptureEvent::CursorShape { width, height, hot_x, hot_y, argb });
+                            self.emit(CaptureEvent::CursorShape {
+                                width,
+                                height,
+                                hot_x,
+                                hot_y,
+                                argb,
+                            });
                         }
                         Err(e) => tracing::warn!(error = %e, "cursor read failed"),
                     }
@@ -592,7 +757,10 @@ impl State {
                     f.destroy();
                 }
                 tracing::debug!(?reason, "cursor frame failed; retrying");
-                if !matches!(reason, wayland_client::WEnum::Value(frame_proto::FailureReason::Stopped)) {
+                if !matches!(
+                    reason,
+                    wayland_client::WEnum::Value(frame_proto::FailureReason::Stopped)
+                ) {
                     self.capture_cursor();
                 }
             }
@@ -605,12 +773,20 @@ impl State {
             cursor_session::Event::Enter => {
                 self.cursor_visible = true;
                 let (x, y) = self.cursor_pos;
-                self.emit(CaptureEvent::CursorPos { x, y, visible: true });
+                self.emit(CaptureEvent::CursorPos {
+                    x,
+                    y,
+                    visible: true,
+                });
             }
             cursor_session::Event::Leave => {
                 self.cursor_visible = false;
                 let (x, y) = self.cursor_pos;
-                self.emit(CaptureEvent::CursorPos { x, y, visible: false });
+                self.emit(CaptureEvent::CursorPos {
+                    x,
+                    y,
+                    visible: false,
+                });
             }
             cursor_session::Event::Position { x, y } => {
                 self.cursor_pos = (x, y);
@@ -624,35 +800,78 @@ impl State {
 }
 
 impl Dispatch<WlRegistry, GlobalListContents> for State {
-    fn event(_: &mut Self, _: &WlRegistry, _: wayland_client::protocol::wl_registry::Event, _: &GlobalListContents, _: &Connection, _: &QueueHandle<Self>) {}
+    fn event(
+        _: &mut Self,
+        _: &WlRegistry,
+        _: wayland_client::protocol::wl_registry::Event,
+        _: &GlobalListContents,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
 }
 
 impl Dispatch<WlOutput, ()> for State {
-    fn event(s: &mut Self, o: &WlOutput, e: wl_output::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+    fn event(
+        s: &mut Self,
+        o: &WlOutput,
+        e: wl_output::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
         s.outputs.handle(o, e);
     }
 }
 
 impl Dispatch<WlSeat, ()> for State {
-    fn event(s: &mut Self, _: &WlSeat, e: wl_seat::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+    fn event(
+        s: &mut Self,
+        _: &WlSeat,
+        e: wl_seat::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
         s.seat.handle(e);
     }
 }
 
 impl Dispatch<ExtImageCopyCaptureSessionV1, Kind> for State {
-    fn event(s: &mut Self, _: &ExtImageCopyCaptureSessionV1, e: session_proto::Event, kind: &Kind, _: &Connection, _: &QueueHandle<Self>) {
+    fn event(
+        s: &mut Self,
+        _: &ExtImageCopyCaptureSessionV1,
+        e: session_proto::Event,
+        kind: &Kind,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
         s.on_session_event(*kind, e);
     }
 }
 
 impl Dispatch<ExtImageCopyCaptureFrameV1, Kind> for State {
-    fn event(s: &mut Self, f: &ExtImageCopyCaptureFrameV1, e: frame_proto::Event, kind: &Kind, _: &Connection, _: &QueueHandle<Self>) {
+    fn event(
+        s: &mut Self,
+        f: &ExtImageCopyCaptureFrameV1,
+        e: frame_proto::Event,
+        kind: &Kind,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
         s.on_frame_event(*kind, f, e);
     }
 }
 
 impl Dispatch<ExtImageCopyCaptureCursorSessionV1, ()> for State {
-    fn event(s: &mut Self, _: &ExtImageCopyCaptureCursorSessionV1, e: cursor_session::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+    fn event(
+        s: &mut Self,
+        _: &ExtImageCopyCaptureCursorSessionV1,
+        e: cursor_session::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
         s.on_cursor_session_event(e);
     }
 }

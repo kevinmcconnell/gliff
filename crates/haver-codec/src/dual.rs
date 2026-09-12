@@ -36,7 +36,11 @@ impl DualEncoder {
         // The auxiliary stream is pure chroma; keep its settings identical so
         // keyframes line up. Its QP/bitrate can be tuned later.
         let aux = H264Encoder::new(display, settings)?;
-        Ok(Self { main, aux, pending_keyframe: false })
+        Ok(Self {
+            main,
+            aux,
+            pending_keyframe: false,
+        })
     }
 
     pub fn main_extradata(&self) -> &[u8] {
@@ -53,12 +57,26 @@ impl DualEncoder {
     }
 
     /// Encode one 4:4:4 frame into two H.264 access units.
-    pub fn encode(&mut self, src: &Yuv444, timestamp: u64, force_keyframe: bool) -> Result<DualPacket> {
+    pub fn encode(
+        &mut self,
+        src: &Yuv444,
+        timestamp: u64,
+        force_keyframe: bool,
+    ) -> Result<DualPacket> {
         let force = force_keyframe || std::mem::take(&mut self.pending_keyframe);
         let (m, a) = split_yuv444(src);
-        let mp = self.main.encode_planes(&m.y, m.width, &m.uv, m.width, timestamp, force)?;
-        let ap = self.aux.encode_planes(&a.y, a.width, &a.uv, a.width, timestamp, force)?;
-        Ok(DualPacket { timestamp, keyframe: mp.keyframe, main: mp.data, aux: ap.data })
+        let mp = self
+            .main
+            .encode_planes(&m.y, m.width, &m.uv, m.width, timestamp, force)?;
+        let ap = self
+            .aux
+            .encode_planes(&a.y, a.width, &a.uv, a.width, timestamp, force)?;
+        Ok(DualPacket {
+            timestamp,
+            keyframe: mp.keyframe,
+            main: mp.data,
+            aux: ap.data,
+        })
     }
 }
 
@@ -99,7 +117,12 @@ impl DualDecoder {
 
     /// Decode one dual access unit and pair by timestamp. Returns the two NV12
     /// dmabuf frames once both streams have produced a matching timestamp.
-    pub fn decode_pair(&mut self, timestamp: u64, main: &[u8], aux: &[u8]) -> Result<Option<DecodedPair>> {
+    pub fn decode_pair(
+        &mut self,
+        timestamp: u64,
+        main: &[u8],
+        aux: &[u8],
+    ) -> Result<Option<DecodedPair>> {
         for f in self.main.decode(timestamp, main)? {
             self.main_ready.insert(f.timestamp, f.frame);
         }
@@ -117,14 +140,23 @@ impl DualDecoder {
             let oldest = *self.aux_ready.keys().next().expect("non-empty");
             self.aux_ready.remove(&oldest);
         }
-        let ts = self.main_ready.keys().find(|k| self.aux_ready.contains_key(k)).copied();
+        let ts = self
+            .main_ready
+            .keys()
+            .find(|k| self.aux_ready.contains_key(k))
+            .copied();
         if let Some(ts) = ts {
             // Drop any older unpaired frames; their partner was lost.
             self.main_ready.retain(|k, _| *k >= ts);
             self.aux_ready.retain(|k, _| *k >= ts);
             let main = self.main_ready.remove(&ts).expect("present");
             let aux = self.aux_ready.remove(&ts).expect("present");
-            return Ok(Some(DecodedPair { main, aux, width: self.width, height: self.height }));
+            return Ok(Some(DecodedPair {
+                main,
+                aux,
+                width: self.width,
+                height: self.height,
+            }));
         }
         Ok(None)
     }

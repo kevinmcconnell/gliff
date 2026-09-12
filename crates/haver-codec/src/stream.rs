@@ -29,22 +29,41 @@ pub enum Encoder {
 }
 
 impl Encoder {
-    pub fn new(display: Rc<Display>, settings: EncoderSettings, chroma: ChromaMode) -> Result<Self> {
+    pub fn new(
+        display: Rc<Display>,
+        settings: EncoderSettings,
+        chroma: ChromaMode,
+    ) -> Result<Self> {
         Ok(match chroma {
             ChromaMode::Single420 => Self::Single(SingleEncoder::new(display, settings)?),
-            ChromaMode::Dual420 | ChromaMode::Native444 => Self::Dual(DualEncoder::new(display, settings)?),
+            ChromaMode::Dual420 | ChromaMode::Native444 => {
+                Self::Dual(DualEncoder::new(display, settings)?)
+            }
         })
     }
 
-    pub fn encode(&mut self, src: &Yuv444, timestamp: u64, force_keyframe: bool) -> Result<EncodedFrame> {
+    pub fn encode(
+        &mut self,
+        src: &Yuv444,
+        timestamp: u64,
+        force_keyframe: bool,
+    ) -> Result<EncodedFrame> {
         Ok(match self {
             Self::Dual(d) => {
                 let p = d.encode(src, timestamp, force_keyframe)?;
-                EncodedFrame { main: p.main, aux: Some(p.aux), keyframe: p.keyframe }
+                EncodedFrame {
+                    main: p.main,
+                    aux: Some(p.aux),
+                    keyframe: p.keyframe,
+                }
             }
             Self::Single(s) => {
                 let (main, keyframe) = s.encode(src, timestamp, force_keyframe)?;
-                EncodedFrame { main, aux: None, keyframe }
+                EncodedFrame {
+                    main,
+                    aux: None,
+                    keyframe,
+                }
             }
         })
     }
@@ -66,22 +85,42 @@ pub enum Decoder {
 }
 
 impl Decoder {
-    pub fn new(display: Rc<Display>, chroma: ChromaMode, width: usize, height: usize) -> Result<Self> {
+    pub fn new(
+        display: Rc<Display>,
+        chroma: ChromaMode,
+        width: usize,
+        height: usize,
+    ) -> Result<Self> {
         Ok(match chroma {
             ChromaMode::Single420 => Self::Single(SingleDecoder::new(display, width, height)?),
-            ChromaMode::Dual420 | ChromaMode::Native444 => Self::Dual(DualDecoder::new(display, width, height)?),
+            ChromaMode::Dual420 | ChromaMode::Native444 => {
+                Self::Dual(DualDecoder::new(display, width, height)?)
+            }
         })
     }
 
     /// Decode without leaving the GPU: the caller imports the planes as textures.
-    pub fn decode_planes(&mut self, timestamp: u64, main: &[u8], aux: &[u8]) -> Result<Option<DecodedPlanes>> {
+    pub fn decode_planes(
+        &mut self,
+        timestamp: u64,
+        main: &[u8],
+        aux: &[u8],
+    ) -> Result<Option<DecodedPlanes>> {
         Ok(match self {
-            Self::Dual(d) => d
-                .decode_pair(timestamp, main, aux)?
-                .map(|p| DecodedPlanes { width: p.width, height: p.height, main: p.main, aux: Some(p.aux) }),
+            Self::Dual(d) => d.decode_pair(timestamp, main, aux)?.map(|p| DecodedPlanes {
+                width: p.width,
+                height: p.height,
+                main: p.main,
+                aux: Some(p.aux),
+            }),
             Self::Single(s) => {
                 let (width, height) = s.dims();
-                s.decode_frame(timestamp, main)?.map(|main| DecodedPlanes { width, height, main, aux: None })
+                s.decode_frame(timestamp, main)?.map(|main| DecodedPlanes {
+                    width,
+                    height,
+                    main,
+                    aux: None,
+                })
             }
         })
     }

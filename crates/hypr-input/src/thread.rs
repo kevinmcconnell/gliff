@@ -56,13 +56,20 @@ pub fn spawn(
     Ok((tx, join))
 }
 
-fn run(cfg: InputConfig, sink: &mut EventSink, rx: channel::Channel<InputCmd>, ready_tx: mpsc::Sender<Result<()>>) -> Result<()> {
+fn run(
+    cfg: InputConfig,
+    sink: &mut EventSink,
+    rx: channel::Channel<InputCmd>,
+    ready_tx: mpsc::Sender<Result<()>>,
+) -> Result<()> {
     let (conn, globals, queue) = hypr_wl::init::<State>(&cfg.target)?;
     let qh = queue.handle();
-    let kb_mgr: ZwpVirtualKeyboardManagerV1 =
-        globals.bind(&qh, 1..=1, ()).map_err(|_| hypr_wl::Error::MissingGlobal("zwp_virtual_keyboard_manager_v1"))?;
-    let ptr_mgr: ZwlrVirtualPointerManagerV1 =
-        globals.bind(&qh, 2..=2, ()).map_err(|_| hypr_wl::Error::MissingGlobal("zwlr_virtual_pointer_manager_v1 v2"))?;
+    let kb_mgr: ZwpVirtualKeyboardManagerV1 = globals
+        .bind(&qh, 1..=1, ())
+        .map_err(|_| hypr_wl::Error::MissingGlobal("zwp_virtual_keyboard_manager_v1"))?;
+    let ptr_mgr: ZwlrVirtualPointerManagerV1 = globals
+        .bind(&qh, 2..=2, ())
+        .map_err(|_| hypr_wl::Error::MissingGlobal("zwlr_virtual_pointer_manager_v1 v2"))?;
     let outputs = Outputs::bind(&globals, &qh)?;
     let seat = Seat::bind(&globals, &qh)?;
 
@@ -86,7 +93,17 @@ fn run(cfg: InputConfig, sink: &mut EventSink, rx: channel::Channel<InputCmd>, r
         quit: false,
     };
     std::mem::swap(&mut state.sink, sink);
-    let result = input_loop(&mut state, conn, queue, rx, ready_tx, &cfg, &qh, &ptr_mgr, &seat_proxy);
+    let result = input_loop(
+        &mut state,
+        conn,
+        queue,
+        rx,
+        ready_tx,
+        &cfg,
+        &qh,
+        &ptr_mgr,
+        &seat_proxy,
+    );
     if let Err(e) = &result {
         state.emit(InputEvent::Error(e.to_string()));
     }
@@ -131,13 +148,15 @@ impl State {
     }
 
     fn upload_keymap(&mut self) -> Result<()> {
-        let fd = memfd_create(c"haver-keymap", MFdFlags::MFD_CLOEXEC).map_err(|e| Error::Input(format!("memfd: {e}")))?;
+        let fd = memfd_create(c"haver-keymap", MFdFlags::MFD_CLOEXEC)
+            .map_err(|e| Error::Input(format!("memfd: {e}")))?;
         let mut file = File::from(fd);
         file.write_all(self.keys.text.as_bytes())?;
         file.write_all(&[0])?;
         file.flush()?;
         let size = self.keys.text.len() as u32 + 1;
-        self.keyboard.keymap(KEYMAP_FORMAT_XKB_V1, file.as_fd(), size);
+        self.keyboard
+            .keymap(KEYMAP_FORMAT_XKB_V1, file.as_fd(), size);
         Ok(())
     }
 
@@ -185,16 +204,29 @@ impl LoopState for State {
                 } else {
                     self.pressed_buttons.remove(&button);
                 }
-                let st = if pressed { wl_pointer::ButtonState::Pressed } else { wl_pointer::ButtonState::Released };
+                let st = if pressed {
+                    wl_pointer::ButtonState::Pressed
+                } else {
+                    wl_pointer::ButtonState::Released
+                };
                 self.pointer.button(t, button, st);
                 self.pointer.frame();
             }
-            InputCmd::Axis { axis, value, discrete, stop } => {
+            InputCmd::Axis {
+                axis,
+                value,
+                discrete,
+                stop,
+            } => {
                 let a = match axis {
                     Axis::Vertical => wl_pointer::Axis::VerticalScroll,
                     Axis::Horizontal => wl_pointer::Axis::HorizontalScroll,
                 };
-                let source = if discrete.is_some() { wl_pointer::AxisSource::Wheel } else { wl_pointer::AxisSource::Finger };
+                let source = if discrete.is_some() {
+                    wl_pointer::AxisSource::Wheel
+                } else {
+                    wl_pointer::AxisSource::Finger
+                };
                 self.pointer.axis_source(source);
                 if stop {
                     self.pointer.axis_stop(t, a);
@@ -232,17 +264,39 @@ impl LoopState for State {
 }
 
 impl Dispatch<WlRegistry, GlobalListContents> for State {
-    fn event(_: &mut Self, _: &WlRegistry, _: wayland_client::protocol::wl_registry::Event, _: &GlobalListContents, _: &Connection, _: &QueueHandle<Self>) {}
+    fn event(
+        _: &mut Self,
+        _: &WlRegistry,
+        _: wayland_client::protocol::wl_registry::Event,
+        _: &GlobalListContents,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
 }
 
 impl Dispatch<WlOutput, ()> for State {
-    fn event(s: &mut Self, o: &WlOutput, e: wl_output::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+    fn event(
+        s: &mut Self,
+        o: &WlOutput,
+        e: wl_output::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
         s.outputs.handle(o, e);
     }
 }
 
 impl Dispatch<WlSeat, ()> for State {
-    fn event(s: &mut Self, _: &WlSeat, e: wl_seat::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+    fn event(
+        s: &mut Self,
+        _: &WlSeat,
+        e: wl_seat::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
         s.seat.handle(e);
     }
 }

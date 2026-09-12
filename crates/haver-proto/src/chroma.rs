@@ -24,7 +24,13 @@ pub struct Yuv444 {
 
 impl Yuv444 {
     pub fn new(width: usize, height: usize) -> Self {
-        Self { width, height, y: vec![0; width * height], u: vec![0; width * height], v: vec![0; width * height] }
+        Self {
+            width,
+            height,
+            y: vec![0; width * height],
+            u: vec![0; width * height],
+            v: vec![0; width * height],
+        }
     }
 }
 
@@ -39,7 +45,12 @@ pub struct Nv12 {
 
 impl Nv12 {
     pub fn new(width: usize, height: usize) -> Self {
-        Self { width, height, y: vec![0; width * height], uv: vec![0; width * height / 2] }
+        Self {
+            width,
+            height,
+            y: vec![0; width * height],
+            uv: vec![0; width * height / 2],
+        }
     }
 }
 
@@ -190,7 +201,10 @@ mod tests {
             assert_eq!(nv12.y.len(), w * h);
             assert_eq!(nv12.uv.len(), w * h / 2);
             let back = nv12_to_yuv444(&nv12);
-            assert_eq!(src, back, "single-stream lossless on block-constant {w}x{h}");
+            assert_eq!(
+                src, back,
+                "single-stream lossless on block-constant {w}x{h}"
+            );
         }
     }
 

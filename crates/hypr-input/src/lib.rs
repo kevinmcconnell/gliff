@@ -54,22 +54,43 @@ pub struct InputConfig {
 
 impl InputConfig {
     pub fn new(output: impl Into<String>) -> Self {
-        Self { target: Target::default(), output: output.into(), keymap: None }
+        Self {
+            target: Target::default(),
+            output: output.into(),
+            keymap: None,
+        }
     }
 }
 
 #[derive(Debug)]
 pub enum InputCmd {
     /// `code` is an evdev keycode (xkb keycode minus 8).
-    Key { code: u32, pressed: bool },
+    Key {
+        code: u32,
+        pressed: bool,
+    },
     /// Absolute pointer position in logical output coordinates.
-    Motion { x: f64, y: f64 },
+    Motion {
+        x: f64,
+        y: f64,
+    },
     /// `button` is an evdev `BTN_*` code.
-    Button { button: u32, pressed: bool },
-    Axis { axis: Axis, value: f64, discrete: Option<i32>, stop: bool },
+    Button {
+        button: u32,
+        pressed: bool,
+    },
+    Axis {
+        axis: Axis,
+        value: f64,
+        discrete: Option<i32>,
+        stop: bool,
+    },
     SetKeymap(String),
     /// Extent of the output's logical space changed (resize).
-    SetExtent { width: u32, height: u32 },
+    SetExtent {
+        width: u32,
+        height: u32,
+    },
     ReleaseAll,
     Stop,
 }
@@ -92,7 +113,10 @@ impl Input {
         let (ready_tx, ready_rx) = mpsc::channel();
         let (cmd, join) = thread::spawn(config, sink, ready_tx)?;
         match ready_rx.recv() {
-            Ok(Ok(())) => Ok(Self { cmd, join: Some(join) }),
+            Ok(Ok(())) => Ok(Self {
+                cmd,
+                join: Some(join),
+            }),
             Ok(Err(e)) => Err(e),
             Err(_) => Err(Error::ThreadGone),
         }
@@ -130,7 +154,10 @@ impl Drop for Input {
 }
 
 /// Protocol names the input path needs, for probing.
-pub const REQUIRED_GLOBALS: &[&str] = &["zwp_virtual_keyboard_manager_v1", "zwlr_virtual_pointer_manager_v1"];
+pub const REQUIRED_GLOBALS: &[&str] = &[
+    "zwp_virtual_keyboard_manager_v1",
+    "zwlr_virtual_pointer_manager_v1",
+];
 
 /// Evdev codes for a handful of keys, for smoke tests.
 pub mod keys {

@@ -28,12 +28,28 @@ impl ShmBuffer {
     {
         let stride = width * 4;
         let size = (stride * height) as u64;
-        let fd = memfd_create(c"haver-cursor", MFdFlags::MFD_CLOEXEC).map_err(|e| Error::Capture(format!("memfd: {e}")))?;
+        let fd = memfd_create(c"haver-cursor", MFdFlags::MFD_CLOEXEC)
+            .map_err(|e| Error::Capture(format!("memfd: {e}")))?;
         let file = File::from(fd);
         file.set_len(size)?;
         let pool = shm.create_pool(file.as_fd(), size as i32, qh, ());
-        let buffer = pool.create_buffer(0, width as i32, height as i32, stride as i32, wl_shm::Format::Argb8888, qh, ());
-        Ok(Self { file, pool, buffer, width, height, stride })
+        let buffer = pool.create_buffer(
+            0,
+            width as i32,
+            height as i32,
+            stride as i32,
+            wl_shm::Format::Argb8888,
+            qh,
+            (),
+        );
+        Ok(Self {
+            file,
+            pool,
+            buffer,
+            width,
+            height,
+            stride,
+        })
     }
 
     /// Copy the pixels out as tightly packed ARGB8888 (little-endian BGRA bytes).

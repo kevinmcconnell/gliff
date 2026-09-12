@@ -18,9 +18,9 @@ use std::time::{Duration, Instant};
 
 use adw::prelude::*;
 use clap::Parser;
-use gtk4 as gtk;
 use gtk::gdk;
 use gtk::glib;
+use gtk4 as gtk;
 use haver_proto::{Axis, ClientMsg};
 use haver_transport::SshTarget;
 use libadwaita as adw;
@@ -31,7 +31,10 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 type OutSender = UnboundedSender<(ClientMsg, Vec<u8>)>;
 
 #[derive(Parser)]
-#[command(name = "haver-client", about = "Remote-desktop a Hyprland session over ssh")]
+#[command(
+    name = "haver-client",
+    about = "Remote-desktop a Hyprland session over ssh"
+)]
 struct Cli {
     /// `user@host` to ssh to and spawn haver-server, or empty to type it in.
     host: Option<String>,
@@ -94,9 +97,13 @@ struct App {
 }
 
 fn main() -> glib::ExitCode {
-    tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env()).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
     let cli = Cli::parse();
-    let app = adw::Application::builder().application_id("com.haver.Client").build();
+    let app = adw::Application::builder()
+        .application_id("com.haver.Client")
+        .build();
     app.connect_activate(move |app| build_ui(app, &cli));
     // GTK owns argv parsing; we already parsed with clap, so pass none.
     let empty: Vec<String> = vec![];
@@ -104,15 +111,24 @@ fn main() -> glib::ExitCode {
 }
 
 fn build_ui(app: &adw::Application, cli: &Cli) {
-    let window = adw::ApplicationWindow::builder().application(app).default_width(1280).default_height(760).build();
+    let window = adw::ApplicationWindow::builder()
+        .application(app)
+        .default_width(1280)
+        .default_height(760)
+        .build();
 
     let header = adw::HeaderBar::new();
-    let host_entry = gtk::Entry::builder().placeholder_text("user@host").hexpand(true).build();
+    let host_entry = gtk::Entry::builder()
+        .placeholder_text("user@host")
+        .hexpand(true)
+        .build();
     if let Some(h) = &cli.host {
         host_entry.set_text(h);
     }
     let connect_btn = gtk::Button::with_label("Connect");
-    let fullscreen_btn = gtk::ToggleButton::builder().icon_name("view-fullscreen-symbolic").build();
+    let fullscreen_btn = gtk::ToggleButton::builder()
+        .icon_name("view-fullscreen-symbolic")
+        .build();
     header.pack_start(&host_entry);
     header.pack_start(&connect_btn);
     header.pack_end(&fullscreen_btn);
@@ -127,7 +143,12 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
     let gpu = Arc::new(AtomicBool::new(haver_gl::supports_dmabuf_import(&node)));
     tracing::info!(gpu = gpu.load(Ordering::Relaxed), "initial display path");
 
-    let stats = gtk::Label::builder().halign(gtk::Align::Start).valign(gtk::Align::Start).css_classes(["stats"]).visible(false).build();
+    let stats = gtk::Label::builder()
+        .halign(gtk::Align::Start)
+        .valign(gtk::Align::Start)
+        .css_classes(["stats"])
+        .visible(false)
+        .build();
     let status = gtk::Label::builder().label("Not connected").build();
 
     let area = gtk::GLArea::builder().hexpand(true).vexpand(true).build();
@@ -151,7 +172,10 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
             renderer.borrow_mut().take();
         });
     }
-    let gl = GlView { area: area.clone(), frame };
+    let gl = GlView {
+        area: area.clone(),
+        frame,
+    };
     let video: gtk::Widget = area.upcast();
 
     let overlay = gtk::Overlay::new();
@@ -205,7 +229,10 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         let host_entry = host_entry.clone();
         let connect = cli.connect.clone();
         let server_bin = cli.server_bin.clone();
-        let output = cli.output.clone().or_else(|| cli.mirror.then(|| "auto".to_string()));
+        let output = cli
+            .output
+            .clone()
+            .or_else(|| cli.mirror.then(|| "auto".to_string()));
         connect_btn.connect_clicked(move |_| {
             let endpoint = match &connect {
                 Some(addr) => Endpoint::Tcp(addr.clone()),
@@ -232,7 +259,11 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
     let css = gtk::CssProvider::new();
     css.load_from_string(".stats { background: rgba(0,0,0,0.6); color: #fff; padding: 6px; margin: 6px; border-radius: 6px; font-family: monospace; }");
     if let Some(display) = gdk::Display::default() {
-        gtk::style_context_add_provider_for_display(&display, &css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &css,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
     }
 
     // Watch the local clipboard: when it changes to text we did not just
@@ -258,7 +289,12 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
                     let total = bytes.len() as u64;
                     send_payload(
                         &ui,
-                        ClientMsg::ClipboardData { mime_type: "text/plain;charset=utf-8".into(), offset: 0, total, data_len: bytes.len() as u32 },
+                        ClientMsg::ClipboardData {
+                            mime_type: "text/plain;charset=utf-8".into(),
+                            offset: 0,
+                            total,
+                            data_len: bytes.len() as u32,
+                        },
                         bytes,
                     );
                 }
@@ -286,7 +322,14 @@ fn start_session(ui: Rc<App>, endpoint: Endpoint) {
     std::thread::Builder::new()
         .name("haver-net".into())
         .spawn(move || {
-            Worker { endpoint, gpu, frames: frame_tx, status: status_tx, input: input_rx }.run();
+            Worker {
+                endpoint,
+                gpu,
+                frames: frame_tx,
+                status: status_tx,
+                input: input_rx,
+            }
+            .run();
         })
         .expect("spawn network thread");
 
@@ -304,7 +347,9 @@ fn schedule_reconnect(ui: Rc<App>) {
         ui.status.set_text("Disconnected — press Connect to retry");
         return;
     }
-    let Some(endpoint) = ui.endpoint.borrow().clone() else { return };
+    let Some(endpoint) = ui.endpoint.borrow().clone() else {
+        return;
+    };
     ui.status.set_text(&format!("Reconnecting… (attempt {n})"));
     let ui2 = ui.clone();
     glib::timeout_add_local_once(Duration::from_millis(1500), move || {
@@ -322,7 +367,9 @@ fn poll_frames(ui: Rc<App>, rx: Receiver<DecodedFrame>) {
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 // The worker ended; stop this per-session timer so it does not
                 // accumulate across reconnects.
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => return glib::ControlFlow::Break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    return glib::ControlFlow::Break
+                }
             }
         }
         if let Some(f) = latest {
@@ -334,20 +381,43 @@ fn poll_frames(ui: Rc<App>, rx: Receiver<DecodedFrame>) {
 }
 
 /// The Y (R8) and UV (GR88) dmabuf planes of an NV12 frame.
-fn nv12_planes(frame: &haver_codec::frame::Nv12Frame) -> (haver_gl::DmabufPlane<'_>, haver_gl::DmabufPlane<'_>) {
+fn nv12_planes(
+    frame: &haver_codec::frame::Nv12Frame,
+) -> (haver_gl::DmabufPlane<'_>, haver_gl::DmabufPlane<'_>) {
     use drm_fourcc::DrmFourcc;
     use haver_gl::DmabufPlane;
     let info = frame.info();
     (
-        DmabufPlane { fd: info.fd(), width: info.width, height: info.height, offset: info.planes[0].offset, stride: info.planes[0].stride, fourcc: DrmFourcc::R8, modifier: info.modifier },
-        DmabufPlane { fd: info.fd(), width: info.width / 2, height: info.height / 2, offset: info.planes[1].offset, stride: info.planes[1].stride, fourcc: DrmFourcc::Gr88, modifier: info.modifier },
+        DmabufPlane {
+            fd: info.fd(),
+            width: info.width,
+            height: info.height,
+            offset: info.planes[0].offset,
+            stride: info.planes[0].stride,
+            fourcc: DrmFourcc::R8,
+            modifier: info.modifier,
+        },
+        DmabufPlane {
+            fd: info.fd(),
+            width: info.width / 2,
+            height: info.height / 2,
+            offset: info.planes[1].offset,
+            stride: info.planes[1].stride,
+            fourcc: DrmFourcc::Gr88,
+            modifier: info.modifier,
+        },
     )
 }
 
 /// Render the latest frame in the GLArea's current context. Draws dmabuf planes
 /// on the GPU when possible; if that is unavailable or fails, clears the shared
 /// `gpu` flag (so the worker switches to sending BGRA) and blits CPU BGRA.
-fn render_gl(area: &gtk::GLArea, renderer: &Rc<RefCell<Option<haver_gl::Renderer>>>, frame: &Rc<RefCell<Option<net::DecodedFrame>>>, gpu: &Arc<AtomicBool>) {
+fn render_gl(
+    area: &gtk::GLArea,
+    renderer: &Rc<RefCell<Option<haver_gl::Renderer>>>,
+    frame: &Rc<RefCell<Option<net::DecodedFrame>>>,
+    gpu: &Arc<AtomicBool>,
+) {
     use haver_gl::FramePlanes;
 
     if renderer.borrow().is_none() {
@@ -367,7 +437,9 @@ fn render_gl(area: &gtk::GLArea, renderer: &Rc<RefCell<Option<haver_gl::Renderer
         }
     }
     let renderer = renderer.borrow();
-    let Some(renderer) = renderer.as_ref() else { return };
+    let Some(renderer) = renderer.as_ref() else {
+        return;
+    };
     let frame = frame.borrow();
     let Some(frame) = frame.as_ref() else { return };
 
@@ -376,13 +448,23 @@ fn render_gl(area: &gtk::GLArea, renderer: &Rc<RefCell<Option<haver_gl::Renderer
     match frame {
         net::DecodedFrame::Planes(p) => {
             let (main_y, main_uv) = nv12_planes(&p.main);
-            let planes = FramePlanes { main_y, main_uv, aux: p.aux.as_ref().map(|a| nv12_planes(a)), width: p.width as u32, height: p.height as u32 };
+            let planes = FramePlanes {
+                main_y,
+                main_uv,
+                aux: p.aux.as_ref().map(|a| nv12_planes(a)),
+                width: p.width as u32,
+                height: p.height as u32,
+            };
             if let Err(e) = renderer.draw_planes(&planes, fb_w, fb_h) {
                 tracing::warn!(error = %e, "GL plane draw failed; falling back to CPU");
                 gpu.store(false, Ordering::Relaxed);
             }
         }
-        net::DecodedFrame::Rgba { width, height, bgra } => {
+        net::DecodedFrame::Rgba {
+            width,
+            height,
+            bgra,
+        } => {
             if let Err(e) = renderer.draw_rgba(bgra, *width as i32, *height as i32, fb_w, fb_h) {
                 tracing::warn!(error = %e, "GL blit failed");
             }
@@ -403,11 +485,23 @@ fn poll_status(ui: Rc<App>, rx: Receiver<Status>) {
                     // reconnect must bring it back to the window.
                     request_resize(&ui);
                 }
-                Status::Stats { fps, mbit, decode_ms } => {
+                Status::Stats {
+                    fps,
+                    mbit,
+                    decode_ms,
+                } => {
                     ui.stats.set_visible(true);
-                    ui.stats.set_text(&format!("{fps:.0} fps  {mbit:.1} Mbit/s  decode {decode_ms:.1} ms"));
+                    ui.stats.set_text(&format!(
+                        "{fps:.0} fps  {mbit:.1} Mbit/s  decode {decode_ms:.1} ms"
+                    ));
                 }
-                Status::Cursor { width, height, hot_x, hot_y, argb } => set_remote_cursor(&ui, width, height, hot_x, hot_y, &argb),
+                Status::Cursor {
+                    width,
+                    height,
+                    hot_x,
+                    hot_y,
+                    argb,
+                } => set_remote_cursor(&ui, width, height, hot_x, hot_y, &argb),
                 Status::Clipboard(text) => {
                     *ui.last_remote_clip.borrow_mut() = Some(text.clone());
                     if let Some(display) = gdk::Display::default() {
@@ -444,7 +538,13 @@ fn set_remote_cursor(ui: &App, width: u32, height: u32, hot_x: i32, hot_y: i32, 
         return;
     }
     let bytes = glib::Bytes::from(argb);
-    let texture = gdk::MemoryTexture::new(width as i32, height as i32, gdk::MemoryFormat::B8g8r8a8, &bytes, width as usize * 4);
+    let texture = gdk::MemoryTexture::new(
+        width as i32,
+        height as i32,
+        gdk::MemoryFormat::B8g8r8a8,
+        &bytes,
+        width as usize * 4,
+    );
     let cursor = gdk::Cursor::from_texture(&texture, hot_x, hot_y, None);
     ui.video.set_cursor(Some(&cursor));
 }
@@ -482,8 +582,14 @@ fn send_payload(ui: &App, msg: ClientMsg, payload: Vec<u8>) {
 #[derive(Clone)]
 enum ReleaseHotkey {
     None,
-    DoubleTap { keyval: gdk::Key, within: Duration },
-    Chord { mods: gdk::ModifierType, keyval: gdk::Key },
+    DoubleTap {
+        keyval: gdk::Key,
+        within: Duration,
+    },
+    Chord {
+        mods: gdk::ModifierType,
+        keyval: gdk::Key,
+    },
 }
 
 const CHORD_MODS: gdk::ModifierType = gdk::ModifierType::CONTROL_MASK
@@ -498,8 +604,14 @@ impl ReleaseHotkey {
             return Ok(Self::None);
         }
         let lower = s.to_ascii_lowercase();
-        if let Some(rest) = lower.strip_prefix("double-").or_else(|| lower.strip_prefix("double:")) {
-            return Ok(Self::DoubleTap { keyval: key_from_name(rest)?, within: Duration::from_millis(400) });
+        if let Some(rest) = lower
+            .strip_prefix("double-")
+            .or_else(|| lower.strip_prefix("double:"))
+        {
+            return Ok(Self::DoubleTap {
+                keyval: key_from_name(rest)?,
+                within: Duration::from_millis(400),
+            });
         }
         let mut mods = gdk::ModifierType::empty();
         let mut keyval = None;
@@ -522,7 +634,12 @@ impl ReleaseHotkey {
     /// True if this press is the release trigger. For a double-tap it records
     /// the tap time and returns true only on the quick second press, so the
     /// first tap still reaches the remote.
-    fn matches(&self, keyval: gdk::Key, state: gdk::ModifierType, last_tap: &RefCell<Option<Instant>>) -> bool {
+    fn matches(
+        &self,
+        keyval: gdk::Key,
+        state: gdk::ModifierType,
+        last_tap: &RefCell<Option<Instant>>,
+    ) -> bool {
         match self {
             Self::None => false,
             Self::Chord { mods, keyval: k } => keyval == *k && (state & CHORD_MODS) == *mods,
@@ -548,18 +665,33 @@ impl ReleaseHotkey {
 
     fn describe(&self) -> String {
         let name = |k: &gdk::Key| {
-            let n = k.name().map(|s| s.to_string()).unwrap_or_else(|| "?".into());
-            if n == "Escape" { "Esc".into() } else { n }
+            let n = k
+                .name()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "?".into());
+            if n == "Escape" {
+                "Esc".into()
+            } else {
+                n
+            }
         };
         match self {
             Self::None => "release disabled".into(),
             Self::DoubleTap { keyval, .. } => format!("double-tap {}", name(keyval)),
             Self::Chord { mods, keyval } => {
                 let mut parts = Vec::new();
-                if mods.contains(gdk::ModifierType::CONTROL_MASK) { parts.push("Ctrl".to_string()); }
-                if mods.contains(gdk::ModifierType::ALT_MASK) { parts.push("Alt".to_string()); }
-                if mods.contains(gdk::ModifierType::SHIFT_MASK) { parts.push("Shift".to_string()); }
-                if mods.contains(gdk::ModifierType::SUPER_MASK) { parts.push("Super".to_string()); }
+                if mods.contains(gdk::ModifierType::CONTROL_MASK) {
+                    parts.push("Ctrl".to_string());
+                }
+                if mods.contains(gdk::ModifierType::ALT_MASK) {
+                    parts.push("Alt".to_string());
+                }
+                if mods.contains(gdk::ModifierType::SHIFT_MASK) {
+                    parts.push("Shift".to_string());
+                }
+                if mods.contains(gdk::ModifierType::SUPER_MASK) {
+                    parts.push("Super".to_string());
+                }
                 parts.push(name(keyval));
                 parts.join("+")
             }
@@ -578,7 +710,9 @@ fn key_from_name(name: &str) -> Result<gdk::Key, String> {
     };
     let title = {
         let mut c = n.chars();
-        c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
+        c.next()
+            .map(|f| f.to_uppercase().collect::<String>() + c.as_str())
+            .unwrap_or_default()
     };
     for cand in alias.iter().copied().chain([n, title.as_str()]) {
         if !cand.is_empty() {
@@ -594,7 +728,8 @@ fn key_from_name(name: &str) -> Result<gdk::Key, String> {
 /// which fires the focus-leave handler that restores system shortcuts.
 fn release_capture(ui: &App, window: &adw::ApplicationWindow) {
     gtk::prelude::GtkWindowExt::set_focus(window, gtk::Widget::NONE);
-    ui.status.set_text("Shortcuts released — click the screen to capture again");
+    ui.status
+        .set_text("Shortcuts released — click the screen to capture again");
 }
 
 /// Release every key held on the remote. Once the video loses focus their
@@ -603,7 +738,13 @@ fn release_capture(ui: &App, window: &adw::ApplicationWindow) {
 fn release_pressed_keys(ui: &App) {
     let held = std::mem::take(&mut *ui.pressed_keys.borrow_mut());
     for code in held {
-        send(ui, ClientMsg::Key { keycode: code, pressed: false });
+        send(
+            ui,
+            ClientMsg::Key {
+                keycode: code,
+                pressed: false,
+            },
+        );
     }
 }
 
@@ -612,10 +753,19 @@ fn release_pressed_keys(ui: &App) {
 /// release of a key whose press was never sent.
 fn track_key(ui: &App, code: u32, pressed: bool) -> bool {
     let mut keys = ui.pressed_keys.borrow_mut();
-    if pressed { keys.insert(code) } else { keys.remove(&code) }
+    if pressed {
+        keys.insert(code)
+    } else {
+        keys.remove(&code)
+    }
 }
 
-fn install_input_handlers(ui: &Rc<App>, video: &gtk::Widget, window: &adw::ApplicationWindow, hotkey: ReleaseHotkey) {
+fn install_input_handlers(
+    ui: &Rc<App>,
+    video: &gtk::Widget,
+    window: &adw::ApplicationWindow,
+    hotkey: ReleaseHotkey,
+) {
     video.set_focusable(true);
     video.set_can_focus(true);
 
@@ -635,7 +785,13 @@ fn install_input_handlers(ui: &Rc<App>, video: &gtk::Widget, window: &adw::Appli
             }
             let code = keycode.saturating_sub(8);
             if track_key(&ui, code, true) {
-                send(&ui, ClientMsg::Key { keycode: code, pressed: true });
+                send(
+                    &ui,
+                    ClientMsg::Key {
+                        keycode: code,
+                        pressed: true,
+                    },
+                );
             }
             glib::Propagation::Stop
         });
@@ -645,7 +801,13 @@ fn install_input_handlers(ui: &Rc<App>, video: &gtk::Widget, window: &adw::Appli
         key.connect_key_released(move |_, _keyval, keycode, _state| {
             let code = keycode.saturating_sub(8);
             if track_key(&ui, code, false) {
-                send(&ui, ClientMsg::Key { keycode: code, pressed: false });
+                send(
+                    &ui,
+                    ClientMsg::Key {
+                        keycode: code,
+                        pressed: false,
+                    },
+                );
             }
         });
     }
@@ -670,13 +832,25 @@ fn install_input_handlers(ui: &Rc<App>, video: &gtk::Widget, window: &adw::Appli
         let video = video.clone();
         click.connect_pressed(move |g, _, _, _| {
             video.grab_focus();
-            send(&ui, ClientMsg::PointerButton { button: evdev_button(g.current_button()), pressed: true });
+            send(
+                &ui,
+                ClientMsg::PointerButton {
+                    button: evdev_button(g.current_button()),
+                    pressed: true,
+                },
+            );
         });
     }
     {
         let ui = ui.clone();
         click.connect_released(move |g, _, _, _| {
-            send(&ui, ClientMsg::PointerButton { button: evdev_button(g.current_button()), pressed: false });
+            send(
+                &ui,
+                ClientMsg::PointerButton {
+                    button: evdev_button(g.current_button()),
+                    pressed: false,
+                },
+            );
         });
     }
     video.add_controller(click);
@@ -687,10 +861,26 @@ fn install_input_handlers(ui: &Rc<App>, video: &gtk::Widget, window: &adw::Appli
         let ui = ui.clone();
         scroll.connect_scroll(move |_, dx, dy| {
             if dy != 0.0 {
-                send(&ui, ClientMsg::PointerAxis { axis: Axis::Vertical, value: dy * 15.0, discrete: Some(dy.signum() as i32), stop: false });
+                send(
+                    &ui,
+                    ClientMsg::PointerAxis {
+                        axis: Axis::Vertical,
+                        value: dy * 15.0,
+                        discrete: Some(dy.signum() as i32),
+                        stop: false,
+                    },
+                );
             }
             if dx != 0.0 {
-                send(&ui, ClientMsg::PointerAxis { axis: Axis::Horizontal, value: dx * 15.0, discrete: Some(dx.signum() as i32), stop: false });
+                send(
+                    &ui,
+                    ClientMsg::PointerAxis {
+                        axis: Axis::Horizontal,
+                        value: dx * 15.0,
+                        discrete: Some(dx.signum() as i32),
+                        stop: false,
+                    },
+                );
             }
             glib::Propagation::Stop
         });
@@ -748,11 +938,22 @@ fn install_resize_handler(ui: &Rc<App>, area: &gtk::GLArea) {
 /// Send a Resize if the stream does not already match the view.
 fn request_resize(ui: &App) {
     let size = ui.view_size.get();
-    if size.0 < 64 || size.1 < 64 || size == ui.stream_size.get() || size == ui.resize_requested.get() {
+    if size.0 < 64
+        || size.1 < 64
+        || size == ui.stream_size.get()
+        || size == ui.resize_requested.get()
+    {
         return;
     }
     ui.resize_requested.set(size);
-    send(ui, ClientMsg::Resize { width: size.0, height: size.1, scale: ui.video.scale_factor() as f32 });
+    send(
+        ui,
+        ClientMsg::Resize {
+            width: size.0,
+            height: size.1,
+            scale: ui.video.scale_factor() as f32,
+        },
+    );
 }
 
 /// GTK button number to evdev `BTN_*`.
@@ -774,8 +975,14 @@ mod tests {
 
     #[test]
     fn parse_chord_and_double_and_none() {
-        assert!(matches!(ReleaseHotkey::parse("none").unwrap(), ReleaseHotkey::None));
-        assert!(matches!(ReleaseHotkey::parse("").unwrap(), ReleaseHotkey::None));
+        assert!(matches!(
+            ReleaseHotkey::parse("none").unwrap(),
+            ReleaseHotkey::None
+        ));
+        assert!(matches!(
+            ReleaseHotkey::parse("").unwrap(),
+            ReleaseHotkey::None
+        ));
 
         match ReleaseHotkey::parse("shift+escape").unwrap() {
             ReleaseHotkey::Chord { mods, keyval } => {
@@ -793,7 +1000,10 @@ mod tests {
             _ => panic!("expected chord"),
         }
 
-        assert!(matches!(ReleaseHotkey::parse("double-escape").unwrap(), ReleaseHotkey::DoubleTap { .. }));
+        assert!(matches!(
+            ReleaseHotkey::parse("double-escape").unwrap(),
+            ReleaseHotkey::DoubleTap { .. }
+        ));
         assert!(ReleaseHotkey::parse("ctrl+alt").is_err());
     }
 
@@ -805,7 +1015,11 @@ mod tests {
         // Bare Escape, no Shift: not a match (so it reaches the remote).
         assert!(!hk.matches(gdk::Key::Escape, gdk::ModifierType::empty(), &lt));
         // Extra lock bits are ignored.
-        assert!(hk.matches(gdk::Key::Escape, gdk::ModifierType::SHIFT_MASK | gdk::ModifierType::LOCK_MASK, &lt));
+        assert!(hk.matches(
+            gdk::Key::Escape,
+            gdk::ModifierType::SHIFT_MASK | gdk::ModifierType::LOCK_MASK,
+            &lt
+        ));
     }
 
     #[test]

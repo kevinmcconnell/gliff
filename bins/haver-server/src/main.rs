@@ -14,7 +14,10 @@ use tokio::net::TcpListener;
 use hypr_wl::Target;
 
 #[derive(Parser)]
-#[command(name = "haver-server", about = "Serve a Hyprland session over the haver protocol")]
+#[command(
+    name = "haver-server",
+    about = "Serve a Hyprland session over the haver protocol"
+)]
 struct Cli {
     /// Serve over stdin/stdout (spawned by ssh). stdout carries the protocol.
     #[arg(long, conflicts_with = "listen")]
@@ -46,7 +49,10 @@ struct Cli {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     // In --stdio mode stdout IS the protocol: all logs go to stderr.
-    tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env()).with_writer(std::io::stderr).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .init();
 
     if cli.stdio {
         assert_stdout_is_free()?;
@@ -55,7 +61,10 @@ fn main() -> Result<()> {
         anyhow::bail!("choose --headless or --output <name>");
     }
 
-    let target = Target { display: None, instance: cli.instance.clone() };
+    let target = Target {
+        display: None,
+        instance: cli.instance.clone(),
+    };
     let cfg = session::Config {
         target,
         output: cli.output.clone(),
@@ -64,11 +73,15 @@ fn main() -> Result<()> {
         bitrate: cli.bitrate,
     };
 
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async move {
         if let Some(addr) = cli.listen {
-            let listener = TcpListener::bind(&addr).await.with_context(|| format!("bind {addr}"))?;
+            let listener = TcpListener::bind(&addr)
+                .await
+                .with_context(|| format!("bind {addr}"))?;
             tracing::info!(%addr, "listening (dev mode, no auth)");
             let (stream, peer) = listener.accept().await?;
             tracing::info!(%peer, "client connected");

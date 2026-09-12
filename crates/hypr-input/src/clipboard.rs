@@ -15,16 +15,27 @@ use wayland_client::globals::GlobalListContents;
 use wayland_client::protocol::wl_registry::WlRegistry;
 use wayland_client::protocol::wl_seat::{self, WlSeat};
 use wayland_client::{delegate_noop, Connection, Dispatch, QueueHandle};
-use wayland_protocols::ext::data_control::v1::client::ext_data_control_device_v1::{self as device, ExtDataControlDeviceV1};
+use wayland_protocols::ext::data_control::v1::client::ext_data_control_device_v1::{
+    self as device, ExtDataControlDeviceV1,
+};
 use wayland_protocols::ext::data_control::v1::client::ext_data_control_manager_v1::ExtDataControlManagerV1;
-use wayland_protocols::ext::data_control::v1::client::ext_data_control_offer_v1::{self as offer, ExtDataControlOfferV1};
-use wayland_protocols::ext::data_control::v1::client::ext_data_control_source_v1::{self as source, ExtDataControlSourceV1};
+use wayland_protocols::ext::data_control::v1::client::ext_data_control_offer_v1::{
+    self as offer, ExtDataControlOfferV1,
+};
+use wayland_protocols::ext::data_control::v1::client::ext_data_control_source_v1::{
+    self as source, ExtDataControlSourceV1,
+};
 
 use crate::{Error, Result};
 use hypr_wl::{LoopState, Outputs, Seat, Target};
 
 /// Text mime types we offer and accept, best first.
-const TEXT_MIMES: &[&str] = &["text/plain;charset=utf-8", "text/plain", "UTF8_STRING", "STRING"];
+const TEXT_MIMES: &[&str] = &[
+    "text/plain;charset=utf-8",
+    "text/plain",
+    "UTF8_STRING",
+    "STRING",
+];
 
 #[derive(Debug)]
 pub enum ClipboardEvent {
@@ -51,7 +62,10 @@ impl Clipboard {
         let (ready_tx, ready_rx) = mpsc::channel();
         let (cmd, join) = spawn(target, sink, ready_tx)?;
         match ready_rx.recv() {
-            Ok(Ok(())) => Ok(Self { cmd, join: Some(join) }),
+            Ok(Ok(())) => Ok(Self {
+                cmd,
+                join: Some(join),
+            }),
             Ok(Err(e)) => Err(e),
             Err(_) => Err(Error::Input("clipboard thread gone".into())),
         }
@@ -90,7 +104,11 @@ struct State {
     quit: bool,
 }
 
-fn spawn(target: Target, sink: ClipboardSink, ready_tx: mpsc::Sender<Result<()>>) -> Result<(Sender<Cmd>, std::thread::JoinHandle<()>)> {
+fn spawn(
+    target: Target,
+    sink: ClipboardSink,
+    ready_tx: mpsc::Sender<Result<()>>,
+) -> Result<(Sender<Cmd>, std::thread::JoinHandle<()>)> {
     let (tx, rx) = channel::channel::<Cmd>();
     let tx2 = tx.clone();
     let join = std::thread::Builder::new()
@@ -104,11 +122,18 @@ fn spawn(target: Target, sink: ClipboardSink, ready_tx: mpsc::Sender<Result<()>>
     Ok((tx, join))
 }
 
-fn run(target: Target, sink: &mut ClipboardSink, cmd_tx: Sender<Cmd>, rx: channel::Channel<Cmd>, ready_tx: mpsc::Sender<Result<()>>) -> Result<()> {
+fn run(
+    target: Target,
+    sink: &mut ClipboardSink,
+    cmd_tx: Sender<Cmd>,
+    rx: channel::Channel<Cmd>,
+    ready_tx: mpsc::Sender<Result<()>>,
+) -> Result<()> {
     let (conn, globals, mut queue) = hypr_wl::init::<State>(&target)?;
     let qh = queue.handle();
-    let manager: ExtDataControlManagerV1 =
-        globals.bind(&qh, 1..=1, ()).map_err(|_| hypr_wl::Error::MissingGlobal("ext_data_control_manager_v1"))?;
+    let manager: ExtDataControlManagerV1 = globals
+        .bind(&qh, 1..=1, ())
+        .map_err(|_| hypr_wl::Error::MissingGlobal("ext_data_control_manager_v1"))?;
     let outputs = Outputs::bind(&globals, &qh)?;
     let seat = Seat::bind(&globals, &qh)?;
 
@@ -182,7 +207,11 @@ impl State {
 
     fn receive_offer(&mut self, off: &ExtDataControlOfferV1) {
         let mimes = self.offers.get(off).cloned().unwrap_or_default();
-        let Some(mime) = TEXT_MIMES.iter().find(|m| mimes.iter().any(|a| a == *m)).map(|m| m.to_string()) else {
+        let Some(mime) = TEXT_MIMES
+            .iter()
+            .find(|m| mimes.iter().any(|a| a == *m))
+            .map(|m| m.to_string())
+        else {
             return; // no text mime offered
         };
         let (read_fd, write_fd) = match pipe() {
@@ -246,23 +275,52 @@ fn read_selection(read_fd: OwnedFd) -> Option<String> {
 }
 
 impl Dispatch<WlRegistry, GlobalListContents> for State {
-    fn event(_: &mut Self, _: &WlRegistry, _: wayland_client::protocol::wl_registry::Event, _: &GlobalListContents, _: &Connection, _: &QueueHandle<Self>) {}
+    fn event(
+        _: &mut Self,
+        _: &WlRegistry,
+        _: wayland_client::protocol::wl_registry::Event,
+        _: &GlobalListContents,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
 }
 
 impl Dispatch<WlSeat, ()> for State {
-    fn event(s: &mut Self, _: &WlSeat, e: wl_seat::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+    fn event(
+        s: &mut Self,
+        _: &WlSeat,
+        e: wl_seat::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
         s.seat.handle(e);
     }
 }
 
 impl Dispatch<wayland_client::protocol::wl_output::WlOutput, ()> for State {
-    fn event(s: &mut Self, o: &wayland_client::protocol::wl_output::WlOutput, e: wayland_client::protocol::wl_output::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+    fn event(
+        s: &mut Self,
+        o: &wayland_client::protocol::wl_output::WlOutput,
+        e: wayland_client::protocol::wl_output::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
         s.outputs.handle(o, e);
     }
 }
 
 impl Dispatch<ExtDataControlDeviceV1, ()> for State {
-    fn event(s: &mut Self, _: &ExtDataControlDeviceV1, e: device::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+    fn event(
+        s: &mut Self,
+        _: &ExtDataControlDeviceV1,
+        e: device::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
         match e {
             device::Event::DataOffer { id } => {
                 s.offers.insert(id, Vec::new());
@@ -289,7 +347,14 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for State {
 }
 
 impl Dispatch<ExtDataControlOfferV1, ()> for State {
-    fn event(s: &mut Self, off: &ExtDataControlOfferV1, e: offer::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+    fn event(
+        s: &mut Self,
+        off: &ExtDataControlOfferV1,
+        e: offer::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
         if let offer::Event::Offer { mime_type } = e {
             s.offers.entry(off.clone()).or_default().push(mime_type);
         }
@@ -297,7 +362,14 @@ impl Dispatch<ExtDataControlOfferV1, ()> for State {
 }
 
 impl Dispatch<ExtDataControlSourceV1, ()> for State {
-    fn event(s: &mut Self, src: &ExtDataControlSourceV1, e: source::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+    fn event(
+        s: &mut Self,
+        src: &ExtDataControlSourceV1,
+        e: source::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
         match e {
             source::Event::Send { mime_type: _, fd } => {
                 if let Some((cur, text)) = &s.our_source {

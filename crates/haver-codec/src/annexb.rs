@@ -14,7 +14,11 @@ pub fn nal_units(data: &[u8]) -> impl Iterator<Item = (u8, &[u8])> {
     let n = starts.len();
     (0..n).filter_map(move |i| {
         let (_, body_start) = starts[i];
-        let end = if i + 1 < n { starts[i + 1].0 } else { data.len() };
+        let end = if i + 1 < n {
+            starts[i + 1].0
+        } else {
+            data.len()
+        };
         let body = &data[body_start..end];
         body.first().map(|h| (h & 0x1F, body))
     })
@@ -80,11 +84,16 @@ mod tests {
 
     #[test]
     fn splits_nal_units() {
-        let stream = [0, 0, 0, 1, 0x67, 1, 2, 0, 0, 1, 0x68, 3, 0, 0, 0, 1, 0x65, 9, 9];
+        let stream = [
+            0, 0, 0, 1, 0x67, 1, 2, 0, 0, 1, 0x68, 3, 0, 0, 0, 1, 0x65, 9, 9,
+        ];
         let units: Vec<(u8, usize)> = nal_units(&stream).map(|(t, b)| (t, b.len())).collect();
         assert_eq!(units, vec![(NAL_SPS, 3), (NAL_PPS, 2), (NAL_IDR, 3)]);
         assert!(contains_idr(&stream));
-        assert_eq!(parameter_sets(&stream), vec![0, 0, 0, 1, 0x67, 1, 2, 0, 0, 0, 1, 0x68, 3]);
+        assert_eq!(
+            parameter_sets(&stream),
+            vec![0, 0, 0, 1, 0x67, 1, 2, 0, 0, 0, 1, 0x68, 3]
+        );
     }
 
     #[test]

@@ -19,7 +19,10 @@ pub struct SingleEncoder {
 
 impl SingleEncoder {
     pub fn new(display: Rc<Display>, settings: EncoderSettings) -> Result<Self> {
-        Ok(Self { enc: H264Encoder::new(display, settings)?, pending_keyframe: false })
+        Ok(Self {
+            enc: H264Encoder::new(display, settings)?,
+            pending_keyframe: false,
+        })
     }
 
     pub fn request_keyframe(&mut self) {
@@ -27,10 +30,17 @@ impl SingleEncoder {
     }
 
     /// Encode one frame; returns (main bytes, keyframe).
-    pub fn encode(&mut self, src: &Yuv444, timestamp: u64, force_keyframe: bool) -> Result<(Vec<u8>, bool)> {
+    pub fn encode(
+        &mut self,
+        src: &Yuv444,
+        timestamp: u64,
+        force_keyframe: bool,
+    ) -> Result<(Vec<u8>, bool)> {
         let force = force_keyframe || std::mem::take(&mut self.pending_keyframe);
         let m = yuv444_to_nv12(src);
-        let p = self.enc.encode_planes(&m.y, m.width, &m.uv, m.width, timestamp, force)?;
+        let p = self
+            .enc
+            .encode_planes(&m.y, m.width, &m.uv, m.width, timestamp, force)?;
         Ok((p.data, p.keyframe))
     }
 }
@@ -44,12 +54,21 @@ pub struct SingleDecoder {
 impl SingleDecoder {
     pub fn new(display: Rc<Display>, width: usize, height: usize) -> Result<Self> {
         let alloc = FrameAllocator::open(&crate::vaapi::render_node(None))?;
-        Ok(Self { dec: H264Decoder::new(display, alloc, 2)?, width, height })
+        Ok(Self {
+            dec: H264Decoder::new(display, alloc, 2)?,
+            width,
+            height,
+        })
     }
 
     /// Decode and return the raw NV12 dmabuf frame (for the GPU display path).
     pub fn decode_frame(&mut self, timestamp: u64, main: &[u8]) -> Result<Option<Arc<Nv12Frame>>> {
-        Ok(self.dec.decode(timestamp, main)?.into_iter().next().map(|f| f.frame))
+        Ok(self
+            .dec
+            .decode(timestamp, main)?
+            .into_iter()
+            .next()
+            .map(|f| f.frame))
     }
 
     pub fn dims(&self) -> (usize, usize) {
@@ -58,7 +77,9 @@ impl SingleDecoder {
 
     pub fn decode(&mut self, timestamp: u64, main: &[u8]) -> Result<Option<Yuv444>> {
         match self.decode_frame(timestamp, main)? {
-            Some(frame) => Ok(Some(nv12_to_yuv444(&frame.read_nv12(self.width, self.height)?))),
+            Some(frame) => Ok(Some(nv12_to_yuv444(
+                &frame.read_nv12(self.width, self.height)?,
+            ))),
             None => Ok(None),
         }
     }

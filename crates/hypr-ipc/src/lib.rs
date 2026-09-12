@@ -58,17 +58,26 @@ impl Instance {
             if !dir.join(".socket.sock").exists() {
                 return Err(Error::UnknownInstance(sig));
             }
-            return Ok(Self { signature: sig, dir });
+            return Ok(Self {
+                signature: sig,
+                dir,
+            });
         }
         let mut candidates: Vec<(std::time::SystemTime, String, PathBuf)> = Vec::new();
-        for entry in std::fs::read_dir(&hypr_dir).map_err(|_| Error::NoInstance(hypr_dir.clone()))? {
+        for entry in
+            std::fs::read_dir(&hypr_dir).map_err(|_| Error::NoInstance(hypr_dir.clone()))?
+        {
             let entry = entry?;
             let dir = entry.path();
             if !dir.join(".socket.sock").exists() {
                 continue;
             }
             let modified = entry.metadata()?.modified()?;
-            candidates.push((modified, entry.file_name().to_string_lossy().into_owned(), dir));
+            candidates.push((
+                modified,
+                entry.file_name().to_string_lossy().into_owned(),
+                dir,
+            ));
         }
         candidates.sort();
         let (_, signature, dir) = candidates.pop().ok_or(Error::NoInstance(hypr_dir))?;
@@ -110,7 +119,10 @@ impl Instance {
         if response.trim() == "ok" {
             Ok(())
         } else {
-            Err(Error::Command { command: command.to_owned(), response: response.trim().to_owned() })
+            Err(Error::Command {
+                command: command.to_owned(),
+                response: response.trim().to_owned(),
+            })
         }
     }
 
@@ -136,8 +148,17 @@ impl Instance {
     }
 
     /// Apply a monitor rule: `name,WxH@hz,position,scale`.
-    pub fn set_monitor_mode(&self, name: &str, width: u32, height: u32, hz: u32, scale: f32) -> Result<()> {
-        self.dispatch(&format!("keyword monitor {name},{width}x{height}@{hz},auto,{scale}"))
+    pub fn set_monitor_mode(
+        &self,
+        name: &str,
+        width: u32,
+        height: u32,
+        hz: u32,
+        scale: f32,
+    ) -> Result<()> {
+        self.dispatch(&format!(
+            "keyword monitor {name},{width}x{height}@{hz},auto,{scale}"
+        ))
     }
 }
 
@@ -220,7 +241,8 @@ mod tests {
         let v: OptionValue =
             serde_json::from_str(r#"{"option": "x", "bool": false, "set": false }"#).unwrap();
         assert_eq!(v.as_bool(), Some(false));
-        let v: OptionValue = serde_json::from_str(r#"{"option": "x", "str": "us", "set": true }"#).unwrap();
+        let v: OptionValue =
+            serde_json::from_str(r#"{"option": "x", "str": "us", "set": true }"#).unwrap();
         assert_eq!(v.string.as_deref(), Some("us"));
     }
 }

@@ -48,33 +48,53 @@ struct SplitProgs {
 
 impl Headless {
     pub fn new(render_node: &Path) -> Result<Self> {
-        let file = std::fs::File::options().read(true).write(true).open(render_node).map_err(|e| Error::Egl(format!("open {}: {e}", render_node.display())))?;
+        let file = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(render_node)
+            .map_err(|e| Error::Egl(format!("open {}: {e}", render_node.display())))?;
         let device = gbm::Device::new(file).map_err(|e| Error::Egl(format!("gbm: {e}")))?;
         let egl = egl::Instance::new(egl::Static);
         use gbm::AsRaw;
         // SAFETY: the gbm device pointer is a valid EGL native display on Mesa.
-        let display = unsafe { egl.get_display(device.as_raw() as *mut c_void) }.ok_or(Error::NoDisplay)?;
-        egl.initialize(display).map_err(|e| Error::Egl(e.to_string()))?;
-        let exts = egl.query_string(Some(display), egl::EXTENSIONS).map_err(|e| Error::Egl(e.to_string()))?;
+        let display =
+            unsafe { egl.get_display(device.as_raw() as *mut c_void) }.ok_or(Error::NoDisplay)?;
+        egl.initialize(display)
+            .map_err(|e| Error::Egl(e.to_string()))?;
+        let exts = egl
+            .query_string(Some(display), egl::EXTENSIONS)
+            .map_err(|e| Error::Egl(e.to_string()))?;
         if !exts.to_string_lossy().contains(DMABUF_IMPORT_EXT) {
             return Err(Error::NoDmabufImport);
         }
-        egl.bind_api(egl::OPENGL_ES_API).map_err(|e| Error::Egl(e.to_string()))?;
-        let has_modifiers = exts.to_string_lossy().contains("EGL_EXT_image_dma_buf_import_modifiers");
+        egl.bind_api(egl::OPENGL_ES_API)
+            .map_err(|e| Error::Egl(e.to_string()))?;
+        let has_modifiers = exts
+            .to_string_lossy()
+            .contains("EGL_EXT_image_dma_buf_import_modifiers");
         // Surfaceless rendering only uses FBOs, so a config is unnecessary:
         // EGL_KHR_no_config_context lets us create a context with no config.
         // SAFETY: EGL_NO_CONFIG_KHR is the documented null config sentinel.
         let no_config = unsafe { egl::Config::from_ptr(std::ptr::null_mut()) };
         let context = egl
-            .create_context(display, no_config, None, &[egl::CONTEXT_MAJOR_VERSION, 3, egl::NONE])
+            .create_context(
+                display,
+                no_config,
+                None,
+                &[egl::CONTEXT_MAJOR_VERSION, 3, egl::NONE],
+            )
             .map_err(|e| Error::Egl(format!("create context: {e}")))?;
         // Surfaceless: requires EGL_KHR_surfaceless_context (standard on Mesa).
-        egl.make_current(display, None, None, Some(context)).map_err(|e| Error::Egl(format!("make current: {e}")))?;
+        egl.make_current(display, None, None, Some(context))
+            .map_err(|e| Error::Egl(format!("make current: {e}")))?;
 
         let name = CString::new("glEGLImageTargetTexture2DOES").unwrap();
-        let raw = egl.get_proc_address(name.to_str().unwrap()).ok_or_else(|| Error::Gl("glEGLImageTargetTexture2DOES missing".into()))?;
+        let raw = egl
+            .get_proc_address(name.to_str().unwrap())
+            .ok_or_else(|| Error::Gl("glEGLImageTargetTexture2DOES missing".into()))?;
         // SAFETY: signature (GLenum target, GLeglImageOES image).
-        let image_target: ImageTargetTexture2D = unsafe { std::mem::transmute::<extern "system" fn(), ImageTargetTexture2D>(raw) };
+        let image_target: ImageTargetTexture2D =
+            unsafe { std::mem::transmute::<extern "system" fn(), ImageTargetTexture2D>(raw) };
         // SAFETY: get_proc_address gives valid GL entry points for this context.
         let gl = unsafe {
             glow::Context::from_loader_function(|s| match egl.get_proc_address(s) {
@@ -82,7 +102,16 @@ impl Headless {
                 None => std::ptr::null(),
             })
         };
-        Ok(Self { egl, display, context, gl, image_target, has_modifiers, split: None, _device: device })
+        Ok(Self {
+            egl,
+            display,
+            context,
+            gl,
+            image_target,
+            has_modifiers,
+            split: None,
+            _device: device,
+        })
     }
 
     fn ensure_split(&mut self) -> Result<()> {
@@ -92,10 +121,22 @@ impl Headless {
         // SAFETY: compile the split programs and a vao on the current context.
         let progs = unsafe {
             SplitProgs {
-                main_y: crate::build_program(&self.gl, crate::VERT, &format!("{HEAD}{FRAG_MAIN_Y}"))?,
-                main_uv: crate::build_program(&self.gl, crate::VERT, &format!("{HEAD}{FRAG_MAIN_UV}"))?,
+                main_y: crate::build_program(
+                    &self.gl,
+                    crate::VERT,
+                    &format!("{HEAD}{FRAG_MAIN_Y}"),
+                )?,
+                main_uv: crate::build_program(
+                    &self.gl,
+                    crate::VERT,
+                    &format!("{HEAD}{FRAG_MAIN_UV}"),
+                )?,
                 aux_y: crate::build_program(&self.gl, crate::VERT, &format!("{HEAD}{FRAG_AUX_Y}"))?,
-                aux_uv: crate::build_program(&self.gl, crate::VERT, &format!("{HEAD}{FRAG_AUX_UV}"))?,
+                aux_uv: crate::build_program(
+                    &self.gl,
+                    crate::VERT,
+                    &format!("{HEAD}{FRAG_AUX_UV}"),
+                )?,
                 vao: self.gl.create_vertex_array().map_err(Error::Gl)?,
                 src_tex: crate::new_texture(&self.gl)?,
             }
@@ -133,50 +174,57 @@ impl Headless {
                 self.gl.bind_vertex_array(Some(progs.vao));
             }
             // Render each output plane into its dmabuf.
-            let mut pass = |prog: glow::Program, plane: &DmabufPlane, pw: u32, ph: u32| -> Result<()> {
-                let image = self.import(plane)?;
-                images.push(image);
-                // SAFETY: attach the plane image to an FBO and draw the pass.
-                unsafe {
-                    let tex = crate::new_texture(&self.gl)?;
-                    self.gl.bind_texture(GL_TEXTURE_2D, Some(tex));
-                    (self.image_target)(GL_TEXTURE_2D, images.last().unwrap().as_ptr());
-                    let fbo = self.gl.create_framebuffer().map_err(Error::Gl)?;
-                    self.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
-                    self.gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, GL_TEXTURE_2D, Some(tex), 0);
-                    let status = self.gl.check_framebuffer_status(glow::FRAMEBUFFER);
-                    if status != glow::FRAMEBUFFER_COMPLETE {
+            let mut pass =
+                |prog: glow::Program, plane: &DmabufPlane, pw: u32, ph: u32| -> Result<()> {
+                    let image = self.import(plane)?;
+                    images.push(image);
+                    // SAFETY: attach the plane image to an FBO and draw the pass.
+                    unsafe {
+                        let tex = crate::new_texture(&self.gl)?;
+                        self.gl.bind_texture(GL_TEXTURE_2D, Some(tex));
+                        (self.image_target)(GL_TEXTURE_2D, images.last().unwrap().as_ptr());
+                        let fbo = self.gl.create_framebuffer().map_err(Error::Gl)?;
+                        self.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+                        self.gl.framebuffer_texture_2d(
+                            glow::FRAMEBUFFER,
+                            glow::COLOR_ATTACHMENT0,
+                            GL_TEXTURE_2D,
+                            Some(tex),
+                            0,
+                        );
+                        let status = self.gl.check_framebuffer_status(glow::FRAMEBUFFER);
+                        if status != glow::FRAMEBUFFER_COMPLETE {
+                            self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+                            self.gl.delete_framebuffer(fbo);
+                            self.gl.delete_texture(tex);
+                            return Err(Error::Gl(format!("split fbo incomplete: {status:#x}")));
+                        }
+                        self.gl.viewport(0, 0, pw as i32, ph as i32);
+                        self.gl.use_program(Some(prog));
+                        self.gl.active_texture(glow::TEXTURE0);
+                        self.gl.bind_texture(GL_TEXTURE_2D, Some(progs.src_tex));
+                        if let Some(l) = self.gl.get_uniform_location(prog, "src") {
+                            self.gl.uniform_1_i32(Some(&l), 0);
+                        }
+                        if let Some(l) = self.gl.get_uniform_location(prog, "tex_w") {
+                            self.gl.uniform_1_i32(Some(&l), width as i32);
+                        }
+                        if let Some(l) = self.gl.get_uniform_location(prog, "tex_h") {
+                            self.gl.uniform_1_i32(Some(&l), height as i32);
+                        }
+                        if let Some(l) = self.gl.get_uniform_location(prog, "out_w") {
+                            self.gl.uniform_1_i32(Some(&l), pw as i32);
+                        }
+                        if let Some(l) = self.gl.get_uniform_location(prog, "out_h") {
+                            self.gl.uniform_1_i32(Some(&l), ph as i32);
+                        }
+                        self.gl.draw_arrays(glow::TRIANGLES, 0, 3);
                         self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
                         self.gl.delete_framebuffer(fbo);
                         self.gl.delete_texture(tex);
-                        return Err(Error::Gl(format!("split fbo incomplete: {status:#x}")));
                     }
-                    self.gl.viewport(0, 0, pw as i32, ph as i32);
-                    self.gl.use_program(Some(prog));
-                    self.gl.active_texture(glow::TEXTURE0);
-                    self.gl.bind_texture(GL_TEXTURE_2D, Some(progs.src_tex));
-                    if let Some(l) = self.gl.get_uniform_location(prog, "src") {
-                        self.gl.uniform_1_i32(Some(&l), 0);
-                    }
-                    if let Some(l) = self.gl.get_uniform_location(prog, "tex_w") {
-                        self.gl.uniform_1_i32(Some(&l), width as i32);
-                    }
-                    if let Some(l) = self.gl.get_uniform_location(prog, "tex_h") {
-                        self.gl.uniform_1_i32(Some(&l), height as i32);
-                    }
-                    if let Some(l) = self.gl.get_uniform_location(prog, "out_w") {
-                        self.gl.uniform_1_i32(Some(&l), pw as i32);
-                    }
-                    if let Some(l) = self.gl.get_uniform_location(prog, "out_h") {
-                        self.gl.uniform_1_i32(Some(&l), ph as i32);
-                    }
-                    self.gl.draw_arrays(glow::TRIANGLES, 0, 3);
-                    self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-                    self.gl.delete_framebuffer(fbo);
-                    self.gl.delete_texture(tex);
-                }
-                Ok(())
-            };
+                    Ok(())
+                };
             pass(progs.main_y, main_y, width, height)?;
             pass(progs.main_uv, main_uv, width / 2, height / 2)?;
             pass(progs.aux_y, aux_y, width, height)?;
@@ -197,11 +245,14 @@ impl Headless {
 
     /// Make this context current (call before any GL work on this thread).
     pub fn make_current(&self) -> Result<()> {
-        self.egl.make_current(self.display, None, None, Some(self.context)).map_err(|e| Error::Egl(e.to_string()))
+        self.egl
+            .make_current(self.display, None, None, Some(self.context))
+            .map_err(|e| Error::Egl(e.to_string()))
     }
 
     fn import(&self, p: &DmabufPlane) -> Result<egl::Image> {
         use std::os::fd::AsRawFd;
+        #[rustfmt::skip]
         let mut attribs: Vec<egl::Attrib> = vec![
             EGL_WIDTH, p.width as egl::Attrib,
             EGL_HEIGHT, p.height as egl::Attrib,
@@ -220,8 +271,15 @@ impl Headless {
         }
         attribs.push(egl::ATTRIB_NONE);
         // SAFETY: standard EGL_LINUX_DMABUF_EXT import args; NONE-terminated.
-        let (ctx, buffer) = unsafe { (egl::Context::from_ptr(egl::NO_CONTEXT), egl::ClientBuffer::from_ptr(std::ptr::null_mut())) };
-        self.egl.create_image(self.display, ctx, EGL_LINUX_DMABUF_EXT, buffer, &attribs).map_err(|e| Error::Egl(format!("import ({:?}): {e}", p.fourcc)))
+        let (ctx, buffer) = unsafe {
+            (
+                egl::Context::from_ptr(egl::NO_CONTEXT),
+                egl::ClientBuffer::from_ptr(std::ptr::null_mut()),
+            )
+        };
+        self.egl
+            .create_image(self.display, ctx, EGL_LINUX_DMABUF_EXT, buffer, &attribs)
+            .map_err(|e| Error::Egl(format!("import ({:?}): {e}", p.fourcc)))
     }
 
     /// Feasibility check: import `plane` as a render target, clear it to a known
@@ -237,10 +295,17 @@ impl Headless {
             (self.image_target)(GL_TEXTURE_2D, image.as_ptr());
             let fbo = self.gl.create_framebuffer().map_err(Error::Gl)?;
             self.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
-            self.gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, GL_TEXTURE_2D, Some(tex), 0);
+            self.gl.framebuffer_texture_2d(
+                glow::FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                GL_TEXTURE_2D,
+                Some(tex),
+                0,
+            );
             let status = self.gl.check_framebuffer_status(glow::FRAMEBUFFER);
             let r = if status == glow::FRAMEBUFFER_COMPLETE {
-                self.gl.viewport(0, 0, plane.width as i32, plane.height as i32);
+                self.gl
+                    .viewport(0, 0, plane.width as i32, plane.height as i32);
                 self.gl.clear_color(red, 0.0, 0.0, 1.0);
                 self.gl.clear(glow::COLOR_BUFFER_BIT);
                 self.gl.finish();

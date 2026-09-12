@@ -29,13 +29,25 @@ pub struct GlDualEncoder {
 }
 
 impl GlDualEncoder {
-    pub fn new(display: Rc<Display>, render_node: &Path, settings: EncoderSettings) -> Result<Self> {
-        let headless = Headless::new(render_node).map_err(|e| Error::Encode(format!("headless GL: {e}")))?;
+    pub fn new(
+        display: Rc<Display>,
+        render_node: &Path,
+        settings: EncoderSettings,
+    ) -> Result<Self> {
+        let headless =
+            Headless::new(render_node).map_err(|e| Error::Encode(format!("headless GL: {e}")))?;
         let width = settings.width;
         let height = settings.height;
         let main = H264Encoder::new(display.clone(), settings.clone())?;
         let aux = H264Encoder::new(display, settings)?;
-        Ok(Self { headless, main, aux, width, height, pending_keyframe: false })
+        Ok(Self {
+            headless,
+            main,
+            aux,
+            width,
+            height,
+            pending_keyframe: false,
+        })
     }
 
     pub fn main_extradata(&self) -> &[u8] {
@@ -51,7 +63,12 @@ impl GlDualEncoder {
     }
 
     /// Encode one captured BGRA/BGRX frame, splitting 4:4:4 on the GPU.
-    pub fn encode(&mut self, input: &DmabufPlane, timestamp: u64, force_keyframe: bool) -> Result<DualPacket> {
+    pub fn encode(
+        &mut self,
+        input: &DmabufPlane,
+        timestamp: u64,
+        force_keyframe: bool,
+    ) -> Result<DualPacket> {
         let force = force_keyframe || std::mem::take(&mut self.pending_keyframe);
         let (w, h) = (self.width, self.height);
 
@@ -62,8 +79,12 @@ impl GlDualEncoder {
             use std::borrow::Borrow;
             let main_surf: &cros_codecs::libva::Surface<()> = main_handle.borrow();
             let aux_surf: &cros_codecs::libva::Surface<()> = aux_handle.borrow();
-            let main_desc = main_surf.export_prime().map_err(|e| Error::Encode(format!("export main: {e}")))?;
-            let aux_desc = aux_surf.export_prime().map_err(|e| Error::Encode(format!("export aux: {e}")))?;
+            let main_desc = main_surf
+                .export_prime()
+                .map_err(|e| Error::Encode(format!("export main: {e}")))?;
+            let aux_desc = aux_surf
+                .export_prime()
+                .map_err(|e| Error::Encode(format!("export aux: {e}")))?;
             let (my, muv) = nv12_planes(&main_desc);
             let (ay, auv) = nv12_planes(&aux_desc);
             self.headless
@@ -75,7 +96,12 @@ impl GlDualEncoder {
 
         let mp = self.main.encode_surface(main_handle, timestamp, force)?;
         let ap = self.aux.encode_surface(aux_handle, timestamp, force)?;
-        Ok(DualPacket { timestamp, keyframe: mp.keyframe, main: mp.data, aux: ap.data })
+        Ok(DualPacket {
+            timestamp,
+            keyframe: mp.keyframe,
+            main: mp.data,
+            aux: ap.data,
+        })
     }
 }
 

@@ -45,7 +45,10 @@ pub struct Framed<S> {
 
 impl<S> Framed<S> {
     pub fn new(stream: S) -> Self {
-        Self { stream, read_buf: BytesMut::with_capacity(64 * 1024) }
+        Self {
+            stream,
+            read_buf: BytesMut::with_capacity(64 * 1024),
+        }
     }
 
     pub fn into_inner(self) -> S {
@@ -62,7 +65,11 @@ impl<S: AsyncWrite + Unpin> Framed<S> {
     /// Write a message then the given payload slices, all in order. Uses
     /// `write_vectored` so a large encoder payload is not copied into a
     /// staging buffer first.
-    pub async fn write_msg_with_payloads<M: Serialize>(&mut self, msg: &M, payloads: &[&[u8]]) -> Result<()> {
+    pub async fn write_msg_with_payloads<M: Serialize>(
+        &mut self,
+        msg: &M,
+        payloads: &[&[u8]],
+    ) -> Result<()> {
         let body = postcard::to_stdvec(msg)?;
         let len = (body.len() as u32).to_le_bytes();
         let mut parts: Vec<&[u8]> = Vec::with_capacity(2 + payloads.len());
@@ -102,7 +109,8 @@ impl<S: AsyncRead + Unpin> Framed<S> {
 
     async fn read_exact_bytes(&mut self, n: usize) -> Result<BytesMut> {
         while self.read_buf.len() < n {
-            self.read_buf.reserve((n - self.read_buf.len()).max(32 * 1024));
+            self.read_buf
+                .reserve((n - self.read_buf.len()).max(32 * 1024));
             if self.stream.read_buf(&mut self.read_buf).await? == 0 {
                 return Err(Error::Closed);
             }
@@ -141,21 +149,32 @@ async fn write_all_vectored<S: AsyncWrite + Unpin>(stream: &mut S, parts: &[&[u8
 #[cfg(test)]
 mod tests {
     use super::*;
-    use haver_proto::{ClientMsg, ClientCaps, Codec, ChromaMode};
+    use haver_proto::{ChromaMode, ClientCaps, ClientMsg, Codec};
 
     #[tokio::test]
     async fn round_trips_message_and_payload() {
         let (a, b) = tokio::io::duplex(4096);
         let mut wr = Framed::new(a);
         let mut rd = Framed::new(b);
-        let msg = ClientMsg::Hello { version: 1, keymap: "k".into(), caps: ClientCaps { codecs: vec![Codec::H264], max_width: 1920, max_height: 1080, chroma: vec![ChromaMode::Dual420] } };
+        let msg = ClientMsg::Hello {
+            version: 1,
+            keymap: "k".into(),
+            caps: ClientCaps {
+                codecs: vec![Codec::H264],
+                max_width: 1920,
+                max_height: 1080,
+                chroma: vec![ChromaMode::Dual420],
+            },
+        };
         let payload = vec![7u8; 5000];
         let p2 = vec![9u8; 100];
         let m2 = msg.clone();
         let payload2 = payload.clone();
         let p2b = p2.clone();
         let task = tokio::spawn(async move {
-            wr.write_msg_with_payloads(&m2, &[&payload2, &p2b]).await.unwrap();
+            wr.write_msg_with_payloads(&m2, &[&payload2, &p2b])
+                .await
+                .unwrap();
         });
         let got: ClientMsg = rd.read_msg().await.unwrap();
         assert_eq!(got, msg);

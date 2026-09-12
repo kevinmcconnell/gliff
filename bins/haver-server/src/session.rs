@@ -15,7 +15,8 @@ use haver_codec::h264::EncoderSettings;
 use haver_codec::libva::Display;
 use haver_codec::Encoder;
 use haver_proto::{
-    ChromaMode, ClientCaps, ClientMsg, Codec, OutputInfo as ProtoOutput, Rect, ServerMsg, SessionInfo, PROTOCOL_VERSION,
+    ChromaMode, ClientCaps, ClientMsg, Codec, OutputInfo as ProtoOutput, Rect, ServerMsg,
+    SessionInfo, PROTOCOL_VERSION,
 };
 use haver_transport::Framed;
 use hypr_capture::{BgraImage, CaptureConfig, CaptureEvent, Capturer};
@@ -35,14 +36,27 @@ const TEXT_MIME: &str = "text/plain;charset=utf-8";
 /// Events from the capture thread.
 enum Incoming {
     Frame(BgraImage),
-    Cursor { width: u32, height: u32, hot_x: i32, hot_y: i32, argb: Vec<u8> },
-    CursorPos { x: f64, y: f64, visible: bool },
+    Cursor {
+        width: u32,
+        height: u32,
+        hot_x: i32,
+        hot_y: i32,
+        argb: Vec<u8>,
+    },
+    CursorPos {
+        x: f64,
+        y: f64,
+        visible: bool,
+    },
     Stopped,
     Error(String),
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 pub async fn run<R, W>(rd: R, wr: W, cfg: Config) -> Result<()>
@@ -68,8 +82,16 @@ where
     writer
         .write_msg(&ServerMsg::HelloAck {
             version: PROTOCOL_VERSION,
-            session: SessionInfo { headless: output.is_headless(), output: output.name.clone() },
-            outputs: vec![ProtoOutput { name: output.name.clone(), width: output.width, height: output.height, scale_milli: 1000 }],
+            session: SessionInfo {
+                headless: output.is_headless(),
+                output: output.name.clone(),
+            },
+            outputs: vec![ProtoOutput {
+                name: output.name.clone(),
+                width: output.width,
+                height: output.height,
+                scale_milli: 1000,
+            }],
         })
         .await?;
     send_stream_config(&mut writer, codec, chroma, output.width, output.height).await?;
@@ -78,18 +100,27 @@ where
     let capturer = start_capture(&cfg.target, &output.name, &cfg.render_node, cap_tx)?;
 
     let input = start_input(&cfg.target, &output.name, &keymap)?;
-    input.send(InputCmd::SetExtent { width: output.width, height: output.height }).ok();
+    input
+        .send(InputCmd::SetExtent {
+            width: output.width,
+            height: output.height,
+        })
+        .ok();
 
     let (clip_out_tx, mut clip_out_rx) = mpsc::unbounded_channel::<String>();
-    let clipboard = Clipboard::start(cfg.target.clone(), Box::new(move |ClipboardEvent::Text(t)| {
-        let _ = clip_out_tx.send(t);
-    }))
+    let clipboard = Clipboard::start(
+        cfg.target.clone(),
+        Box::new(move |ClipboardEvent::Text(t)| {
+            let _ = clip_out_tx.send(t);
+        }),
+    )
     .map_err(|e| tracing::warn!(error = %e, "clipboard bridge unavailable"))
     .ok();
 
     let display = haver_codec::vaapi::open_display(&cfg.render_node).context("open VA display")?;
     let settings = encoder_settings(output.width, output.height, cfg.bitrate);
-    let encoder = Encoder::new(display.clone(), settings.clone(), chroma).context("create encoder")?;
+    let encoder =
+        Encoder::new(display.clone(), settings.clone(), chroma).context("create encoder")?;
 
     let (mut msg_rx, mut clip_in_rx) = spawn_reader(reader);
 
@@ -152,15 +183,27 @@ where
 }
 
 /// Read the client's Hello and check its protocol version.
-async fn handshake<R, W>(reader: &mut Framed<R>, writer: &mut Framed<W>) -> Result<(String, ClientCaps)>
+async fn handshake<R, W>(
+    reader: &mut Framed<R>,
+    writer: &mut Framed<W>,
+) -> Result<(String, ClientCaps)>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     match reader.read_msg::<ClientMsg>().await.context("read Hello")? {
-        ClientMsg::Hello { version, keymap, caps } => {
+        ClientMsg::Hello {
+            version,
+            keymap,
+            caps,
+        } => {
             if version != PROTOCOL_VERSION {
-                writer.write_msg(&ServerMsg::Error { code: 1, message: format!("version {version} unsupported") }).await?;
+                writer
+                    .write_msg(&ServerMsg::Error {
+                        code: 1,
+                        message: format!("version {version} unsupported"),
+                    })
+                    .await?;
                 anyhow::bail!("client version {version} != {PROTOCOL_VERSION}");
             }
             Ok((keymap, caps))
@@ -172,7 +215,9 @@ where
 /// Drain the socket on its own task so a burst of input (a mouse drag) can
 /// never starve frame capture and a blocked write can never block reads.
 /// Clipboard payloads are consumed inline and delivered as text.
-fn spawn_reader<R>(mut reader: Framed<R>) -> (UnboundedReceiver<ClientMsg>, UnboundedReceiver<String>)
+fn spawn_reader<R>(
+    mut reader: Framed<R>,
+) -> (UnboundedReceiver<ClientMsg>, UnboundedReceiver<String>)
 where
     R: AsyncRead + Unpin + 'static,
 {
@@ -181,14 +226,16 @@ where
     tokio::task::spawn_local(async move {
         loop {
             match reader.read_msg::<ClientMsg>().await {
-                Ok(ClientMsg::ClipboardData { data_len, .. }) => match reader.read_payload(data_len).await {
-                    Ok(bytes) => {
-                        if let Ok(text) = String::from_utf8(bytes.to_vec()) {
-                            let _ = clip_tx.send(text);
+                Ok(ClientMsg::ClipboardData { data_len, .. }) => {
+                    match reader.read_payload(data_len).await {
+                        Ok(bytes) => {
+                            if let Ok(text) = String::from_utf8(bytes.to_vec()) {
+                                let _ = clip_tx.send(text);
+                            }
                         }
+                        Err(_) => break,
                     }
-                    Err(_) => break,
-                },
+                }
                 Ok(msg) => {
                     if msg_tx.send(msg).is_err() {
                         break;
@@ -230,27 +277,54 @@ impl<W: AsyncWrite + Unpin> Session<W> {
     async fn on_client_msg(&mut self, msg: ClientMsg) -> Result<ControlFlow<()>> {
         match msg {
             ClientMsg::Bye => return Ok(ControlFlow::Break(())),
-            ClientMsg::FrameAck { frame_id, decoded_at_ms } => {
+            ClientMsg::FrameAck {
+                frame_id,
+                decoded_at_ms,
+            } => {
                 self.in_flight = self.in_flight.saturating_sub(1);
                 self.rtt.record(frame_id, decoded_at_ms);
                 self.n_limit = self.rtt.window(self.settings.framerate);
             }
             ClientMsg::RequestKeyframe => self.want_keyframe = true,
-            ClientMsg::Key { keycode, pressed } => self.inject(InputCmd::Key { code: keycode, pressed }),
+            ClientMsg::Key { keycode, pressed } => self.inject(InputCmd::Key {
+                code: keycode,
+                pressed,
+            }),
             ClientMsg::PointerMotion { x, y } => self.inject(InputCmd::Motion { x, y }),
-            ClientMsg::PointerButton { button, pressed } => self.inject(InputCmd::Button { button, pressed }),
-            ClientMsg::PointerAxis { axis, value, discrete, stop } => {
+            ClientMsg::PointerButton { button, pressed } => {
+                self.inject(InputCmd::Button { button, pressed })
+            }
+            ClientMsg::PointerAxis {
+                axis,
+                value,
+                discrete,
+                stop,
+            } => {
                 let axis = match axis {
                     haver_proto::Axis::Vertical => InAxis::Vertical,
                     haver_proto::Axis::Horizontal => InAxis::Horizontal,
                 };
-                self.inject(InputCmd::Axis { axis, value, discrete, stop })
+                self.inject(InputCmd::Axis {
+                    axis,
+                    value,
+                    discrete,
+                    stop,
+                })
             }
             ClientMsg::Resize { width, height, .. } => self.resize(width, height).await?,
-            ClientMsg::Ping { t } => self.writer.write_msg(&ServerMsg::Pong { t, server_now_ms: now_ms() }).await?,
+            ClientMsg::Ping { t } => {
+                self.writer
+                    .write_msg(&ServerMsg::Pong {
+                        t,
+                        server_now_ms: now_ms(),
+                    })
+                    .await?
+            }
             // ClipboardData is consumed by the reader task; the offer/request
             // negotiation is not used for text.
-            ClientMsg::ClipboardData { .. } | ClientMsg::ClipboardOffer { .. } | ClientMsg::ClipboardRequest { .. } => {}
+            ClientMsg::ClipboardData { .. }
+            | ClientMsg::ClipboardOffer { .. }
+            | ClientMsg::ClipboardRequest { .. } => {}
             ClientMsg::Hello { .. } => anyhow::bail!("unexpected second Hello"),
         }
         Ok(ControlFlow::Continue(()))
@@ -266,15 +340,22 @@ impl<W: AsyncWrite + Unpin> Session<W> {
     async fn resize(&mut self, width: u32, height: u32) -> Result<()> {
         let width = width.min(self.caps.max_width) & !1;
         let height = height.min(self.caps.max_height) & !1;
-        if !self.output.is_headless() || width < 320 || height < 240 || (width, height) == (self.output.width, self.output.height) {
+        if !self.output.is_headless()
+            || width < 320
+            || height < 240
+            || (width, height) == (self.output.width, self.output.height)
+        {
             return Ok(());
         }
         tracing::info!(width, height, "resizing headless output");
-        self.instance.set_monitor_mode(&self.output.name, width, height, 60, 1.0).ok();
+        self.instance
+            .set_monitor_mode(&self.output.name, width, height, 60, 1.0)
+            .ok();
         self.output.width = width;
         self.output.height = height;
         self.settings = encoder_settings(width, height, self.bitrate);
-        self.encoder = Encoder::new(self.display.clone(), self.settings.clone(), self.chroma).context("reconfigure encoder")?;
+        self.encoder = Encoder::new(self.display.clone(), self.settings.clone(), self.chroma)
+            .context("reconfigure encoder")?;
         self.inject(InputCmd::SetExtent { width, height });
         self.pending = None;
         self.want_keyframe = true;
@@ -284,7 +365,12 @@ impl<W: AsyncWrite + Unpin> Session<W> {
     async fn send_clipboard(&mut self, text: String) -> Result<()> {
         let bytes = text.into_bytes();
         let total = bytes.len() as u64;
-        let msg = ServerMsg::ClipboardData { mime_type: TEXT_MIME.into(), offset: 0, total, data_len: bytes.len() as u32 };
+        let msg = ServerMsg::ClipboardData {
+            mime_type: TEXT_MIME.into(),
+            offset: 0,
+            total,
+            data_len: bytes.len() as u32,
+        };
         Ok(self.writer.write_msg_with_payloads(&msg, &[&bytes]).await?)
     }
 
@@ -294,13 +380,33 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                 self.pending = Some(image);
                 self.capture_asked = false;
             }
-            Some(Incoming::Cursor { width, height, hot_x, hot_y, argb }) => {
+            Some(Incoming::Cursor {
+                width,
+                height,
+                hot_x,
+                hot_y,
+                argb,
+            }) => {
                 self.cursor_shape_id += 1;
-                let msg = ServerMsg::CursorShape { id: self.cursor_shape_id, width, height, hot_x, hot_y, argb_len: argb.len() as u32 };
+                let msg = ServerMsg::CursorShape {
+                    id: self.cursor_shape_id,
+                    width,
+                    height,
+                    hot_x,
+                    hot_y,
+                    argb_len: argb.len() as u32,
+                };
                 self.writer.write_msg_with_payloads(&msg, &[&argb]).await?;
             }
             Some(Incoming::CursorPos { x, y, visible }) => {
-                self.writer.write_msg(&ServerMsg::CursorPos { x, y, shape_id: self.cursor_shape_id, visible }).await?;
+                self.writer
+                    .write_msg(&ServerMsg::CursorPos {
+                        x,
+                        y,
+                        shape_id: self.cursor_shape_id,
+                        visible,
+                    })
+                    .await?;
             }
             Some(Incoming::Stopped) => {
                 tracing::warn!("capture stopped");
@@ -321,7 +427,9 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         if self.in_flight < self.n_limit {
             if let Some(image) = self.pending.take() {
                 // A frame captured before a resize took effect is stale.
-                if (image.width, image.height) == (self.output.width as usize, self.output.height as usize) {
+                if (image.width, image.height)
+                    == (self.output.width as usize, self.output.height as usize)
+                {
                     self.encode_and_send(&image).await?;
                 }
             }
@@ -345,11 +453,18 @@ impl<W: AsyncWrite + Unpin> Session<W> {
             frame_id: self.frame_id,
             pts_us: now_ms() * 1000,
             keyframe: encoded.keyframe,
-            damage: vec![Rect { x: 0, y: 0, width: width as i32, height: height as i32 }],
+            damage: vec![Rect {
+                x: 0,
+                y: 0,
+                width: width as i32,
+                height: height as i32,
+            }],
             data_len: encoded.main.len() as u32,
             aux_len: aux.len() as u32,
         };
-        self.writer.write_msg_with_payloads(&msg, &[&encoded.main, &aux]).await?;
+        self.writer
+            .write_msg_with_payloads(&msg, &[&encoded.main, &aux])
+            .await?;
         tracing::debug!(
             frame_id = self.frame_id,
             key = encoded.keyframe,
@@ -390,9 +505,22 @@ impl Drop for SessionOutput {
     }
 }
 
-async fn send_stream_config<W: AsyncWrite + Unpin>(writer: &mut Framed<W>, codec: Codec, chroma: ChromaMode, width: u32, height: u32) -> Result<()> {
+async fn send_stream_config<W: AsyncWrite + Unpin>(
+    writer: &mut Framed<W>,
+    codec: Codec,
+    chroma: ChromaMode,
+    width: u32,
+    height: u32,
+) -> Result<()> {
     // Parameter sets ride in-band on every keyframe, so extradata is empty.
-    let msg = ServerMsg::StreamConfig { codec, chroma, width, height, extradata: Vec::new(), aux_extradata: None };
+    let msg = ServerMsg::StreamConfig {
+        codec,
+        chroma,
+        width,
+        height,
+        extradata: Vec::new(),
+        aux_extradata: None,
+    };
     Ok(writer.write_msg(&msg).await?)
 }
 
@@ -407,25 +535,50 @@ fn encoder_settings(width: u32, height: u32, bitrate: Option<u32>) -> EncoderSet
 }
 
 /// Pick the named output, or create a headless one sized to the client.
-fn setup_output(instance: &hypr_ipc::Instance, cfg: &Config, caps: &ClientCaps) -> Result<SessionOutput> {
+fn setup_output(
+    instance: &hypr_ipc::Instance,
+    cfg: &Config,
+    caps: &ClientCaps,
+) -> Result<SessionOutput> {
     if let Some(name) = &cfg.output {
         let mons = instance.monitors()?;
-        let m = if name == "auto" { main_monitor(&mons) } else { mons.iter().find(|m| &m.name == name) }
-            .with_context(|| format!("no output {name}"))?;
-        return Ok(SessionOutput { name: m.name.clone(), width: m.width & !1, height: m.height & !1, headless: None });
+        let m = if name == "auto" {
+            main_monitor(&mons)
+        } else {
+            mons.iter().find(|m| &m.name == name)
+        }
+        .with_context(|| format!("no output {name}"))?;
+        return Ok(SessionOutput {
+            name: m.name.clone(),
+            width: m.width & !1,
+            height: m.height & !1,
+            headless: None,
+        });
     }
     let before: Vec<String> = instance.monitors()?.into_iter().map(|m| m.name).collect();
     let requested = format!("haver-{}", std::process::id());
-    instance.create_headless_output(&requested).context("create headless output")?;
+    instance
+        .create_headless_output(&requested)
+        .context("create headless output")?;
     // Hyprland names the output itself, so find the one that appeared.
-    let mut output = SessionOutput { name: requested, width: 0, height: 0, headless: Some(instance.clone()) };
+    let mut output = SessionOutput {
+        name: requested,
+        width: 0,
+        height: 0,
+        headless: Some(instance.clone()),
+    };
     std::thread::sleep(Duration::from_millis(200));
     let after = instance.monitors()?;
-    let m = after.iter().find(|m| !before.contains(&m.name)).context("headless output did not appear")?;
+    let m = after
+        .iter()
+        .find(|m| !before.contains(&m.name))
+        .context("headless output did not appear")?;
     output.name = m.name.clone();
     output.width = caps.max_width.clamp(320, 1920) & !1;
     output.height = caps.max_height.clamp(240, 1080) & !1;
-    instance.set_monitor_mode(&output.name, output.width, output.height, 60, 1.0).ok();
+    instance
+        .set_monitor_mode(&output.name, output.width, output.height, 60, 1.0)
+        .ok();
     std::thread::sleep(Duration::from_millis(150));
     Ok(output)
 }
@@ -434,10 +587,17 @@ fn setup_output(instance: &hypr_ipc::Instance, cfg: &Config, caps: &ClientCaps) 
 /// the leftmost enabled one.
 fn main_monitor(mons: &[hypr_ipc::Monitor]) -> Option<&hypr_ipc::Monitor> {
     let enabled = || mons.iter().filter(|m| !m.disabled);
-    enabled().find(|m| m.focused).or_else(|| enabled().min_by_key(|m| (m.x, m.y)))
+    enabled()
+        .find(|m| m.focused)
+        .or_else(|| enabled().min_by_key(|m| (m.x, m.y)))
 }
 
-fn start_capture(target: &Target, output: &str, render_node: &std::path::Path, tx: UnboundedSender<Incoming>) -> Result<Capturer> {
+fn start_capture(
+    target: &Target,
+    output: &str,
+    render_node: &std::path::Path,
+    tx: UnboundedSender<Incoming>,
+) -> Result<Capturer> {
     let mut cc = CaptureConfig::new(output.to_string());
     cc.target = target.clone();
     cc.render_node = render_node.to_path_buf();
@@ -448,8 +608,24 @@ fn start_capture(target: &Target, output: &str, render_node: &std::path::Path, t
                 Ok(image) => Incoming::Frame(image),
                 Err(e) => Incoming::Error(e.to_string()),
             },
-            CaptureEvent::CursorShape { width, height, hot_x, hot_y, argb } => Incoming::Cursor { width, height, hot_x, hot_y, argb },
-            CaptureEvent::CursorPos { x, y, visible } => Incoming::CursorPos { x: x as f64, y: y as f64, visible },
+            CaptureEvent::CursorShape {
+                width,
+                height,
+                hot_x,
+                hot_y,
+                argb,
+            } => Incoming::Cursor {
+                width,
+                height,
+                hot_x,
+                hot_y,
+                argb,
+            },
+            CaptureEvent::CursorPos { x, y, visible } => Incoming::CursorPos {
+                x: x as f64,
+                y: y as f64,
+                visible,
+            },
             CaptureEvent::Stopped => Incoming::Stopped,
             CaptureEvent::Error(e) => Incoming::Error(e),
             CaptureEvent::Ready { .. } => return,
@@ -474,7 +650,10 @@ struct RttEstimator {
 
 impl RttEstimator {
     fn new() -> Self {
-        Self { sent: VecDeque::new(), smoothed_ms: 30.0 }
+        Self {
+            sent: VecDeque::new(),
+            smoothed_ms: 30.0,
+        }
     }
 
     fn on_sent(&mut self, frame_id: u64) {
@@ -509,7 +688,10 @@ mod tests {
         // exceeds 8, for any frame rate.
         for fps in [1u32, 30, 60, 240] {
             let n = rtt.window(fps);
-            assert!((2..=8).contains(&n), "window {n} out of bounds at {fps} fps");
+            assert!(
+                (2..=8).contains(&n),
+                "window {n} out of bounds at {fps} fps"
+            );
         }
     }
 }

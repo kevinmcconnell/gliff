@@ -108,15 +108,24 @@ pub struct CaptureBuffer {
 
 impl std::fmt::Debug for CaptureBuffer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CaptureBuffer").field("index", &self.index).field("info", &self.info).finish()
+        f.debug_struct("CaptureBuffer")
+            .field("index", &self.index)
+            .field("info", &self.info)
+            .finish()
     }
 }
 
 impl CaptureBuffer {
     /// Map the whole buffer for CPU reads and run `f(pixels, stride_bytes)`.
     pub fn with_mapped<R>(&self, f: impl FnOnce(&[u8], u32) -> R) -> Result<R> {
-        let device = self.device.lock().map_err(|_| Error::Gbm("device mutex poisoned".into()))?;
-        let bo = self.bo.lock().map_err(|_| Error::Gbm("buffer mutex poisoned".into()))?;
+        let device = self
+            .device
+            .lock()
+            .map_err(|_| Error::Gbm("device mutex poisoned".into()))?;
+        let bo = self
+            .bo
+            .lock()
+            .map_err(|_| Error::Gbm("buffer mutex poisoned".into()))?;
         let (w, h) = (self.info.width, self.info.height);
         let mapped = bo
             .map(&device, 0, 0, w, h, |m| f(m.buffer(), m.stride()))
@@ -131,10 +140,16 @@ impl CaptureBuffer {
     pub fn read_bgra(&self) -> Result<BgraImage> {
         let width = self.info.width as usize & !1;
         let height = self.info.height as usize & !1;
-        let bgra_in_memory = matches!(DrmFourcc::try_from(self.info.fourcc), Ok(DrmFourcc::Xrgb8888 | DrmFourcc::Argb8888));
+        let bgra_in_memory = matches!(
+            DrmFourcc::try_from(self.info.fourcc),
+            Ok(DrmFourcc::Xrgb8888 | DrmFourcc::Argb8888)
+        );
         let pixels = self.with_mapped(|mapped, stride| {
             let mut out = vec![0u8; width * height * 4];
-            for (dst, src) in out.chunks_exact_mut(width * 4).zip(mapped.chunks(stride as usize)) {
+            for (dst, src) in out
+                .chunks_exact_mut(width * 4)
+                .zip(mapped.chunks(stride as usize))
+            {
                 if bgra_in_memory {
                     dst.copy_from_slice(&src[..width * 4]);
                 } else {
@@ -145,7 +160,11 @@ impl CaptureBuffer {
             }
             out
         })?;
-        Ok(BgraImage { width, height, pixels })
+        Ok(BgraImage {
+            width,
+            height,
+            pixels,
+        })
     }
 }
 
@@ -180,7 +199,10 @@ impl std::fmt::Debug for CapturedFrame {
 impl Drop for CapturedFrame {
     fn drop(&mut self) {
         if let Some(tx) = self.release.take() {
-            let _ = tx.send(thread::Cmd::Release { index: self.buffer.index, generation: self.buffer.generation });
+            let _ = tx.send(thread::Cmd::Release {
+                index: self.buffer.index,
+                generation: self.buffer.generation,
+            });
         }
     }
 }
@@ -188,10 +210,26 @@ impl Drop for CapturedFrame {
 #[derive(Debug)]
 pub enum CaptureEvent {
     /// Session constraints are known and buffers are allocated.
-    Ready { output: OutputInfo, width: u32, height: u32, fourcc: u32, modifier: u64 },
+    Ready {
+        output: OutputInfo,
+        width: u32,
+        height: u32,
+        fourcc: u32,
+        modifier: u64,
+    },
     Frame(CapturedFrame),
-    CursorShape { width: u32, height: u32, hot_x: i32, hot_y: i32, argb: Vec<u8> },
-    CursorPos { x: i32, y: i32, visible: bool },
+    CursorShape {
+        width: u32,
+        height: u32,
+        hot_x: i32,
+        hot_y: i32,
+        argb: Vec<u8>,
+    },
+    CursorPos {
+        x: i32,
+        y: i32,
+        visible: bool,
+    },
     Stopped,
     Error(String),
 }
@@ -209,12 +247,17 @@ impl Capturer {
     /// capture thread. Returns once the compositor connection is up.
     pub fn start(config: CaptureConfig, sink: EventSink) -> Result<Self> {
         let (cmd, join) = thread::spawn(config, sink)?;
-        Ok(Self { cmd, join: Some(join) })
+        Ok(Self {
+            cmd,
+            join: Some(join),
+        })
     }
 
     /// Ask for the next frame. Frames are only captured on demand.
     pub fn request_frame(&self) -> Result<()> {
-        self.cmd.send(thread::Cmd::RequestFrame).map_err(|_| Error::ThreadGone)
+        self.cmd
+            .send(thread::Cmd::RequestFrame)
+            .map_err(|_| Error::ThreadGone)
     }
 
     pub fn stop(&self) {

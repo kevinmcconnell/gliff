@@ -82,9 +82,13 @@ fn probe(render_node: &Path) -> Result<bool> {
     use gbm::AsRaw;
     // SAFETY: the gbm device pointer is a valid EGL native display on Mesa; the
     // Display it yields is only used to initialize and query strings.
-    let display = unsafe { egl.get_display(device.as_raw() as *mut c_void) }.ok_or(Error::NoDisplay)?;
-    egl.initialize(display).map_err(|e| Error::Egl(e.to_string()))?;
-    let exts = egl.query_string(Some(display), egl::EXTENSIONS).map_err(|e| Error::Egl(e.to_string()))?;
+    let display =
+        unsafe { egl.get_display(device.as_raw() as *mut c_void) }.ok_or(Error::NoDisplay)?;
+    egl.initialize(display)
+        .map_err(|e| Error::Egl(e.to_string()))?;
+    let exts = egl
+        .query_string(Some(display), egl::EXTENSIONS)
+        .map_err(|e| Error::Egl(e.to_string()))?;
     let ok = exts.to_string_lossy().contains(DMABUF_IMPORT_EXT);
     let _ = egl.terminate(display);
     Ok(ok)
@@ -144,11 +148,26 @@ impl Renderer {
             let recombine = build_program(&gl, VERT, FRAG_RECOMBINE)?;
             let blit = build_program(&gl, VERT, FRAG_BLIT)?;
             let vao = gl.create_vertex_array().map_err(Error::Gl)?;
-            let plane_textures = [new_texture(&gl)?, new_texture(&gl)?, new_texture(&gl)?, new_texture(&gl)?];
+            let plane_textures = [
+                new_texture(&gl)?,
+                new_texture(&gl)?,
+                new_texture(&gl)?,
+                new_texture(&gl)?,
+            ];
             let rgba_texture = new_texture(&gl)?;
             (recombine, blit, vao, plane_textures, rgba_texture)
         };
-        Ok(Self { egl, gl, recombine, blit, vao, plane_textures, rgba_texture, image_target, can_dmabuf })
+        Ok(Self {
+            egl,
+            gl,
+            recombine,
+            blit,
+            vao,
+            plane_textures,
+            rgba_texture,
+            image_target,
+            can_dmabuf,
+        })
     }
 
     pub fn can_dmabuf(&self) -> bool {
@@ -159,7 +178,10 @@ impl Renderer {
     /// untouched) if dmabuf import is unavailable or fails; the caller then
     /// switches to the CPU path.
     pub fn draw_planes(&self, planes: &FramePlanes, fb_w: i32, fb_h: i32) -> Result<()> {
-        let image_target = self.image_target.filter(|_| self.can_dmabuf).ok_or(Error::NoDmabufImport)?;
+        let image_target = self
+            .image_target
+            .filter(|_| self.can_dmabuf)
+            .ok_or(Error::NoDmabufImport)?;
         let display = self.egl.get_current_display().ok_or(Error::NoDisplay)?;
         let (vw, vh) = (planes.width as i32, planes.height as i32);
 
@@ -172,7 +194,8 @@ impl Renderer {
                 // binds the EGLImage to the bound 2D texture.
                 unsafe {
                     self.gl.active_texture(glow::TEXTURE0 + unit as u32);
-                    self.gl.bind_texture(GL_TEXTURE_2D, Some(self.plane_textures[unit]));
+                    self.gl
+                        .bind_texture(GL_TEXTURE_2D, Some(self.plane_textures[unit]));
                     image_target(GL_TEXTURE_2D, image.as_ptr());
                 }
                 Ok(())
@@ -214,7 +237,14 @@ impl Renderer {
     }
 
     /// Draw one frame from CPU BGRA (the fallback when dmabuf import is off).
-    pub fn draw_rgba(&self, bgra: &[u8], width: i32, height: i32, fb_w: i32, fb_h: i32) -> Result<()> {
+    pub fn draw_rgba(
+        &self,
+        bgra: &[u8],
+        width: i32,
+        height: i32,
+        fb_w: i32,
+        fb_h: i32,
+    ) -> Result<()> {
         if width <= 0 || height <= 0 || bgra.len() < (width * height * 4) as usize {
             return Err(Error::Gl("rgba buffer too small".into()));
         }
@@ -263,6 +293,7 @@ impl Renderer {
     fn import(&self, display: egl::Display, p: &DmabufPlane) -> Result<egl::Image> {
         // Buffers are always linear (modifier 0), so we omit the modifier
         // attribs, which would need EGL_EXT_image_dma_buf_import_modifiers.
+        #[rustfmt::skip]
         let attribs: [egl::Attrib; 13] = [
             EGL_WIDTH, p.width as egl::Attrib,
             EGL_HEIGHT, p.height as egl::Attrib,
@@ -276,7 +307,12 @@ impl Renderer {
         // SAFETY: NO_CONTEXT and a null client buffer are the required args for
         // an EGL_LINUX_DMABUF_EXT image; the attrib list is NONE-terminated and
         // the fd stays owned by the caller.
-        let (ctx, buffer) = unsafe { (egl::Context::from_ptr(egl::NO_CONTEXT), egl::ClientBuffer::from_ptr(std::ptr::null_mut())) };
+        let (ctx, buffer) = unsafe {
+            (
+                egl::Context::from_ptr(egl::NO_CONTEXT),
+                egl::ClientBuffer::from_ptr(std::ptr::null_mut()),
+            )
+        };
         self.egl
             .create_image(display, ctx, EGL_LINUX_DMABUF_EXT, buffer, &attribs)
             .map_err(|e| Error::Egl(format!("dmabuf import ({:?}): {e}", p.fourcc)))
@@ -316,10 +352,26 @@ pub(crate) unsafe fn new_texture(gl: &glow::Context) -> Result<glow::NativeTextu
     unsafe {
         let t = gl.create_texture().map_err(Error::Gl)?;
         gl.bind_texture(GL_TEXTURE_2D, Some(t));
-        gl.tex_parameter_i32(GL_TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::NEAREST as i32);
-        gl.tex_parameter_i32(GL_TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::NEAREST as i32);
-        gl.tex_parameter_i32(GL_TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
-        gl.tex_parameter_i32(GL_TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+        gl.tex_parameter_i32(
+            GL_TEXTURE_2D,
+            glow::TEXTURE_MIN_FILTER,
+            glow::NEAREST as i32,
+        );
+        gl.tex_parameter_i32(
+            GL_TEXTURE_2D,
+            glow::TEXTURE_MAG_FILTER,
+            glow::NEAREST as i32,
+        );
+        gl.tex_parameter_i32(
+            GL_TEXTURE_2D,
+            glow::TEXTURE_WRAP_S,
+            glow::CLAMP_TO_EDGE as i32,
+        );
+        gl.tex_parameter_i32(
+            GL_TEXTURE_2D,
+            glow::TEXTURE_WRAP_T,
+            glow::CLAMP_TO_EDGE as i32,
+        );
         Ok(t)
     }
 }
@@ -392,7 +444,11 @@ void main() {
 
 /// # Safety
 /// A current GL context.
-pub(crate) unsafe fn build_program(gl: &glow::Context, vert: &str, frag: &str) -> Result<glow::Program> {
+pub(crate) unsafe fn build_program(
+    gl: &glow::Context,
+    vert: &str,
+    frag: &str,
+) -> Result<glow::Program> {
     // SAFETY: standard shader compile/link on the current context.
     unsafe {
         let program = gl.create_program().map_err(Error::Gl)?;
@@ -401,14 +457,20 @@ pub(crate) unsafe fn build_program(gl: &glow::Context, vert: &str, frag: &str) -
             gl.shader_source(shader, src);
             gl.compile_shader(shader);
             if !gl.get_shader_compile_status(shader) {
-                return Err(Error::Gl(format!("shader compile: {}", gl.get_shader_info_log(shader))));
+                return Err(Error::Gl(format!(
+                    "shader compile: {}",
+                    gl.get_shader_info_log(shader)
+                )));
             }
             gl.attach_shader(program, shader);
             gl.delete_shader(shader);
         }
         gl.link_program(program);
         if !gl.get_program_link_status(program) {
-            return Err(Error::Gl(format!("program link: {}", gl.get_program_info_log(program))));
+            return Err(Error::Gl(format!(
+                "program link: {}",
+                gl.get_program_info_log(program)
+            )));
         }
         Ok(program)
     }

@@ -117,18 +117,37 @@ enum Cmd {
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env()).with_writer(std::io::stderr).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .init();
     let cli = Cli::parse();
-    let target = Target { display: cli.display.clone(), instance: cli.instance.clone() };
+    let target = Target {
+        display: cli.display.clone(),
+        instance: cli.instance.clone(),
+    };
     let node = vaapi::render_node(cli.render_node.as_deref());
     match cli.cmd {
         Cmd::Protocols => protocols(&target)?,
         Cmd::Outputs => outputs(&target)?,
         Cmd::Permissions => permissions(&target)?,
         Cmd::Vaapi => vaapi_probe(&node)?,
-        Cmd::Roundtrip { width, height, frames, bitrate } => roundtrip(&node, width, height, frames, bitrate)?,
-        Cmd::Capture { output, png, cursor } => capture(&target, &node, output, &png, cursor)?,
-        Cmd::Input { output, text, click } => input(&target, output, &text, click)?,
+        Cmd::Roundtrip {
+            width,
+            height,
+            frames,
+            bitrate,
+        } => roundtrip(&node, width, height, frames, bitrate)?,
+        Cmd::Capture {
+            output,
+            png,
+            cursor,
+        } => capture(&target, &node, output, &png, cursor)?,
+        Cmd::Input {
+            output,
+            text,
+            click,
+        } => input(&target, output, &text, click)?,
         Cmd::Pipeline { output, gl } => pipeline(&target, &node, output, gl)?,
         Cmd::ServeTest { connect, frames } => serve_test(&node, &connect, frames)?,
         Cmd::Clipboard { set, secs } => clipboard(&target, set, secs)?,
@@ -152,23 +171,42 @@ fn status(ok: bool, what: &str) {
 fn protocols(target: &Target) -> Result<()> {
     struct S;
     impl Dispatch<WlRegistry, GlobalListContents> for S {
-        fn event(_: &mut Self, _: &WlRegistry, _: wayland_client::protocol::wl_registry::Event, _: &GlobalListContents, _: &Connection, _: &QueueHandle<Self>) {}
+        fn event(
+            _: &mut Self,
+            _: &WlRegistry,
+            _: wayland_client::protocol::wl_registry::Event,
+            _: &GlobalListContents,
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+        }
     }
     let (_conn, globals, _queue) = hypr_wl::init::<S>(target)?;
     let list = hypr_wl::list_globals(&globals);
     for g in &list {
         println!("  {} v{}", g.interface, g.version);
     }
-    let required: Vec<&str> = hypr_capture::REQUIRED_GLOBALS.iter().chain(hypr_input::REQUIRED_GLOBALS).copied().collect();
+    let required: Vec<&str> = hypr_capture::REQUIRED_GLOBALS
+        .iter()
+        .chain(hypr_input::REQUIRED_GLOBALS)
+        .copied()
+        .collect();
     let mut all = true;
     for name in required {
         let ok = hypr_wl::has_global(&globals, name);
         all &= ok;
         status(ok, name);
     }
-    let clipboard = hypr_wl::has_global(&globals, "ext_data_control_manager_v1") || hypr_wl::has_global(&globals, "zwlr_data_control_manager_v1");
-    status(clipboard, "clipboard: ext_data_control_manager_v1 or zwlr_data_control_manager_v1");
-    status(hypr_wl::has_global(&globals, "zwp_keyboard_shortcuts_inhibit_manager_v1"), "zwp_keyboard_shortcuts_inhibit_manager_v1 (client side)");
+    let clipboard = hypr_wl::has_global(&globals, "ext_data_control_manager_v1")
+        || hypr_wl::has_global(&globals, "zwlr_data_control_manager_v1");
+    status(
+        clipboard,
+        "clipboard: ext_data_control_manager_v1 or zwlr_data_control_manager_v1",
+    );
+    status(
+        hypr_wl::has_global(&globals, "zwp_keyboard_shortcuts_inhibit_manager_v1"),
+        "zwp_keyboard_shortcuts_inhibit_manager_v1 (client side)",
+    );
     if !all {
         bail!("required protocols missing");
     }
@@ -178,12 +216,26 @@ fn protocols(target: &Target) -> Result<()> {
 fn outputs(target: &Target) -> Result<()> {
     for o in hypr_capture::list_outputs(target)? {
         let (lw, lh) = o.logical_size();
-        println!("  wl_output {} {}x{}@{}mHz scale {} logical {lw}x{lh} at {},{} ({})", o.name, o.width, o.height, o.refresh_mhz, o.scale, o.x, o.y, o.description);
+        println!(
+            "  wl_output {} {}x{}@{}mHz scale {} logical {lw}x{lh} at {},{} ({})",
+            o.name, o.width, o.height, o.refresh_mhz, o.scale, o.x, o.y, o.description
+        );
     }
     match target.instance() {
         Ok(inst) => {
             for m in inst.monitors()? {
-                println!("  hyprctl  {} {}x{}@{:.2} scale {} at {},{} focused={} disabled={}", m.name, m.width, m.height, m.refresh_rate, m.scale, m.x, m.y, m.focused, m.disabled);
+                println!(
+                    "  hyprctl  {} {}x{}@{:.2} scale {} at {},{} focused={} disabled={}",
+                    m.name,
+                    m.width,
+                    m.height,
+                    m.refresh_rate,
+                    m.scale,
+                    m.x,
+                    m.y,
+                    m.focused,
+                    m.disabled
+                );
             }
         }
         Err(e) => println!("  hyprctl unavailable: {e}"),
@@ -209,14 +261,26 @@ fn vaapi_probe(node: &std::path::Path) -> Result<()> {
     status(info.h264_encode(), "H.264 encode");
     status(info.h264_decode(), "H.264 decode");
     let native = info.native_444_encode();
-    println!("INFO native 4:4:4 encode profiles: {}", if native.is_empty() { "none".to_owned() } else { native.join(",") });
+    println!(
+        "INFO native 4:4:4 encode profiles: {}",
+        if native.is_empty() {
+            "none".to_owned()
+        } else {
+            native.join(",")
+        }
+    );
     if !(info.h264_encode() && info.h264_decode()) {
         bail!("VA-API H.264 encode and decode are both required");
     }
     Ok(())
 }
 
-fn fill_synthetic(frame: &mut haver_codec::frame::Nv12Frame, w: u32, h: u32, t: usize) -> Result<()> {
+fn fill_synthetic(
+    frame: &mut haver_codec::frame::Nv12Frame,
+    w: u32,
+    h: u32,
+    t: usize,
+) -> Result<()> {
     let shift = t as f64 * 3.0;
     frame.with_planes_mut(|y, uv, py, puv| {
         for row in 0..h as usize {
@@ -239,13 +303,27 @@ fn fill_synthetic(frame: &mut haver_codec::frame::Nv12Frame, w: u32, h: u32, t: 
 /// The colour bytes of a BGRA buffer, skipping the alpha/X byte whose captured
 /// value is undefined.
 fn rgb_channels(bgra: &[u8]) -> Vec<u8> {
-    bgra.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect()
+    bgra.chunks_exact(4)
+        .flat_map(|p| [p[0], p[1], p[2]])
+        .collect()
 }
 
-fn roundtrip(node: &std::path::Path, width: u32, height: u32, frames: usize, bitrate: Option<u32>) -> Result<()> {
+fn roundtrip(
+    node: &std::path::Path,
+    width: u32,
+    height: u32,
+    frames: usize,
+    bitrate: Option<u32>,
+) -> Result<()> {
     let display = vaapi::open_display(node)?;
     let bitrate = bitrate.unwrap_or_else(|| EncoderSettings::default_bitrate(width, height, 60));
-    let settings = EncoderSettings { width, height, bitrate, framerate: 60, low_power: false };
+    let settings = EncoderSettings {
+        width,
+        height,
+        bitrate,
+        framerate: 60,
+        low_power: false,
+    };
     let (cw, ch) = (settings.coded_width(), settings.coded_height());
     let alloc = FrameAllocator::open(node)?;
     let pool = FramePool::new(&alloc, cw, ch, 4)?;
@@ -261,13 +339,18 @@ fn roundtrip(node: &std::path::Path, width: u32, height: u32, frames: usize, bit
         fill_synthetic(&mut frame, width, height, i)?;
         let source_y = frame.read_nv12(width as usize, height as usize)?.y;
         let force = i == frames / 2;
-        let (yb, uvb, yp, uvp) = frame.with_planes(|y, uv, py, puv| (y.to_vec(), uv.to_vec(), py, puv))?;
+        let (yb, uvb, yp, uvp) =
+            frame.with_planes(|y, uv, py, puv| (y.to_vec(), uv.to_vec(), py, puv))?;
         let t0 = std::time::Instant::now();
-        let packet = encoder.encode_planes(&yb, yp, &uvb, uvp, i as u64, force).with_context(|| format!("encode frame {i}"))?;
+        let packet = encoder
+            .encode_planes(&yb, yp, &uvb, uvp, i as u64, force)
+            .with_context(|| format!("encode frame {i}"))?;
         let enc_ms = t0.elapsed().as_secs_f64() * 1000.0;
         total_bytes += packet.data.len();
         let t1 = std::time::Instant::now();
-        let out = decoder.decode(i as u64, &packet.data).with_context(|| format!("decode frame {i}"))?;
+        let out = decoder
+            .decode(i as u64, &packet.data)
+            .with_context(|| format!("decode frame {i}"))?;
         let dec_ms = t1.elapsed().as_secs_f64() * 1000.0;
         println!(
             "  frame {i}: {} bytes key={} enc {enc_ms:.2} ms dec {dec_ms:.2} ms -> {} frame(s) out",
@@ -286,13 +369,23 @@ fn roundtrip(node: &std::path::Path, width: u32, height: u32, frames: usize, bit
             let y_out = d.frame.read_nv12(width as usize, height as usize)?.y;
             min_psnr = min_psnr.min(psnr(&source_y, &y_out));
             if d.timestamp != i as u64 {
-                println!("  WARN decoded timestamp {} for input {i}: decoder is not zero-latency", d.timestamp);
+                println!(
+                    "  WARN decoded timestamp {} for input {i}: decoder is not zero-latency",
+                    d.timestamp
+                );
             }
         }
     }
     let elapsed = start.elapsed().as_secs_f64();
-    println!("  {frames} frames, {total_bytes} bytes, {:.1} fps end to end, extradata {} bytes", frames as f64 / elapsed, encoder.parameter_sets().len());
-    status(decoded == frames, &format!("decoded {decoded}/{frames} frames with zero decoder latency"));
+    println!(
+        "  {frames} frames, {total_bytes} bytes, {:.1} fps end to end, extradata {} bytes",
+        frames as f64 / elapsed,
+        encoder.parameter_sets().len()
+    );
+    status(
+        decoded == frames,
+        &format!("decoded {decoded}/{frames} frames with zero decoder latency"),
+    );
     status(min_psnr > 30.0, &format!("min luma PSNR {min_psnr:.1} dB"));
     if decoded != frames || min_psnr <= 30.0 {
         bail!("round-trip check failed");
@@ -300,7 +393,12 @@ fn roundtrip(node: &std::path::Path, width: u32, height: u32, frames: usize, bit
     Ok(())
 }
 
-fn pipeline(target: &Target, node: &std::path::Path, output: Option<String>, gl: bool) -> Result<()> {
+fn pipeline(
+    target: &Target,
+    node: &std::path::Path,
+    output: Option<String>,
+    gl: bool,
+) -> Result<()> {
     use std::sync::mpsc;
     use std::time::Duration;
     let output = pick_output(target, output)?;
@@ -309,7 +407,12 @@ fn pipeline(target: &Target, node: &std::path::Path, output: Option<String>, gl:
     cfg.render_node = node.to_path_buf();
     cfg.cursor = false;
     let (tx, rx) = mpsc::channel();
-    let capturer = Capturer::start(cfg, Box::new(move |ev| { let _ = tx.send(ev); }))?;
+    let capturer = Capturer::start(
+        cfg,
+        Box::new(move |ev| {
+            let _ = tx.send(ev);
+        }),
+    )?;
     capturer.request_frame()?;
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let mut captured = None;
@@ -326,8 +429,18 @@ fn pipeline(target: &Target, node: &std::path::Path, output: Option<String>, gl:
         }
     }
     drop(capturer);
-    let (BgraImage { width: w, height: h, pixels: bgra }, buffer) =
-        captured.ok_or_else(|| anyhow!("no frame captured (a headless output renders reliably; a physical KVM output may not)"))?;
+    let (
+        BgraImage {
+            width: w,
+            height: h,
+            pixels: bgra,
+        },
+        buffer,
+    ) = captured.ok_or_else(|| {
+        anyhow!(
+            "no frame captured (a headless output renders reliably; a physical KVM output may not)"
+        )
+    })?;
     println!("  captured {w}x{h} from {output}");
 
     if gl {
@@ -335,7 +448,13 @@ fn pipeline(target: &Target, node: &std::path::Path, output: Option<String>, gl:
     }
 
     let display = vaapi::open_display(node)?;
-    let settings = EncoderSettings { width: w as u32, height: h as u32, bitrate: EncoderSettings::default_bitrate(w as u32, h as u32, 60), framerate: 60, low_power: false };
+    let settings = EncoderSettings {
+        width: w as u32,
+        height: h as u32,
+        bitrate: EncoderSettings::default_bitrate(w as u32, h as u32, 60),
+        framerate: 60,
+        low_power: false,
+    };
     let mut encoder = DualEncoder::new(display.clone(), settings).context("dual encoder")?;
     let mut decoder = DualDecoder::new(display, w, h).context("dual decoder")?;
 
@@ -343,24 +462,44 @@ fn pipeline(target: &Target, node: &std::path::Path, output: Option<String>, gl:
     let t0 = std::time::Instant::now();
     let packet = encoder.encode(&src444, 0, true).context("encode")?;
     let enc_ms = t0.elapsed().as_secs_f64() * 1000.0;
-    println!("  encoded main {} bytes, aux {} bytes, key={}, {enc_ms:.1} ms", packet.main.len(), packet.aux.len(), packet.keyframe);
+    println!(
+        "  encoded main {} bytes, aux {} bytes, key={}, {enc_ms:.1} ms",
+        packet.main.len(),
+        packet.aux.len(),
+        packet.keyframe
+    );
     let t1 = std::time::Instant::now();
-    let out444 = decoder.decode(0, &packet.main, &packet.aux).context("decode")?.ok_or_else(|| anyhow!("dual decode produced no frame"))?;
+    let out444 = decoder
+        .decode(0, &packet.main, &packet.aux)
+        .context("decode")?
+        .ok_or_else(|| anyhow!("dual decode produced no frame"))?;
     let dec_ms = t1.elapsed().as_secs_f64() * 1000.0;
 
     let y_psnr = psnr(&src444.y, &out444.y);
     let u_psnr = psnr(&src444.u, &out444.u);
     let v_psnr = psnr(&src444.v, &out444.v);
-    let rgb_psnr = psnr(&rgb_channels(&bgra), &rgb_channels(&yuv444_to_bgra(&out444)));
+    let rgb_psnr = psnr(
+        &rgb_channels(&bgra),
+        &rgb_channels(&yuv444_to_bgra(&out444)),
+    );
     println!("  decoded {dec_ms:.1} ms; PSNR Y {y_psnr:.1} U {u_psnr:.1} V {v_psnr:.1} dB, end-to-end RGB {rgb_psnr:.1} dB");
-    status(y_psnr > 35.0 && u_psnr > 35.0 && v_psnr > 35.0, "Dual420 4:4:4 round-trip on a captured frame");
+    status(
+        y_psnr > 35.0 && u_psnr > 35.0 && v_psnr > 35.0,
+        "Dual420 4:4:4 round-trip on a captured frame",
+    );
     if !(y_psnr > 35.0 && u_psnr > 35.0 && v_psnr > 35.0) {
         bail!("4:4:4 pipeline PSNR too low");
     }
     Ok(())
 }
 
-fn pipeline_gl(node: &std::path::Path, w: usize, h: usize, bgra: &[u8], buffer: &hypr_capture::CaptureBuffer) -> Result<()> {
+fn pipeline_gl(
+    node: &std::path::Path,
+    w: usize,
+    h: usize,
+    bgra: &[u8],
+    buffer: &hypr_capture::CaptureBuffer,
+) -> Result<()> {
     use haver_codec::libva::{Display, Image, UsageHint, VA_FOURCC_NV12, VA_RT_FORMAT_YUV420};
     use haver_proto::chroma::{recombine_yuv444, split_yuv444, Nv12};
     use std::time::Instant;
@@ -377,12 +516,22 @@ fn pipeline_gl(node: &std::path::Path, w: usize, h: usize, bgra: &[u8], buffer: 
         fourcc: src_fourcc,
         modifier: info.modifier,
     };
-    println!("  input dmabuf: {:?} {}x{} modifier {:#x}", src_fourcc, info.width, info.height, info.modifier);
+    println!(
+        "  input dmabuf: {:?} {}x{} modifier {:#x}",
+        src_fourcc, info.width, info.height, info.modifier
+    );
 
     let display: std::rc::Rc<Display> = vaapi::open_display(node)?;
     let make_nv12 = || -> Result<_> {
         let mut s = display
-            .create_surfaces::<()>(VA_RT_FORMAT_YUV420, Some(VA_FOURCC_NV12), w as u32, h as u32, Some(UsageHint::USAGE_HINT_ENCODER), vec![()])
+            .create_surfaces::<()>(
+                VA_RT_FORMAT_YUV420,
+                Some(VA_FOURCC_NV12),
+                w as u32,
+                h as u32,
+                Some(UsageHint::USAGE_HINT_ENCODER),
+                vec![()],
+            )
             .map_err(|e| anyhow!("create_surfaces: {e}"))?;
         Ok(s.remove(0))
     };
@@ -395,19 +544,31 @@ fn pipeline_gl(node: &std::path::Path, w: usize, h: usize, bgra: &[u8], buffer: 
     // the per-frame cost; the encoder would hold the surfaces across frames.
     let mut gl_ms = f64::INFINITY;
     for _ in 0..10 {
-        let main_desc = main_surf.export_prime().map_err(|e| anyhow!("export main: {e}"))?;
-        let aux_desc = aux_surf.export_prime().map_err(|e| anyhow!("export aux: {e}"))?;
+        let main_desc = main_surf
+            .export_prime()
+            .map_err(|e| anyhow!("export main: {e}"))?;
+        let aux_desc = aux_surf
+            .export_prime()
+            .map_err(|e| anyhow!("export aux: {e}"))?;
         let (my, muv) = nv12_planes(&main_desc);
         let (ay, auv) = nv12_planes(&aux_desc);
         let t = Instant::now();
-        headless.split_dual(&input, w as u32, h as u32, &my, &muv, &ay, &auv).context("gl split")?;
+        headless
+            .split_dual(&input, w as u32, h as u32, &my, &muv, &ay, &auv)
+            .context("gl split")?;
         gl_ms = gl_ms.min(t.elapsed().as_secs_f64() * 1000.0);
     }
 
     // Read the two GL-filled surfaces back to a main/aux NV12 pair.
-    let fmt = display.query_image_formats().map_err(|e| anyhow!("{e}"))?.into_iter().find(|f| f.fourcc == VA_FOURCC_NV12).ok_or_else(|| anyhow!("no NV12 image format"))?;
+    let fmt = display
+        .query_image_formats()
+        .map_err(|e| anyhow!("{e}"))?
+        .into_iter()
+        .find(|f| f.fourcc == VA_FOURCC_NV12)
+        .ok_or_else(|| anyhow!("no NV12 image format"))?;
     let read_nv12 = |surface: &haver_codec::libva::Surface<()>| -> Result<Nv12> {
-        let image = Image::create_from(surface, fmt, (w as u32, h as u32), (w as u32, h as u32)).map_err(|e| anyhow!("map: {e}"))?;
+        let image = Image::create_from(surface, fmt, (w as u32, h as u32), (w as u32, h as u32))
+            .map_err(|e| anyhow!("map: {e}"))?;
         let d = image.as_ref();
         let va = *image.image();
         let (yo, uvo) = (va.offsets[0] as usize, va.offsets[1] as usize);
@@ -453,7 +614,10 @@ fn pipeline_gl(node: &std::path::Path, w: usize, h: usize, bgra: &[u8], buffer: 
     // integer path, so exact equality is not expected; >40 dB means the shader
     // orientation and channel order are correct.
     let split_ok = y_psnr > 40.0 && u_psnr > 40.0 && v_psnr > 40.0;
-    status(split_ok, "GPU 4:4:4 split matches CPU split (orientation + channel order)");
+    status(
+        split_ok,
+        "GPU 4:4:4 split matches CPU split (orientation + channel order)",
+    );
 
     // Release the standalone split resources before the integrated encoder
     // builds its own GL context and surfaces.
@@ -463,16 +627,34 @@ fn pipeline_gl(node: &std::path::Path, w: usize, h: usize, bgra: &[u8], buffer: 
 
     // Integrated: encode the GPU-split surfaces, decode, recombine, and check
     // end-to-end fidelity against the captured frame.
-    let settings = EncoderSettings { width: w as u32, height: h as u32, bitrate: EncoderSettings::default_bitrate(w as u32, h as u32, 60), framerate: 60, low_power: false };
-    let mut encoder = GlDualEncoder::new(display.clone(), node, settings).context("gl dual encoder")?;
+    let settings = EncoderSettings {
+        width: w as u32,
+        height: h as u32,
+        bitrate: EncoderSettings::default_bitrate(w as u32, h as u32, 60),
+        framerate: 60,
+        low_power: false,
+    };
+    let mut encoder =
+        GlDualEncoder::new(display.clone(), node, settings).context("gl dual encoder")?;
     let mut decoder = DualDecoder::new(display, w, h).context("dual decoder")?;
     let packet = encoder.encode(&input, 0, true).context("gl encode")?;
-    println!("  gl-encoded main {} bytes, aux {} bytes, key={}", packet.main.len(), packet.aux.len(), packet.keyframe);
-    let out444 = decoder.decode(0, &packet.main, &packet.aux).context("decode")?.ok_or_else(|| anyhow!("dual decode produced no frame"))?;
+    println!(
+        "  gl-encoded main {} bytes, aux {} bytes, key={}",
+        packet.main.len(),
+        packet.aux.len(),
+        packet.keyframe
+    );
+    let out444 = decoder
+        .decode(0, &packet.main, &packet.aux)
+        .context("decode")?
+        .ok_or_else(|| anyhow!("dual decode produced no frame"))?;
     let e2e_psnr = psnr(&rgb_channels(bgra), &rgb_channels(&yuv444_to_bgra(&out444)));
     println!("  end-to-end RGB PSNR (GPU split -> encode -> decode): {e2e_psnr:.1} dB");
     let e2e_ok = e2e_psnr > 30.0;
-    status(e2e_ok, "GPU-split Dual420 4:4:4 round-trip on a captured frame");
+    status(
+        e2e_ok,
+        "GPU-split Dual420 4:4:4 round-trip on a captured frame",
+    );
 
     if !split_ok {
         bail!("GPU split PSNR too low: shader orientation or GR88 channel order is wrong");
@@ -488,43 +670,85 @@ fn pick_output(target: &Target, output: Option<String>) -> Result<String> {
         return Ok(o);
     }
     let list = hypr_capture::list_outputs(target)?;
-    list.first().map(|o| o.name.clone()).ok_or_else(|| anyhow!("no outputs"))
+    list.first()
+        .map(|o| o.name.clone())
+        .ok_or_else(|| anyhow!("no outputs"))
 }
 
-fn capture(target: &Target, node: &std::path::Path, output: Option<String>, png_path: &std::path::Path, cursor: bool) -> Result<()> {
+fn capture(
+    target: &Target,
+    node: &std::path::Path,
+    output: Option<String>,
+    png_path: &std::path::Path,
+    cursor: bool,
+) -> Result<()> {
     let output = pick_output(target, output)?;
     let mut cfg = CaptureConfig::new(output.clone());
     cfg.target = target.clone();
     cfg.render_node = node.to_path_buf();
     cfg.cursor = cursor;
     let (tx, rx) = mpsc::channel();
-    let capturer = Capturer::start(cfg, Box::new(move |ev| {
-        let _ = tx.send(ev);
-    }))?;
+    let capturer = Capturer::start(
+        cfg,
+        Box::new(move |ev| {
+            let _ = tx.send(ev);
+        }),
+    )?;
     capturer.request_frame()?;
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let mut got_frame = false;
     let mut got_cursor = !cursor;
     while std::time::Instant::now() < deadline && !(got_frame && got_cursor) {
-        let Ok(ev) = rx.recv_timeout(Duration::from_millis(200)) else { continue };
+        let Ok(ev) = rx.recv_timeout(Duration::from_millis(200)) else {
+            continue;
+        };
         match ev {
-            CaptureEvent::Ready { width, height, fourcc, modifier, .. } => {
-                println!("  session ready {width}x{height} fourcc {:?} modifier {modifier:#x}", fourcc.to_le_bytes().map(|b| b as char));
+            CaptureEvent::Ready {
+                width,
+                height,
+                fourcc,
+                modifier,
+                ..
+            } => {
+                println!(
+                    "  session ready {width}x{height} fourcc {:?} modifier {modifier:#x}",
+                    fourcc.to_le_bytes().map(|b| b as char)
+                );
             }
             CaptureEvent::Frame(frame) => {
                 let image = frame.buffer.read_bgra()?;
                 let (w, h) = (image.width as u32, image.height as u32);
-                let rgb: Vec<u8> = image.pixels.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0]]).collect();
+                let rgb: Vec<u8> = image
+                    .pixels
+                    .chunks_exact(4)
+                    .flat_map(|p| [p[2], p[1], p[0]])
+                    .collect();
                 write_png(png_path, w, h, &rgb)?;
-                println!("  wrote {} ({w}x{h}, seq {}, damage {:?}, presentation {} ns)", png_path.display(), frame.sequence, frame.damage, frame.presentation_ns);
+                println!(
+                    "  wrote {} ({w}x{h}, seq {}, damage {:?}, presentation {} ns)",
+                    png_path.display(),
+                    frame.sequence,
+                    frame.damage,
+                    frame.presentation_ns
+                );
                 got_frame = true;
             }
-            CaptureEvent::CursorShape { width, height, hot_x, hot_y, argb } => {
+            CaptureEvent::CursorShape {
+                width,
+                height,
+                hot_x,
+                hot_y,
+                argb,
+            } => {
                 let opaque = argb.chunks(4).filter(|p| p[3] > 0).count();
-                println!("  cursor shape {width}x{height} hotspot {hot_x},{hot_y} ({opaque} opaque px)");
+                println!(
+                    "  cursor shape {width}x{height} hotspot {hot_x},{hot_y} ({opaque} opaque px)"
+                );
                 got_cursor = true;
             }
-            CaptureEvent::CursorPos { x, y, visible } => println!("  cursor pos {x},{y} visible={visible}"),
+            CaptureEvent::CursorPos { x, y, visible } => {
+                println!("  cursor pos {x},{y} visible={visible}")
+            }
             CaptureEvent::Stopped => bail!("capture stopped"),
             CaptureEvent::Error(e) => bail!("capture error: {e}"),
         }
@@ -558,9 +782,12 @@ fn input(target: &Target, output: Option<String>, text: &str, click: bool) -> Re
     let mut cfg = InputConfig::new(output.clone());
     cfg.target = target.clone();
     let (tx, rx) = mpsc::channel();
-    let input = Input::start(cfg, Box::new(move |ev| {
-        let _ = tx.send(ev);
-    }))?;
+    let input = Input::start(
+        cfg,
+        Box::new(move |ev| {
+            let _ = tx.send(ev);
+        }),
+    )?;
     if let Ok(InputEvent::Error(e)) = rx.recv_timeout(Duration::from_millis(100)) {
         bail!("input error: {e}");
     }
@@ -590,14 +817,23 @@ fn input(target: &Target, output: Option<String>, text: &str, click: bool) -> Re
     }
     input.release_all()?;
     std::thread::sleep(Duration::from_millis(50));
-    status(true, &format!("moved pointer to {},{} on {output} and typed {text:?}", lw / 2, lh / 2));
+    status(
+        true,
+        &format!(
+            "moved pointer to {},{} on {output} and typed {text:?}",
+            lw / 2,
+            lh / 2
+        ),
+    );
     Ok(())
 }
 
 fn serve_test(node: &std::path::Path, addr: &str, frames: usize) -> Result<()> {
     use haver_proto::{ChromaMode, ClientCaps, ClientMsg, Codec, ServerMsg};
     use haver_transport::Framed;
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async move {
         let stream = tokio::net::TcpStream::connect(addr).await.with_context(|| format!("connect {addr}"))?;
@@ -662,7 +898,12 @@ fn clipboard(target: &Target, set: Option<String>, secs: u64) -> Result<()> {
     use hypr_input::{Clipboard, ClipboardEvent};
     use std::sync::mpsc;
     let (tx, rx) = mpsc::channel();
-    let clip = Clipboard::start(target.clone(), Box::new(move |ev| { let _ = tx.send(ev); }))?;
+    let clip = Clipboard::start(
+        target.clone(),
+        Box::new(move |ev| {
+            let _ = tx.send(ev);
+        }),
+    )?;
     if let Some(text) = set {
         clip.set_text(text.clone());
         println!("  set selection to {text:?}; holding {secs}s");
@@ -673,7 +914,9 @@ fn clipboard(target: &Target, set: Option<String>, secs: u64) -> Result<()> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
         let mut got = false;
         while std::time::Instant::now() < deadline {
-            if let Ok(ClipboardEvent::Text(t)) = rx.recv_timeout(std::time::Duration::from_millis(200)) {
+            if let Ok(ClipboardEvent::Text(t)) =
+                rx.recv_timeout(std::time::Duration::from_millis(200))
+            {
                 println!("  selection: {t:?}");
                 got = true;
             }
@@ -703,15 +946,44 @@ fn bench(iters: usize) -> Result<()> {
                 f();
             }
             let ms = t.elapsed().as_secs_f64() * 1000.0 / n as f64;
-            println!("  {w}x{h} {label:<28} {ms:6.2} ms/frame  ({:.0} fps cap)", 1000.0 / ms.max(0.001));
+            println!(
+                "  {w}x{h} {label:<28} {ms:6.2} ms/frame  ({:.0} fps cap)",
+                1000.0 / ms.max(0.001)
+            );
         };
         let src = bgra_to_yuv444(&bgra, w * 4, w, h);
         let (m, a) = split_yuv444(&src);
-        time("bgra->yuv444 (server)", iters, { let bgra = bgra.clone(); Box::new(move || { let _ = bgra_to_yuv444(&bgra, w * 4, w, h); }) });
-        time("split 4:4:4->2xNV12 (server)", iters, { let src = src.clone(); Box::new(move || { let _ = split_yuv444(&src); }) });
-        time("subsample 4:4:4->NV12 (single)", iters, { let src = src.clone(); Box::new(move || { let _ = yuv444_to_nv12(&src); }) });
-        time("recombine 2xNV12->444 (client)", iters, { let m = m.clone(); let a = a.clone(); Box::new(move || { let _ = recombine_yuv444(&m, &a); }) });
-        time("yuv444->bgra (client)", iters, { let src = src.clone(); Box::new(move || { let _ = yuv444_to_bgra(&src); }) });
+        time("bgra->yuv444 (server)", iters, {
+            let bgra = bgra.clone();
+            Box::new(move || {
+                let _ = bgra_to_yuv444(&bgra, w * 4, w, h);
+            })
+        });
+        time("split 4:4:4->2xNV12 (server)", iters, {
+            let src = src.clone();
+            Box::new(move || {
+                let _ = split_yuv444(&src);
+            })
+        });
+        time("subsample 4:4:4->NV12 (single)", iters, {
+            let src = src.clone();
+            Box::new(move || {
+                let _ = yuv444_to_nv12(&src);
+            })
+        });
+        time("recombine 2xNV12->444 (client)", iters, {
+            let m = m.clone();
+            let a = a.clone();
+            Box::new(move || {
+                let _ = recombine_yuv444(&m, &a);
+            })
+        });
+        time("yuv444->bgra (client)", iters, {
+            let src = src.clone();
+            Box::new(move || {
+                let _ = yuv444_to_bgra(&src);
+            })
+        });
     }
     Ok(())
 }
@@ -721,13 +993,25 @@ fn gltest(node: &std::path::Path) -> Result<()> {
     let (w, h) = (256u32, 256u32);
     let display: std::rc::Rc<Display> = vaapi::open_display(node)?;
     let mut surfaces = display
-        .create_surfaces::<()>(VA_RT_FORMAT_YUV420, Some(VA_FOURCC_NV12), w, h, Some(UsageHint::USAGE_HINT_ENCODER), vec![()])
+        .create_surfaces::<()>(
+            VA_RT_FORMAT_YUV420,
+            Some(VA_FOURCC_NV12),
+            w,
+            h,
+            Some(UsageHint::USAGE_HINT_ENCODER),
+            vec![()],
+        )
         .map_err(|e| anyhow!("create_surfaces: {e}"))?;
     let surface = surfaces.remove(0);
-    let desc = surface.export_prime().map_err(|e| anyhow!("export_prime: {e}"))?;
+    let desc = surface
+        .export_prime()
+        .map_err(|e| anyhow!("export_prime: {e}"))?;
     let layer = &desc.layers[0];
     let obj = &desc.objects[0];
-    println!("  VA NV12 surface exported: modifier {:#x}, Y off {} pitch {}", obj.drm_format_modifier, layer.offset[0], layer.pitch[0]);
+    println!(
+        "  VA NV12 surface exported: modifier {:#x}, Y off {} pitch {}",
+        obj.drm_format_modifier, layer.offset[0], layer.pitch[0]
+    );
     let y_plane = haver_gl::DmabufPlane {
         fd: obj.fd.as_fd(),
         width: w,
@@ -745,12 +1029,21 @@ fn gltest(node: &std::path::Path) -> Result<()> {
     }
     // Read the surface back and check the Y plane is ~128.
     drop(desc); // close exported fds before mapping
-    let fmt = display.query_image_formats().map_err(|e| anyhow!("{e}"))?.into_iter().find(|f| f.fourcc == VA_FOURCC_NV12).ok_or_else(|| anyhow!("no NV12 image"))?;
-    let image = haver_codec::libva::Image::create_from(&surface, fmt, (w, h), (w, h)).map_err(|e| anyhow!("map surface: {e}"))?;
+    let fmt = display
+        .query_image_formats()
+        .map_err(|e| anyhow!("{e}"))?
+        .into_iter()
+        .find(|f| f.fourcc == VA_FOURCC_NV12)
+        .ok_or_else(|| anyhow!("no NV12 image"))?;
+    let image = haver_codec::libva::Image::create_from(&surface, fmt, (w, h), (w, h))
+        .map_err(|e| anyhow!("map surface: {e}"))?;
     let data = image.as_ref();
     let yo = image.image().offsets[0] as usize;
     let samples: Vec<u8> = (0..8).map(|i| data[yo + i]).collect();
-    let mean: f64 = (0..(w * h) as usize).map(|i| data[yo + i] as f64).sum::<f64>() / (w * h) as f64;
+    let mean: f64 = (0..(w * h) as usize)
+        .map(|i| data[yo + i] as f64)
+        .sum::<f64>()
+        / (w * h) as f64;
     println!("  read-back Y[0..8]={samples:?} mean={mean:.1} (expect ~128 if GL wrote it)");
     let ok = clear.is_ok() && (mean - 128.0).abs() < 8.0;
     status(ok, "GL render into VA encoder surface");

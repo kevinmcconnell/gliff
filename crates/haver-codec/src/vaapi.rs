@@ -46,20 +46,24 @@ impl VaInfo {
     }
 
     pub fn can_decode(&self, profile: i32) -> bool {
-        self.profile(profile).is_some_and(|p| p.has(VAEntrypoint::VAEntrypointVLD))
+        self.profile(profile)
+            .is_some_and(|p| p.has(VAEntrypoint::VAEntrypointVLD))
     }
 
     pub fn can_encode(&self, profile: i32) -> bool {
-        self.profile(profile)
-            .is_some_and(|p| p.has(VAEntrypoint::VAEntrypointEncSlice) || p.has(VAEntrypoint::VAEntrypointEncSliceLP))
+        self.profile(profile).is_some_and(|p| {
+            p.has(VAEntrypoint::VAEntrypointEncSlice) || p.has(VAEntrypoint::VAEntrypointEncSliceLP)
+        })
     }
 
     pub fn low_power_encode(&self, profile: i32) -> bool {
-        self.profile(profile).is_some_and(|p| p.has(VAEntrypoint::VAEntrypointEncSliceLP))
+        self.profile(profile)
+            .is_some_and(|p| p.has(VAEntrypoint::VAEntrypointEncSliceLP))
     }
 
     pub fn h264_encode(&self) -> bool {
-        self.can_encode(VAProfile::VAProfileH264High) || self.can_encode(VAProfile::VAProfileH264Main)
+        self.can_encode(VAProfile::VAProfileH264High)
+            || self.can_encode(VAProfile::VAProfileH264Main)
     }
 
     pub fn h264_decode(&self) -> bool {
@@ -68,28 +72,45 @@ impl VaInfo {
 
     /// Any profile that encodes 4:4:4 natively.
     pub fn native_444_encode(&self) -> Vec<&'static str> {
-        [VAProfile::VAProfileHEVCMain444, VAProfile::VAProfileHEVCSccMain444, VAProfile::VAProfileAV1Profile1]
-            .into_iter()
-            .filter(|p| self.can_encode(*p))
-            .filter_map(|p| self.profile(p).map(|p| p.name))
-            .collect()
+        [
+            VAProfile::VAProfileHEVCMain444,
+            VAProfile::VAProfileHEVCSccMain444,
+            VAProfile::VAProfileAV1Profile1,
+        ]
+        .into_iter()
+        .filter(|p| self.can_encode(*p))
+        .filter_map(|p| self.profile(p).map(|p| p.name))
+        .collect()
     }
 }
 
 pub fn probe(node: &Path) -> Result<VaInfo> {
     let display = open_display(node)?;
-    let vendor = display.query_vendor_string().unwrap_or_else(|_| "unknown".to_owned());
+    let vendor = display
+        .query_vendor_string()
+        .unwrap_or_else(|_| "unknown".to_owned());
     let mut profiles = Vec::new();
-    for id in display.query_config_profiles().map_err(|e| Error::Va(e.to_string()))? {
+    for id in display
+        .query_config_profiles()
+        .map_err(|e| Error::Va(e.to_string()))?
+    {
         let entrypoints = display
             .query_config_entrypoints(id)
             .map_err(|e| Error::Va(e.to_string()))?
             .into_iter()
             .map(|e| (e, entrypoint_name(e)))
             .collect();
-        profiles.push(ProfileInfo { id, name: profile_name(id), entrypoints });
+        profiles.push(ProfileInfo {
+            id,
+            name: profile_name(id),
+            entrypoints,
+        });
     }
-    Ok(VaInfo { node: node.to_path_buf(), vendor, profiles })
+    Ok(VaInfo {
+        node: node.to_path_buf(),
+        vendor,
+        profiles,
+    })
 }
 
 pub fn profile_name(id: i32) -> &'static str {

@@ -18,18 +18,31 @@ pub fn local_keymap() -> String {
 
 fn build() -> anyhow::Result<String> {
     let inst = hypr_ipc::Instance::discover(None)?;
-    let opt = |name: &str| inst.get_option(name).ok().and_then(|o| o.string).unwrap_or_default();
+    let opt = |name: &str| {
+        inst.get_option(name)
+            .ok()
+            .and_then(|o| o.string)
+            .unwrap_or_default()
+    };
     let names = KeymapNames {
         rules: String::new(),
         model: opt("input:kb_model"),
         layout: {
             let l = opt("input:kb_layout");
-            if l.is_empty() { "us".to_string() } else { l }
+            if l.is_empty() {
+                "us".to_string()
+            } else {
+                l
+            }
         },
         variant: opt("input:kb_variant"),
         options: {
             let o = opt("input:kb_options");
-            if o.is_empty() { None } else { Some(o) }
+            if o.is_empty() {
+                None
+            } else {
+                Some(o)
+            }
         },
     };
     Ok(keymap_from_names(&names)?)

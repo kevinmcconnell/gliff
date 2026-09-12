@@ -17,7 +17,12 @@ pub struct SshTarget {
 
 impl SshTarget {
     pub fn new(host: impl Into<String>) -> Self {
-        Self { host: host.into(), server_bin: "haver-server".into(), server_args: Vec::new(), ssh_args: Vec::new() }
+        Self {
+            host: host.into(),
+            server_bin: "haver-server".into(),
+            server_args: Vec::new(),
+            ssh_args: Vec::new(),
+        }
     }
 }
 
@@ -50,5 +55,9 @@ pub fn spawn_ssh(target: &SshTarget) -> std::io::Result<SshStream> {
     let mut child = cmd.spawn()?;
     let stdin = child.stdin.take().expect("piped stdin");
     let stdout = child.stdout.take().expect("piped stdout");
-    Ok(SshStream { child, stdin, stdout })
+    Ok(SshStream {
+        child,
+        stdin,
+        stdout,
+    })
 }

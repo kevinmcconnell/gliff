@@ -14,8 +14,12 @@ use cros_codecs::decoder::FramePool as _;
 use cros_codecs::decoder::{DecodedHandle, DecoderEvent};
 use cros_codecs::encoder::h264::EncoderConfig;
 use cros_codecs::encoder::stateless::h264::StatelessEncoder;
-use cros_codecs::encoder::{FrameMetadata, PredictionStructure, RateControl, Tunings, VideoEncoder};
-use cros_codecs::libva::{Display, Image, UsageHint, VAProfile, VA_FOURCC_NV12, VA_RT_FORMAT_YUV420};
+use cros_codecs::encoder::{
+    FrameMetadata, PredictionStructure, RateControl, Tunings, VideoEncoder,
+};
+use cros_codecs::libva::{
+    Display, Image, UsageHint, VAProfile, VA_FOURCC_NV12, VA_RT_FORMAT_YUV420,
+};
 use cros_codecs::{BlockingMode, FrameLayout, PlaneLayout, Resolution};
 
 use crate::frame::{align_up, nv12, FrameAllocator, FramePool, Nv12Frame};
@@ -68,7 +72,10 @@ pub struct H264Encoder {
 impl H264Encoder {
     pub fn new(display: Rc<Display>, settings: EncoderSettings) -> Result<Self> {
         let config = EncoderConfig {
-            resolution: Resolution { width: settings.width, height: settings.height },
+            resolution: Resolution {
+                width: settings.width,
+                height: settings.height,
+            },
             profile: Profile::High,
             level: Level::L5_1,
             pred_structure: PredictionStructure::LowDelay { limit: 32768 },
@@ -79,7 +86,10 @@ impl H264Encoder {
                 max_quality: 51,
             },
         };
-        let coded = Resolution { width: settings.coded_width(), height: settings.coded_height() };
+        let coded = Resolution {
+            width: settings.coded_width(),
+            height: settings.coded_height(),
+        };
         // The AMD/radeonsi VA-API encoder does not read a linear external
         // dmabuf as its input surface, so input frames are uploaded into
         // driver-owned surfaces with `vaPutImage`. This is the path
@@ -93,44 +103,77 @@ impl H264Encoder {
             settings.low_power,
         )
         .map_err(|e| Error::Encode(e.to_string()))?;
-        let inner = Encoder::new_h264(backend, config, BlockingMode::Blocking).map_err(|e| Error::Encode(e.to_string()))?;
-        let mut pool = VaSurfacePool::<()>::new(display.clone(), VA_RT_FORMAT_YUV420, Some(UsageHint::USAGE_HINT_ENCODER), coded);
-        pool.add_frames(vec![(); 8]).map_err(|e| Error::Encode(e.to_string()))?;
+        let inner = Encoder::new_h264(backend, config, BlockingMode::Blocking)
+            .map_err(|e| Error::Encode(e.to_string()))?;
+        let mut pool = VaSurfacePool::<()>::new(
+            display.clone(),
+            VA_RT_FORMAT_YUV420,
+            Some(UsageHint::USAGE_HINT_ENCODER),
+            coded,
+        );
+        pool.add_frames(vec![(); 8])
+            .map_err(|e| Error::Encode(e.to_string()))?;
         let image_format = display
             .query_image_formats()
             .map_err(|e| Error::Encode(e.to_string()))?
             .into_iter()
             .find(|f| f.fourcc == VA_FOURCC_NV12)
             .ok_or_else(|| Error::Encode("driver has no NV12 image format".into()))?;
-        Ok(Self { inner, pool, image_format, settings, parameter_sets: Vec::new(), frames_encoded: 0 })
+        Ok(Self {
+            inner,
+            pool,
+            image_format,
+            settings,
+            parameter_sets: Vec::new(),
+            frames_encoded: 0,
+        })
     }
 
     fn take_surface(&mut self) -> Result<PooledVaSurface<()>> {
         if let Some(s) = self.pool.get_surface() {
             return Ok(s);
         }
-        self.pool.add_frames(vec![(); 4]).map_err(|e| Error::Encode(e.to_string()))?;
-        self.pool.get_surface().ok_or_else(|| Error::Encode("surface pool exhausted".into()))
+        self.pool
+            .add_frames(vec![(); 4])
+            .map_err(|e| Error::Encode(e.to_string()))?;
+        self.pool
+            .get_surface()
+            .ok_or_else(|| Error::Encode("surface pool exhausted".into()))
     }
 
-    fn upload(&self, surface: &PooledVaSurface<()>, y: &[u8], y_stride: usize, uv: &[u8], uv_stride: usize) -> Result<()> {
+    fn upload(
+        &self,
+        surface: &PooledVaSurface<()>,
+        y: &[u8],
+        y_stride: usize,
+        uv: &[u8],
+        uv_stride: usize,
+    ) -> Result<()> {
         let (w, h) = (self.settings.width as usize, self.settings.height as usize);
         let (cw, ch) = (self.settings.coded_width(), self.settings.coded_height());
         let surf: &cros_codecs::libva::Surface<()> = surface.borrow();
-        let mut image = Image::create_from(surf, self.image_format, (cw, ch), (self.settings.width, self.settings.height))
-            .map_err(|e| Error::Encode(format!("create image: {e}")))?;
+        let mut image = Image::create_from(
+            surf,
+            self.image_format,
+            (cw, ch),
+            (self.settings.width, self.settings.height),
+        )
+        .map_err(|e| Error::Encode(format!("create image: {e}")))?;
         let va = *image.image();
         let dst = image.as_mut();
         let (yo, uvo) = (va.offsets[0] as usize, va.offsets[1] as usize);
         let (yp, uvp) = (va.pitches[0] as usize, va.pitches[1] as usize);
         for row in 0..h {
-            dst[yo + row * yp..yo + row * yp + w].copy_from_slice(&y[row * y_stride..row * y_stride + w]);
+            dst[yo + row * yp..yo + row * yp + w]
+                .copy_from_slice(&y[row * y_stride..row * y_stride + w]);
         }
         for row in 0..h / 2 {
-            dst[uvo + row * uvp..uvo + row * uvp + w].copy_from_slice(&uv[row * uv_stride..row * uv_stride + w]);
+            dst[uvo + row * uvp..uvo + row * uvp + w]
+                .copy_from_slice(&uv[row * uv_stride..row * uv_stride + w]);
         }
         drop(image);
-        surf.sync().map_err(|e| Error::Encode(format!("surface sync: {e}")))?;
+        surf.sync()
+            .map_err(|e| Error::Encode(format!("surface sync: {e}")))?;
         Ok(())
     }
 
@@ -156,7 +199,15 @@ impl H264Encoder {
     }
 
     /// Encode one NV12 frame supplied as separate Y and UV plane slices.
-    pub fn encode_planes(&mut self, y: &[u8], y_stride: usize, uv: &[u8], uv_stride: usize, timestamp: u64, force_keyframe: bool) -> Result<EncodedPacket> {
+    pub fn encode_planes(
+        &mut self,
+        y: &[u8],
+        y_stride: usize,
+        uv: &[u8],
+        uv_stride: usize,
+        timestamp: u64,
+        force_keyframe: bool,
+    ) -> Result<EncodedPacket> {
         let handle = self.take_surface()?;
         self.upload(&handle, y, y_stride, uv, uv_stride)?;
         self.encode_surface(handle, timestamp, force_keyframe)
@@ -174,19 +225,45 @@ impl H264Encoder {
     }
 
     /// Encode a surface whose NV12 content is already in place.
-    pub fn encode_surface(&mut self, handle: PooledVaSurface<()>, timestamp: u64, force_keyframe: bool) -> Result<EncodedPacket> {
+    pub fn encode_surface(
+        &mut self,
+        handle: PooledVaSurface<()>,
+        timestamp: u64,
+        force_keyframe: bool,
+    ) -> Result<EncodedPacket> {
         let layout = FrameLayout {
             format: (nv12(), 0),
-            size: Resolution { width: self.settings.coded_width(), height: self.settings.coded_height() },
+            size: Resolution {
+                width: self.settings.coded_width(),
+                height: self.settings.coded_height(),
+            },
             planes: vec![
-                PlaneLayout { buffer_index: 0, offset: 0, stride: self.settings.coded_width() as usize },
-                PlaneLayout { buffer_index: 0, offset: (self.settings.coded_width() * self.settings.coded_height()) as usize, stride: self.settings.coded_width() as usize },
+                PlaneLayout {
+                    buffer_index: 0,
+                    offset: 0,
+                    stride: self.settings.coded_width() as usize,
+                },
+                PlaneLayout {
+                    buffer_index: 0,
+                    offset: (self.settings.coded_width() * self.settings.coded_height()) as usize,
+                    stride: self.settings.coded_width() as usize,
+                },
             ],
         };
-        let meta = FrameMetadata { timestamp, layout, force_keyframe };
-        self.inner.encode(meta, handle).map_err(|e| Error::Encode(e.to_string()))?;
+        let meta = FrameMetadata {
+            timestamp,
+            layout,
+            force_keyframe,
+        };
+        self.inner
+            .encode(meta, handle)
+            .map_err(|e| Error::Encode(e.to_string()))?;
         let mut packets = Vec::new();
-        while let Some(buf) = self.inner.poll().map_err(|e| Error::Encode(e.to_string()))? {
+        while let Some(buf) = self
+            .inner
+            .poll()
+            .map_err(|e| Error::Encode(e.to_string()))?
+        {
             packets.push(buf);
         }
         let mut data = Vec::new();
@@ -223,7 +300,11 @@ impl H264Encoder {
             data = with_ps;
         }
         data.extend_from_slice(&annexb::AUD);
-        Ok(EncodedPacket { timestamp: timestamp_out, keyframe, data })
+        Ok(EncodedPacket {
+            timestamp: timestamp_out,
+            keyframe,
+            data,
+        })
     }
 }
 
@@ -247,9 +328,19 @@ pub struct H264Decoder {
 impl H264Decoder {
     /// `extra_frames` is how many decoded frames the caller may hold at once on
     /// top of what the decoder needs for references.
-    pub fn new(display: Rc<Display>, allocator: FrameAllocator, extra_frames: usize) -> Result<Self> {
-        let inner = Decoder::new_vaapi(display, BlockingMode::NonBlocking).map_err(|e| Error::Decode(e.to_string()))?;
-        Ok(Self { inner, allocator, pool: None, extra_frames })
+    pub fn new(
+        display: Rc<Display>,
+        allocator: FrameAllocator,
+        extra_frames: usize,
+    ) -> Result<Self> {
+        let inner = Decoder::new_vaapi(display, BlockingMode::NonBlocking)
+            .map_err(|e| Error::Decode(e.to_string()))?;
+        Ok(Self {
+            inner,
+            allocator,
+            pool: None,
+            extra_frames,
+        })
     }
 
     pub fn pool(&self) -> Option<&FramePool> {
@@ -267,7 +358,10 @@ impl H264Decoder {
             }
             let pool = &self.pool;
             let mut alloc = || pool.as_ref().and_then(FramePool::alloc);
-            match self.inner.decode(timestamp, &access_unit[offset..], &mut alloc) {
+            match self
+                .inner
+                .decode(timestamp, &access_unit[offset..], &mut alloc)
+            {
                 Ok(consumed) => {
                     offset += consumed;
                     stalls = 0;
@@ -276,12 +370,23 @@ impl H264Decoder {
                     self.drain_events(&mut ready)?;
                     stalls += 1;
                     if stalls > 8 {
-                        return Err(Error::Decode("decoder stalled waiting for output buffers".into()));
+                        return Err(Error::Decode(
+                            "decoder stalled waiting for output buffers".into(),
+                        ));
                     }
                 }
                 Err(e) => {
-                    let tail: Vec<String> = access_unit[offset..].iter().take(8).map(|b| format!("{b:02x}")).collect();
-                    tracing::debug!(offset, len = access_unit.len(), tail = tail.join(" "), "decode error");
+                    let tail: Vec<String> = access_unit[offset..]
+                        .iter()
+                        .take(8)
+                        .map(|b| format!("{b:02x}"))
+                        .collect();
+                    tracing::debug!(
+                        offset,
+                        len = access_unit.len(),
+                        tail = tail.join(" "),
+                        "decode error"
+                    );
                     return Err(Error::Decode(e.to_string()));
                 }
             }
@@ -292,7 +397,9 @@ impl H264Decoder {
 
     /// Drop all state so the next IDR starts a fresh stream.
     pub fn flush(&mut self) -> Result<()> {
-        self.inner.flush().map_err(|e| Error::Decode(e.to_string()))?;
+        self.inner
+            .flush()
+            .map_err(|e| Error::Decode(e.to_string()))?;
         let mut sink = Vec::new();
         self.drain_events(&mut sink)?;
         Ok(())

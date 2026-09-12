@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, Weak};
 use cros_codecs::libva::{Display, Surface};
 use cros_codecs::video_frame::generic_dma_video_frame::GenericDmaVideoFrame;
 use cros_codecs::video_frame::{ReadMapping, VideoFrame, WriteMapping};
-use cros_codecs::{FrameLayout, Fourcc, PlaneLayout, Resolution};
+use cros_codecs::{Fourcc, FrameLayout, PlaneLayout, Resolution};
 use drm_fourcc::DrmModifier;
 use gbm::{BufferObjectFlags, Device, Format};
 use haver_proto::chroma::Nv12;
@@ -79,12 +79,19 @@ impl Nv12Frame {
     pub fn layout(&self) -> FrameLayout {
         FrameLayout {
             format: (nv12(), self.info.modifier),
-            size: Resolution { width: self.info.width, height: self.info.height },
+            size: Resolution {
+                width: self.info.width,
+                height: self.info.height,
+            },
             planes: self
                 .info
                 .planes
                 .iter()
-                .map(|p| PlaneLayout { buffer_index: 0, offset: p.offset as usize, stride: p.stride as usize })
+                .map(|p| PlaneLayout {
+                    buffer_index: 0,
+                    offset: p.offset as usize,
+                    stride: p.stride as usize,
+                })
                 .collect(),
         }
     }
@@ -94,7 +101,10 @@ impl Nv12Frame {
     }
 
     /// Run `f` with writable Y and UV plane slices.
-    pub fn with_planes_mut<R>(&mut self, f: impl FnOnce(&mut [u8], &mut [u8], usize, usize) -> R) -> Result<R> {
+    pub fn with_planes_mut<R>(
+        &mut self,
+        f: impl FnOnce(&mut [u8], &mut [u8], usize, usize) -> R,
+    ) -> Result<R> {
         let pitches = self.inner().get_plane_pitch();
         let mapping = self
             .inner
@@ -151,7 +161,10 @@ impl VideoFrame for Nv12Frame {
     }
 
     fn resolution(&self) -> Resolution {
-        Resolution { width: self.info.width, height: self.info.height }
+        Resolution {
+            width: self.info.width,
+            height: self.info.height,
+        }
     }
 
     fn get_plane_size(&self) -> Vec<usize> {
@@ -167,10 +180,16 @@ impl VideoFrame for Nv12Frame {
     }
 
     fn map_mut<'a>(&'a mut self) -> std::result::Result<Box<dyn WriteMapping<'a> + 'a>, String> {
-        self.inner.as_mut().expect("frame inner present until drop").map_mut()
+        self.inner
+            .as_mut()
+            .expect("frame inner present until drop")
+            .map_mut()
     }
 
-    fn to_native_handle(&self, display: &Rc<Display>) -> std::result::Result<Self::NativeHandle, String> {
+    fn to_native_handle(
+        &self,
+        display: &Rc<Display>,
+    ) -> std::result::Result<Self::NativeHandle, String> {
         self.inner().to_native_handle(display)
     }
 }
@@ -201,9 +220,19 @@ impl FrameAllocator {
         let modifier: u64 = bo.modifier().map_err(|e| Error::Gbm(e.to_string()))?.into();
         let modifier = match DrmModifier::from(modifier) {
             DrmModifier::Linear | DrmModifier::Invalid => 0,
-            other => return Err(Error::Gbm(format!("expected a linear buffer, got modifier {other:?}"))),
+            other => {
+                return Err(Error::Gbm(format!(
+                    "expected a linear buffer, got modifier {other:?}"
+                )))
+            }
         };
-        let planes = vec![Plane { offset: 0, stride }, Plane { offset: stride * height, stride }];
+        let planes = vec![
+            Plane { offset: 0, stride },
+            Plane {
+                offset: stride * height,
+                stride,
+            },
+        ];
         let fd = bo.fd().map_err(|e| Error::Gbm(e.to_string()))?;
         let info = Arc::new(DmabufInfo {
             fd,
@@ -220,7 +249,11 @@ impl FrameAllocator {
             planes: info
                 .planes
                 .iter()
-                .map(|p| PlaneLayout { buffer_index: 0, offset: p.offset as usize, stride: p.stride as usize })
+                .map(|p| PlaneLayout {
+                    buffer_index: 0,
+                    offset: p.offset as usize,
+                    stride: p.stride as usize,
+                })
                 .collect(),
         };
         let inner = GenericDmaVideoFrame::new(vec![file], layout).map_err(Error::Gbm)?;
@@ -246,7 +279,12 @@ impl FramePool {
             let (inner, info) = allocator.allocate(width, height)?;
             free.push((inner, info, NEXT_ID.fetch_add(1, Ordering::Relaxed)));
         }
-        Ok(Self { width, height, free: Arc::new(Mutex::new(free)), total: count })
+        Ok(Self {
+            width,
+            height,
+            free: Arc::new(Mutex::new(free)),
+            total: count,
+        })
     }
 
     pub fn width(&self) -> u32 {
@@ -267,7 +305,12 @@ impl FramePool {
 
     pub fn alloc(&self) -> Option<Nv12Frame> {
         let (inner, info, id) = self.free.lock().ok()?.pop()?;
-        Some(Nv12Frame { id, inner: Some(inner), info, pool: Arc::downgrade(&self.free) })
+        Some(Nv12Frame {
+            id,
+            inner: Some(inner),
+            info,
+            pool: Arc::downgrade(&self.free),
+        })
     }
 
     pub fn try_alloc(&self) -> Result<Nv12Frame> {

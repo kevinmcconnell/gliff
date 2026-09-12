@@ -72,12 +72,15 @@ impl Target {
                 }
             }
         }
-        let inst = hypr_ipc::Instance::discover(self.instance.as_deref()).map_err(|e| Error::NoDisplay(e.to_string()))?;
-        inst.wayland_display().map_err(|e| Error::NoDisplay(e.to_string()))
+        let inst = hypr_ipc::Instance::discover(self.instance.as_deref())
+            .map_err(|e| Error::NoDisplay(e.to_string()))?;
+        inst.wayland_display()
+            .map_err(|e| Error::NoDisplay(e.to_string()))
     }
 
     pub fn instance(&self) -> Result<hypr_ipc::Instance> {
-        hypr_ipc::Instance::discover(self.instance.as_deref()).map_err(|e| Error::NoDisplay(e.to_string()))
+        hypr_ipc::Instance::discover(self.instance.as_deref())
+            .map_err(|e| Error::NoDisplay(e.to_string()))
     }
 }
 
@@ -112,14 +115,21 @@ pub struct GlobalInfo {
 
 pub fn list_globals(globals: &GlobalList) -> Vec<GlobalInfo> {
     let mut v: Vec<GlobalInfo> = globals.contents().with_list(|list| {
-        list.iter().map(|g| GlobalInfo { interface: g.interface.clone(), version: g.version }).collect()
+        list.iter()
+            .map(|g| GlobalInfo {
+                interface: g.interface.clone(),
+                version: g.version,
+            })
+            .collect()
     });
     v.sort_by(|a, b| a.interface.cmp(&b.interface));
     v
 }
 
 pub fn has_global(globals: &GlobalList, interface: &str) -> bool {
-    globals.contents().with_list(|list| list.iter().any(|g| g.interface == interface))
+    globals
+        .contents()
+        .with_list(|list| list.iter().any(|g| g.interface == interface))
 }
 
 /// State of one `wl_output`.
@@ -140,7 +150,11 @@ pub struct OutputInfo {
 impl OutputInfo {
     /// Logical size after scale and transform.
     pub fn logical_size(&self) -> (u32, u32) {
-        let (w, h) = if self.transform % 2 == 1 { (self.height, self.width) } else { (self.width, self.height) };
+        let (w, h) = if self.transform % 2 == 1 {
+            (self.height, self.width)
+        } else {
+            (self.width, self.height)
+        };
         let s = self.scale.max(1);
         ((w / s).max(1) as u32, (h / s).max(1) as u32)
     }
@@ -160,7 +174,10 @@ impl Outputs {
     {
         let mut list = Vec::new();
         let names: Vec<u32> = globals.contents().with_list(|l| {
-            l.iter().filter(|g| g.interface == WlOutput::interface().name).map(|g| g.name).collect()
+            l.iter()
+                .filter(|g| g.interface == WlOutput::interface().name)
+                .map(|g| g.name)
+                .collect()
         });
         for name in names {
             let output: WlOutput = globals.registry().bind(name, 4, qh, ());
@@ -174,7 +191,9 @@ impl Outputs {
     }
 
     pub fn find(&self, name: &str) -> Result<(WlOutput, OutputInfo)> {
-        self.get(name).cloned().ok_or_else(|| Error::NoOutput(name.to_owned()))
+        self.get(name)
+            .cloned()
+            .ok_or_else(|| Error::NoOutput(name.to_owned()))
     }
 
     pub fn infos(&self) -> Vec<OutputInfo> {
@@ -182,20 +201,36 @@ impl Outputs {
     }
 
     fn info_mut(&mut self, output: &WlOutput) -> Option<&mut OutputInfo> {
-        self.list.iter_mut().find(|(o, _)| o == output).map(|(_, i)| i)
+        self.list
+            .iter_mut()
+            .find(|(o, _)| o == output)
+            .map(|(_, i)| i)
     }
 
     /// Handle a `wl_output` event; returns true when an output finished a burst.
     pub fn handle(&mut self, output: &WlOutput, event: wl_output::Event) -> bool {
-        let Some(info) = self.info_mut(output) else { return false };
+        let Some(info) = self.info_mut(output) else {
+            return false;
+        };
         match event {
-            wl_output::Event::Geometry { x, y, transform, .. } => {
+            wl_output::Event::Geometry {
+                x, y, transform, ..
+            } => {
                 info.x = x;
                 info.y = y;
                 info.transform = transform.into();
             }
-            wl_output::Event::Mode { flags, width, height, refresh } => {
-                if flags.into_result().map(|f| f.contains(wl_output::Mode::Current)).unwrap_or(false) {
+            wl_output::Event::Mode {
+                flags,
+                width,
+                height,
+                refresh,
+            } => {
+                if flags
+                    .into_result()
+                    .map(|f| f.contains(wl_output::Mode::Current))
+                    .unwrap_or(false)
+                {
                     info.width = width;
                     info.height = height;
                     info.refresh_mhz = refresh;
@@ -229,7 +264,10 @@ impl Seat {
         D: Dispatch<WlSeat, ()> + 'static,
     {
         let seat: WlSeat = globals.bind(qh, 1..=7, ())?;
-        Ok(Self { seat: Some(seat), ..Default::default() })
+        Ok(Self {
+            seat: Some(seat),
+            ..Default::default()
+        })
     }
 
     pub fn handle(&mut self, event: wl_seat::Event) {
@@ -263,11 +301,18 @@ pub trait LoopState: 'static {
 
 /// Run a calloop loop over the Wayland queue and the command channel until
 /// the state reports it has stopped.
-pub fn run_loop<S: LoopState>(conn: Connection, queue: EventQueue<S>, rx: Channel<S::Cmd>, state: &mut S) -> Result<()> {
+pub fn run_loop<S: LoopState>(
+    conn: Connection,
+    queue: EventQueue<S>,
+    rx: Channel<S::Cmd>,
+    state: &mut S,
+) -> Result<()> {
     let wayland = |e: &dyn std::fmt::Display| Error::Wayland(e.to_string());
     let mut event_loop: EventLoop<S> = EventLoop::try_new().map_err(|e| wayland(&e))?;
     let handle = event_loop.handle();
-    WaylandSource::new(conn, queue).insert(handle.clone()).map_err(|e| wayland(&e))?;
+    WaylandSource::new(conn, queue)
+        .insert(handle.clone())
+        .map_err(|e| wayland(&e))?;
     handle
         .insert_source(rx, |evt, _, state: &mut S| match evt {
             channel::Event::Msg(cmd) => state.on_cmd(cmd),
