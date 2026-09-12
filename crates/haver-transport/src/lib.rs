@@ -14,7 +14,7 @@ use haver_proto::frame::MAX_FRAME_BODY;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::io::IoSlice;
-use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, AsyncRead};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub use ssh::{spawn_ssh, SshTarget};
 
@@ -102,12 +102,10 @@ impl<S: AsyncRead + Unpin> Framed<S> {
 
     async fn read_exact_bytes(&mut self, n: usize) -> Result<BytesMut> {
         while self.read_buf.len() < n {
-            let mut chunk = [0u8; 32 * 1024];
-            let read = self.stream.read(&mut chunk).await?;
-            if read == 0 {
+            self.read_buf.reserve((n - self.read_buf.len()).max(32 * 1024));
+            if self.stream.read_buf(&mut self.read_buf).await? == 0 {
                 return Err(Error::Closed);
             }
-            self.read_buf.extend_from_slice(&chunk[..read]);
         }
         Ok(self.read_buf.split_to(n))
     }
