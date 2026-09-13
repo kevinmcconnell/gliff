@@ -41,7 +41,8 @@ struct Cli {
     /// Single 4:2:0 stream instead of 4:4:4 (lower bandwidth).
     #[arg(long)]
     low_bandwidth: bool,
-    /// Target bitrate in bits per second (default: derived from size).
+    /// Maximum bitrate in bits per second (default: derived from size). The
+    /// server adapts below it when the link shows queueing.
     #[arg(long)]
     bitrate: Option<u32>,
 }

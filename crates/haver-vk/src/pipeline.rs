@@ -72,6 +72,15 @@ impl Encoder {
         &self.settings
     }
 
+    /// Change the target bitrate of both streams from the next frame on.
+    pub fn set_bitrate(&mut self, bitrate: u32) {
+        self.settings.bitrate = bitrate;
+        self.main.set_bitrate(bitrate);
+        if let Some(a) = &mut self.aux {
+            a.set_bitrate(bitrate);
+        }
+    }
+
     /// Encode a captured dmabuf. `key` identifies the buffer so its import
     /// is reused across frames; pass a new key when the buffer changes.
     pub fn encode_dmabuf(

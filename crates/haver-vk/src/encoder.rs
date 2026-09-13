@@ -252,6 +252,8 @@ pub struct H264Encoder {
     idr_pic_id: u16,
     poc: i32,
     started: bool,
+    /// A bitrate change to apply with the next frame's rate-control update.
+    pending_bitrate: Option<u32>,
 }
 
 impl H264Encoder {
@@ -368,6 +370,7 @@ impl H264Encoder {
                 idr_pic_id: 0,
                 poc: 0,
                 started: false,
+                pending_bitrate: None,
             };
             enc.sps = enc.encoded_parameters(true, false)?;
             enc.pps = enc.encoded_parameters(false, true)?;
@@ -382,6 +385,14 @@ impl H264Encoder {
 
     pub fn settings(&self) -> &EncoderSettings {
         &self.settings
+    }
+
+    /// Change the CBR target from the next frame on, without resetting the
+    /// session (no keyframe is forced).
+    pub fn set_bitrate(&mut self, bitrate: u32) {
+        if bitrate != self.settings.bitrate {
+            self.pending_bitrate = Some(bitrate);
+        }
     }
 
     /// SPS then PPS, Annex B framed.
@@ -457,6 +468,7 @@ impl H264Encoder {
         wait: Option<u64>,
         force_keyframe: bool,
     ) -> Result<PendingEncode> {
+        let bitrate_change = self.pending_bitrate.take();
         let idr = force_keyframe || !self.started || self.current_ref.is_none();
         if idr {
             self.frame_num = 0;
@@ -641,7 +653,11 @@ impl H264Encoder {
                 begin = begin.push_next(&mut rc_info).push_next(&mut h264_rc);
             }
 
-            let settings = &self.settings;
+            let mut next_settings = self.settings.clone();
+            if let Some(b) = bitrate_change {
+                next_settings.bitrate = b;
+            }
+            let settings = &next_settings;
             let started = self.started;
             let dev = &self.gpu.device;
             let video = self.gpu.video.fp();
@@ -658,20 +674,9 @@ impl H264Encoder {
                         dev.cmd_reset_query_pool(cmd, query_pool, 0, 1);
                         (video.cmd_begin_video_coding_khr)(cmd, &begin);
                         if !started {
-                            let mut rc = RateControl::new(settings);
-                            let (mut rc_info, mut h264_rc) = rc.infos();
-                            let mut quality =
-                                vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(0);
-                            let control = vk::VideoCodingControlInfoKHR::default()
-                                .flags(
-                                    vk::VideoCodingControlFlagsKHR::RESET
-                                        | vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL
-                                        | vk::VideoCodingControlFlagsKHR::ENCODE_QUALITY_LEVEL,
-                                )
-                                .push_next(&mut rc_info)
-                                .push_next(&mut h264_rc)
-                                .push_next(&mut quality);
-                            (video.cmd_control_video_coding_khr)(cmd, &control);
+                            record_rate_control(cmd, video, settings, true);
+                        } else if bitrate_change.is_some() {
+                            record_rate_control(cmd, video, settings, false);
                         }
                         dev.cmd_begin_query(cmd, query_pool, 0, vk::QueryControlFlags::empty());
                         (encode.cmd_encode_video_khr)(cmd, &encode_info);
@@ -686,6 +691,10 @@ impl H264Encoder {
             Ok::<(), Error>(())
         })?;
 
+        if let Some(b) = bitrate_change {
+            tracing::info!(bitrate = b, "encoder bitrate changed");
+            self.settings.bitrate = b;
+        }
         // The DPB and counters describe the picture just recorded; the
         // bitstream itself is collected by `finish`.
         self.slots[setup_slot] = Some(current);
@@ -740,6 +749,36 @@ impl H264Encoder {
 /// An encode that has been submitted but not yet read back.
 pub(crate) struct PendingEncode {
     idr: bool,
+}
+
+/// Program CBR rate control (and the quality level) for `settings`; with
+/// `reset` this also starts the session, as the first frame must.
+///
+/// # Safety
+/// `cmd` is recording inside a video coding scope of an encode session.
+unsafe fn record_rate_control(
+    cmd: vk::CommandBuffer,
+    video: &ash::khr::video_queue::DeviceFn,
+    settings: &EncoderSettings,
+    reset: bool,
+) {
+    let mut rc = RateControl::new(settings);
+    let (mut rc_info, mut h264_rc) = rc.infos();
+    let mut quality = vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(0);
+    let mut flags = vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL;
+    if reset {
+        flags |= vk::VideoCodingControlFlagsKHR::RESET
+            | vk::VideoCodingControlFlagsKHR::ENCODE_QUALITY_LEVEL;
+    }
+    let mut control = vk::VideoCodingControlInfoKHR::default()
+        .flags(flags)
+        .push_next(&mut rc_info)
+        .push_next(&mut h264_rc);
+    if reset {
+        control = control.push_next(&mut quality);
+    }
+    // SAFETY: per the function contract; every chained struct outlives the call.
+    unsafe { (video.cmd_control_video_coding_khr)(cmd, &control) };
 }
 
 /// The CBR rate control state: one layer at the target bitrate and frame

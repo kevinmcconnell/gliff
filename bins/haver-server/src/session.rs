@@ -92,18 +92,13 @@ where
             }],
         })
         .await?;
-    send_stream_config(&mut writer, codec, chroma, output.width, output.height).await?;
+    send_stream_config(&mut writer, codec, chroma, &output).await?;
 
     let (cap_tx, mut cap_rx) = mpsc::unbounded_channel();
     let capturer = start_capture(&cfg.target, &output.name, &cfg.render_node, cap_tx)?;
 
     let input = start_input(&cfg.target, &output.name, &keymap)?;
-    input
-        .send(InputCmd::SetExtent {
-            width: output.width,
-            height: output.height,
-        })
-        .ok();
+    input.send(output.logical_extent()).ok();
 
     let (clip_out_tx, mut clip_out_rx) = mpsc::unbounded_channel::<String>();
     let clipboard = Clipboard::start(
@@ -116,7 +111,11 @@ where
     .ok();
 
     let gpu = Gpu::open(Some(&cfg.render_node)).context("open Vulkan device")?;
-    let settings = encoder_settings(output.width, output.height, cfg.bitrate);
+    let bitrate_ctl = BitrateController::new(
+        cfg.bitrate
+            .unwrap_or_else(|| EncoderSettings::default_bitrate(output.width, output.height, 60)),
+    );
+    let settings = encoder_settings(output.width, output.height, bitrate_ctl.current());
     let encoder = Encoder::new(&gpu, settings.clone(), chroma == ChromaMode::Dual420)
         .context("create encoder")?;
 
@@ -129,7 +128,7 @@ where
         instance,
         output,
         caps,
-        bitrate: cfg.bitrate,
+        bitrate_ctl,
         codec,
         chroma,
         settings,
@@ -252,7 +251,7 @@ struct Session<W> {
     instance: hypr_ipc::Instance,
     output: SessionOutput,
     caps: ClientCaps,
-    bitrate: Option<u32>,
+    bitrate_ctl: BitrateController,
     codec: Codec,
     chroma: ChromaMode,
     settings: EncoderSettings,
@@ -282,6 +281,10 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                 self.in_flight = self.in_flight.saturating_sub(1);
                 self.rtt.record(frame_id, decoded_at_ms);
                 self.n_limit = self.rtt.window(self.settings.framerate);
+                if let Some(bitrate) = self.bitrate_ctl.on_ack(self.rtt.smoothed_ms) {
+                    self.settings.bitrate = bitrate;
+                    self.encoder.set_bitrate(bitrate);
+                }
             }
             ClientMsg::RequestKeyframe => self.want_keyframe = true,
             ClientMsg::Key { keycode, pressed } => self.inject(InputCmd::Key {
@@ -309,7 +312,11 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                     stop,
                 })
             }
-            ClientMsg::Resize { width, height, .. } => self.resize(width, height).await?,
+            ClientMsg::Resize {
+                width,
+                height,
+                scale,
+            } => self.resize(width, height, scale).await?,
             ClientMsg::Ping { t } => {
                 self.writer
                     .write_msg(&ServerMsg::Pong {
@@ -335,33 +342,46 @@ impl<W: AsyncWrite + Unpin> Session<W> {
 
     /// Resize a headless output to the client's window, within the size it
     /// declared in Hello, and restart the encoder at the new size.
-    async fn resize(&mut self, width: u32, height: u32) -> Result<()> {
+    /// Resize a headless output to the client's window at the client's
+    /// scale, so the remote UI renders at the client's DPI.
+    async fn resize(&mut self, width: u32, height: u32, scale: f32) -> Result<()> {
         let width = width.min(self.caps.max_width) & !1;
         let height = height.min(self.caps.max_height) & !1;
-        if !self.output.is_headless()
-            || width < 320
-            || height < 240
-            || (width, height) == (self.output.width, self.output.height)
-        {
+        let scale = if scale.is_finite() {
+            scale.clamp(0.5, 4.0)
+        } else {
+            1.0
+        };
+        let same_size = (width, height) == (self.output.width, self.output.height);
+        let same_scale = (scale - self.output.scale).abs() < 0.01;
+        if !self.output.is_headless() || width < 320 || height < 240 || (same_size && same_scale) {
             return Ok(());
         }
-        tracing::info!(width, height, "resizing headless output");
+        tracing::info!(width, height, scale, "resizing headless output");
         self.instance
-            .set_monitor_mode(&self.output.name, width, height, 60, 1.0)
+            .set_monitor_mode(&self.output.name, width, height, 60, scale)
             .ok();
-        self.output.width = width;
-        self.output.height = height;
-        self.settings = encoder_settings(width, height, self.bitrate);
-        self.encoder = Encoder::new(
-            &self.gpu,
-            self.settings.clone(),
-            self.chroma == ChromaMode::Dual420,
-        )
-        .context("reconfigure encoder")?;
-        self.inject(InputCmd::SetExtent { width, height });
-        self.pending = None;
-        self.want_keyframe = true;
-        send_stream_config(&mut self.writer, self.codec, self.chroma, width, height).await
+        // Hyprland applies the mode asynchronously and may round the scale
+        // so the logical size is whole; wait for it and use what it chose.
+        let applied = self
+            .instance
+            .wait_for_mode(&self.output.name, width, height, scale);
+        self.output.scale = applied;
+        self.inject(self.output.logical_extent());
+        if !same_size {
+            self.output.width = width;
+            self.output.height = height;
+            self.settings = encoder_settings(width, height, self.bitrate_ctl.current());
+            self.encoder = Encoder::new(
+                &self.gpu,
+                self.settings.clone(),
+                self.chroma == ChromaMode::Dual420,
+            )
+            .context("reconfigure encoder")?;
+            self.pending = None;
+            self.want_keyframe = true;
+        }
+        send_stream_config(&mut self.writer, self.codec, self.chroma, &self.output).await
     }
 
     async fn send_clipboard(&mut self, text: String) -> Result<()> {
@@ -426,6 +446,9 @@ impl<W: AsyncWrite + Unpin> Session<W> {
     /// Encode and send the pending frame if the client has ack capacity, then
     /// ask the capture thread for the next one.
     async fn pump_encoder(&mut self) -> Result<()> {
+        if self.pending.is_some() && self.in_flight >= self.n_limit {
+            self.bitrate_ctl.note_blocked();
+        }
         if self.in_flight < self.n_limit {
             if let Some(frame) = self.pending.take() {
                 // A frame captured before a resize took effect is stale.
@@ -492,6 +515,7 @@ impl<W: AsyncWrite + Unpin> Session<W> {
             "sent frame"
         );
         self.rtt.on_sent(self.frame_id);
+        self.bitrate_ctl.note_sent();
         self.frame_id += 1;
         self.in_flight += 1;
         Ok(())
@@ -502,14 +526,30 @@ impl<W: AsyncWrite + Unpin> Session<W> {
 /// every exit path including a failure later in setup.
 struct SessionOutput {
     name: String,
+    /// Physical (captured) size.
     width: u32,
     height: u32,
+    /// Output scale; the logical size the pointer works in is size / scale.
+    scale: f32,
     headless: Option<hypr_ipc::Instance>,
 }
 
 impl SessionOutput {
     fn is_headless(&self) -> bool {
         self.headless.is_some()
+    }
+
+    fn scale_milli(&self) -> u32 {
+        (self.scale * 1000.0).round() as u32
+    }
+
+    /// The logical extent Hyprland exposes to clients and the virtual pointer.
+    fn logical_extent(&self) -> InputCmd {
+        let s = self.scale.max(0.5);
+        InputCmd::SetExtent {
+            width: (self.width as f32 / s).round().max(1.0) as u32,
+            height: (self.height as f32 / s).round().max(1.0) as u32,
+        }
     }
 }
 
@@ -525,26 +565,26 @@ async fn send_stream_config<W: AsyncWrite + Unpin>(
     writer: &mut Framed<W>,
     codec: Codec,
     chroma: ChromaMode,
-    width: u32,
-    height: u32,
+    output: &SessionOutput,
 ) -> Result<()> {
     // Parameter sets ride in-band on every keyframe, so extradata is empty.
     let msg = ServerMsg::StreamConfig {
         codec,
         chroma,
-        width,
-        height,
+        width: output.width,
+        height: output.height,
+        scale_milli: output.scale_milli(),
         extradata: Vec::new(),
         aux_extradata: None,
     };
     Ok(writer.write_msg(&msg).await?)
 }
 
-fn encoder_settings(width: u32, height: u32, bitrate: Option<u32>) -> EncoderSettings {
+fn encoder_settings(width: u32, height: u32, bitrate: u32) -> EncoderSettings {
     EncoderSettings {
         width,
         height,
-        bitrate: bitrate.unwrap_or_else(|| EncoderSettings::default_bitrate(width, height, 60)),
+        bitrate,
         framerate: 60,
     }
 }
@@ -567,6 +607,7 @@ fn setup_output(
             name: m.name.clone(),
             width: m.width & !1,
             height: m.height & !1,
+            scale: m.scale,
             headless: None,
         });
     }
@@ -580,6 +621,7 @@ fn setup_output(
         name: requested,
         width: 0,
         height: 0,
+        scale: 1.0,
         headless: Some(instance.clone()),
     };
     std::thread::sleep(Duration::from_millis(200));
@@ -658,6 +700,94 @@ fn start_input(target: &Target, output: &str, keymap: &str) -> Result<Input> {
 struct RttEstimator {
     sent: VecDeque<(u64, Instant)>,
     smoothed_ms: f64,
+}
+
+/// Adapts the CBR target to the path. The ack RTT is the signal: its
+/// minimum is the base delay, growth over the base is queueing; a queue or
+/// a starved send window cuts the rate, a quiet path grows it back slowly.
+struct BitrateController {
+    min: u32,
+    max: u32,
+    current: u32,
+    base_rtt_ms: f64,
+    last_eval: Instant,
+    last_change: Instant,
+    sent: u32,
+    blocked: u32,
+}
+
+impl BitrateController {
+    const EVAL_EVERY: Duration = Duration::from_millis(500);
+    const GROW_AFTER: Duration = Duration::from_secs(2);
+    const QUEUE_HIGH_MS: f64 = 50.0;
+    const QUEUE_LOW_MS: f64 = 15.0;
+
+    fn new(max: u32) -> Self {
+        let now = Instant::now();
+        Self {
+            min: (max / 8).max(1_000_000).min(max),
+            max,
+            current: max,
+            base_rtt_ms: f64::MAX,
+            last_eval: now,
+            last_change: now,
+            sent: 0,
+            blocked: 0,
+        }
+    }
+
+    fn current(&self) -> u32 {
+        self.current
+    }
+
+    fn note_sent(&mut self) {
+        self.sent += 1;
+    }
+
+    /// A frame is waiting because every allowed frame is still unacked.
+    fn note_blocked(&mut self) {
+        self.blocked += 1;
+    }
+
+    /// Feed the smoothed ack RTT; returns a new target when it changes.
+    fn on_ack(&mut self, smoothed_ms: f64) -> Option<u32> {
+        self.base_rtt_ms = self.base_rtt_ms.min(smoothed_ms);
+        let now = Instant::now();
+        if now.duration_since(self.last_eval) < Self::EVAL_EVERY {
+            return None;
+        }
+        self.last_eval = now;
+        // Let the base drift up slowly so a path change is re-learned.
+        self.base_rtt_ms += 0.5;
+        let queueing = smoothed_ms - self.base_rtt_ms;
+        let starved = self.sent > 0 && self.blocked > self.sent;
+        let (sent, blocked) = (self.sent, self.blocked);
+        self.sent = 0;
+        self.blocked = 0;
+        let next = if queueing > Self::QUEUE_HIGH_MS || starved {
+            (self.current / 4 * 3).max(self.min)
+        } else if queueing < Self::QUEUE_LOW_MS
+            && now.duration_since(self.last_change) >= Self::GROW_AFTER
+        {
+            (self.current / 10 * 11).min(self.max)
+        } else {
+            self.current
+        };
+        if next == self.current {
+            return None;
+        }
+        tracing::info!(
+            from = self.current,
+            to = next,
+            queueing_ms = format!("{queueing:.1}"),
+            sent,
+            blocked,
+            "adapting bitrate"
+        );
+        self.current = next;
+        self.last_change = now;
+        Some(next)
+    }
 }
 
 impl RttEstimator {

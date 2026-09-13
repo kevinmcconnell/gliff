@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Chunk cap for clipboard payloads on the wire.
 pub const CLIPBOARD_CHUNK: usize = 256 * 1024;
@@ -129,8 +129,12 @@ pub enum ServerMsg {
     StreamConfig {
         codec: Codec,
         chroma: ChromaMode,
+        /// Stream size in physical pixels.
         width: u32,
         height: u32,
+        /// Output scale x1000: the remote's logical size is `width / scale`,
+        /// and pointer coordinates are sent in that logical space.
+        scale_milli: u32,
         extradata: Vec<u8>,
         aux_extradata: Option<Vec<u8>>,
     },

@@ -59,6 +59,10 @@ enum Cmd {
         /// the synthetic stripes are a worst case for 4:2:0 chroma).
         #[arg(long)]
         bitrate: Option<u32>,
+        /// Drop the bitrate to a quarter for the middle third of the run and
+        /// restore it, to exercise the live rate-control update.
+        #[arg(long)]
+        adapt: bool,
     },
     /// Capture one frame of an output and write it as PNG
     Capture {
@@ -133,7 +137,8 @@ fn main() -> Result<()> {
             frames,
             single,
             bitrate,
-        } => roundtrip(&node, width, height, frames, !single, bitrate)?,
+            adapt,
+        } => roundtrip(&node, width, height, frames, !single, bitrate, adapt)?,
         Cmd::Capture {
             output,
             png,
@@ -153,7 +158,7 @@ fn main() -> Result<()> {
             outputs(&target)?;
             permissions(&target)?;
             vulkan_info(&node)?;
-            roundtrip(&node, 640, 360, 10, true, None)?;
+            roundtrip(&node, 640, 360, 10, true, None, false)?;
         }
     }
     Ok(())
@@ -442,6 +447,7 @@ fn serve_test(node: &std::path::Path, addr: &str, frames: usize) -> Result<()> {
         let mut decoder = Decoder::new(&gpu, chroma != ChromaMode::Single420, w as u32, h as u32)?;
         let mut got = 0usize;
         let mut keyframes = 0usize;
+        let mut scaled = false;
         while got < frames {
             let msg = reader.read_msg::<ServerMsg>().await?;
             match msg {
@@ -453,7 +459,7 @@ fn serve_test(node: &std::path::Path, addr: &str, frames: usize) -> Result<()> {
                     if out.is_some() { got += 1; }
                     if got == 1 { eprintln!("  first decoded frame ok ({}x{}, main {} aux {} bytes, key {keyframe})", w, h, data_len, aux_len); }
                     writer.write_msg(&ClientMsg::FrameAck { frame_id, decoded_at_ms: 0 }).await?;
-                    if got == 3 { writer.write_msg(&ClientMsg::Resize { width: 800, height: 600, scale: 1.0 }).await?; }
+                    if got == 3 { writer.write_msg(&ClientMsg::Resize { width: 800, height: 600, scale: 2.0 }).await?; }
                     if got == 4 {
                         if let Ok(text) = std::env::var("HAVER_SEND_CLIP") {
                             let bytes = text.into_bytes();
@@ -461,9 +467,10 @@ fn serve_test(node: &std::path::Path, addr: &str, frames: usize) -> Result<()> {
                         }
                     }
                 }
-                ServerMsg::StreamConfig { width, height, chroma, .. } => {
+                ServerMsg::StreamConfig { width, height, chroma, scale_milli, .. } => {
                     w = width as usize; h = height as usize;
-                    eprintln!("  reconfig to {w}x{h}");
+                    eprintln!("  reconfig to {w}x{h} scale {scale_milli}");
+                    scaled = scale_milli == 2000;
                     decoder = Decoder::new(&gpu, chroma != ChromaMode::Single420, w as u32, h as u32)?;
                 }
                 ServerMsg::CursorShape { argb_len, .. } => { let _ = reader.read_payload(argb_len).await?; }
@@ -478,6 +485,9 @@ fn serve_test(node: &std::path::Path, addr: &str, frames: usize) -> Result<()> {
         writer.write_msg(&ClientMsg::Bye).await?;
         eprintln!("RESULT decoded {got} frames, {keyframes} keyframes");
         status(got >= frames && keyframes >= 1, &format!("decoded {got} frames from the server ({keyframes} keyframes, resize honoured)"));
+        if frames > 3 {
+            status(scaled, "server applied the requested output scale");
+        }
         Ok::<(), anyhow::Error>(())
     })?;
     Ok(())
@@ -614,6 +624,7 @@ fn roundtrip(
     frames: usize,
     dual: bool,
     bitrate: Option<u32>,
+    adapt: bool,
 ) -> Result<()> {
     let gpu = Gpu::open(Some(node))?;
     println!("  {} ({}) dual={dual}", gpu.name, gpu.driver);
@@ -634,6 +645,14 @@ fn roundtrip(
     for i in 0..frames {
         let src = synthetic_bgra(w, h, i);
         let force = i == frames / 2;
+        if adapt && i == frames / 3 {
+            println!("  bitrate -> {}", bitrate / 4);
+            encoder.set_bitrate(bitrate / 4);
+        }
+        if adapt && i == 2 * frames / 3 {
+            println!("  bitrate -> {bitrate}");
+            encoder.set_bitrate(bitrate);
+        }
         let t0 = std::time::Instant::now();
         let packet = encoder
             .encode_bgra(&src, force)

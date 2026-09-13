@@ -69,6 +69,8 @@ struct App {
     status: gtk::Label,
     /// Size of the stream the server is sending, from the last StreamConfig.
     stream_size: Cell<(u32, u32)>,
+    /// The remote output's scale: pointer coordinates go in physical / scale.
+    stream_scale: Cell<f32>,
     /// Size of the video widget in device pixels, rounded down to even.
     view_size: Cell<(u32, u32)>,
     /// The size last asked of the server, so a pending resize is not repeated.
@@ -156,6 +158,7 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         stats: stats.clone(),
         status: status.clone(),
         stream_size: Cell::new((0, 0)),
+        stream_scale: Cell::new(1.0),
         view_size: Cell::new((0, 0)),
         resize_requested: Cell::new((0, 0)),
         input_tx: RefCell::new(None),
@@ -371,8 +374,13 @@ fn poll_status(ui: Rc<App>, rx: Receiver<Status>) {
     glib::timeout_add_local(Duration::from_millis(100), move || {
         while let Ok(s) = rx.try_recv() {
             match s {
-                Status::Connected { width, height } => {
+                Status::Connected {
+                    width,
+                    height,
+                    scale_milli,
+                } => {
                     ui.stream_size.set((width, height));
+                    ui.stream_scale.set((scale_milli.max(1) as f32) / 1000.0);
                     ui.resize_requested.set((0, 0));
                     ui.retries.set(0);
                     ui.status.set_text(&format!("Connected — {width}x{height}"));
@@ -444,20 +452,23 @@ fn set_remote_cursor(ui: &App, width: u32, height: u32, hot_x: i32, hot_y: i32, 
     ui.video.set_cursor(Some(&cursor));
 }
 
-/// Map a widget-space point to remote output coordinates.
+/// Map a widget-space point to the remote output's logical coordinates:
+/// undo the letterbox to physical stream pixels, then divide by the remote
+/// scale, which is what the virtual pointer expects.
 fn to_remote(ui: &App, x: f64, y: f64) -> (f64, f64) {
     let (rw, rh) = ui.stream_size.get();
     if rw == 0 || rh == 0 {
         return (0.0, 0.0);
     }
     let (aw, ah) = (ui.video.width() as f64, ui.video.height() as f64);
-    // The renderer letterboxes the video; compute the fitted rect.
-    let scale = (aw / rw as f64).min(ah / rh as f64);
-    let (fw, fh) = (rw as f64 * scale, rh as f64 * scale);
+    // The picture letterboxes the video; compute the fitted rect.
+    let fit = (aw / rw as f64).min(ah / rh as f64);
+    let (fw, fh) = (rw as f64 * fit, rh as f64 * fit);
     let (ox, oy) = ((aw - fw) / 2.0, (ah - fh) / 2.0);
-    let rx = ((x - ox) / scale).clamp(0.0, rw as f64);
-    let ry = ((y - oy) / scale).clamp(0.0, rh as f64);
-    (rx, ry)
+    let px = ((x - ox) / fit).clamp(0.0, rw as f64);
+    let py = ((y - oy) / fit).clamp(0.0, rh as f64);
+    let scale = ui.stream_scale.get().max(0.5) as f64;
+    (px / scale, py / scale)
 }
 
 fn send(ui: &App, msg: ClientMsg) {

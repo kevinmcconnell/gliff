@@ -19,6 +19,7 @@ pub enum Status {
     Connected {
         width: u32,
         height: u32,
+        scale_milli: u32,
     },
     Stats {
         fps: f32,
@@ -140,19 +141,24 @@ where
         anyhow::bail!("expected HelloAck, got {ack:?}");
     };
     let cfg = reader.read_msg::<ServerMsg>().await?;
-    let (width, height, chroma) = match cfg {
+    let (width, height, chroma, scale_milli) = match cfg {
         ServerMsg::StreamConfig {
             width,
             height,
             chroma,
+            scale_milli,
             ..
-        } => (width, height, chroma),
+        } => (width, height, chroma, scale_milli),
         other => anyhow::bail!("expected StreamConfig, got {other:?}"),
     };
     let gpu = Gpu::open(Some(&hypr_capture::render_node(None)))?;
     let mut decoder = new_decoder(&gpu, chroma, width, height)?;
-    let _ = status.send(Status::Connected { width, height });
-    tracing::info!(width, height, gpu = %gpu.name, "connected");
+    let _ = status.send(Status::Connected {
+        width,
+        height,
+        scale_milli,
+    });
+    tracing::info!(width, height, scale_milli, gpu = %gpu.name, "connected");
     let mut logged_first = false;
 
     // Writes run on their own task, fed by `out_tx`, so reads (draining video)
@@ -242,10 +248,15 @@ where
                 width,
                 height,
                 chroma,
+                scale_milli,
                 ..
             } => {
                 decoder = new_decoder(&gpu, chroma, width, height)?;
-                let _ = status.send(Status::Connected { width, height });
+                let _ = status.send(Status::Connected {
+                    width,
+                    height,
+                    scale_milli,
+                });
             }
             ServerMsg::CursorShape {
                 width,

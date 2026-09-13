@@ -147,6 +147,27 @@ impl Instance {
         self.dispatch(&format!("output remove {name}"))
     }
 
+    /// Poll until `name` reports `width`x`height` at about `scale` (Hyprland
+    /// applies modes asynchronously and rounds scales), for up to half a
+    /// second. Returns the scale in effect, or `scale` if it never showed up.
+    pub fn wait_for_mode(&self, name: &str, width: u32, height: u32, scale: f32) -> f32 {
+        let mut seen = None;
+        for _ in 0..10 {
+            std::thread::sleep(Duration::from_millis(50));
+            let Ok(mons) = self.monitors() else { continue };
+            if let Some(m) = mons
+                .iter()
+                .find(|m| m.name == name && m.width == width && m.height == height)
+            {
+                seen = Some(m.scale);
+                if (m.scale - scale).abs() < 0.15 {
+                    return m.scale;
+                }
+            }
+        }
+        seen.unwrap_or(scale)
+    }
+
     /// Apply a monitor rule: `name,WxH@hz,position,scale`.
     pub fn set_monitor_mode(
         &self,

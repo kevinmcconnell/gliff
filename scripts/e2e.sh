@@ -58,7 +58,9 @@ echo "== 2. capture->4:4:4 pipeline =="
 hyprctl output create headless e2ecap >/dev/null 2>&1
 sleep 1
 HN=$(hyprctl monitors -j | python3 -c "import sys,json;print(next((m['name'] for m in json.load(sys.stdin) if 'e2ecap' in m['name'] or m['name']=='e2ecap'),''))")
-$PROBE --instance "$NEST_SIG" pipeline --output "${HN:-e2ecap}" 2>/dev/null | grep -q "^PASS" || fail "4:4:4 pipeline"
+pipe=$($PROBE --instance "$NEST_SIG" pipeline --output "${HN:-e2ecap}" 2>/dev/null)
+echo "$pipe" | grep -q "^PASS" || fail "4:4:4 pipeline"
+echo "$pipe" | grep -q "^FAIL" && fail "4:4:4 pipeline ($(echo "$pipe" | grep '^FAIL' | head -1))"
 hyprctl output remove "${HN:-e2ecap}" >/dev/null 2>&1
 echo "   pipeline PASS"
 
@@ -73,6 +75,7 @@ run_server_test() {
     out=$(timeout 30 $PROBE serve-test --connect "127.0.0.1:$port" --frames 8 2>&1)
     kill "$dp" 2>/dev/null; kill "$sp" 2>/dev/null; sleep 1
     echo "$out" | grep -q "^PASS" || fail "$label ($(echo "$out" | tail -1))"
+    echo "$out" | grep -q "^FAIL" && fail "$label ($(echo "$out" | grep '^FAIL' | head -1))"
     echo "   $label PASS"
 }
 
