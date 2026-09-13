@@ -79,8 +79,5 @@ the same path.
 - **Capture dmabuf uses one buffer-object fd for all planes.** Correct for the
   single-plane XRGB/ARGB formats we select; wrong if a multi-fd planar format is
   ever chosen.
-- **Display ring reuse.** The client hands GTK a dmabuf from a ring of three
-  images and writes the same image again three frames later without an
-  explicit fence from GTK. A very slow compositor could show a torn frame.
 - **ssh environment.** The `--stdio` path is built but not yet tested from a cold
   machine; the ssh session must expose `WAYLAND_DISPLAY` and `XDG_RUNTIME_DIR`.

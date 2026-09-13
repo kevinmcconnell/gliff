@@ -140,14 +140,14 @@ Dual420, from `haver-probe roundtrip`:
 
 | Stage | Time per frame |
 |---|---|
-| split + two encodes (blocking, serial on the one encode queue) | ~9 ms |
+| split + two encodes (both submitted, then waited; one encode queue) | ~8.5 ms |
 | two decodes + recombine (GPU, one fence wait) | ~5 ms |
 | CPU readback of the BGRX frame (probe only, cached host memory) | ~1.5 ms |
 
 The old CPU colour/split stages measured ~1.6 ms server and ~2.1 ms client at
-1080p and ~9 ms / ~8.5 ms at 4K; those are gone entirely. Encode time is the
-next thing to improve: the two encodes are submitted and waited one after the
-other, so the main stream's readback does not overlap the aux encode.
+1080p and ~9 ms / ~8.5 ms at 4K; those are gone entirely. The remaining cost is the encode hardware itself:
+the VCN block serialises the two streams, so a 1080p Dual420 frame costs about
+two encodes' worth of time.
 
 ## Pending and recommended improvements
 
@@ -157,16 +157,13 @@ cursor, shortcut inhibit, reconnect, and the text clipboard bridge.
 
 Not yet built, roughly in priority order:
 
-1. **Pipeline the two encodes.** Submit main and aux, then wait for both, so
-   the bitstream readback overlaps GPU work. Same for the two decodes plus the
-   recombine, which already overlap on the GPU but are waited once per frame.
-2. **Fence the display ring.** Hand GTK a release callback that returns the
-   image to the ring instead of reusing it after three frames.
-3. **Native single-stream 4:4:4, and AV1/HEVC.** Vulkan Video exposes HEVC
+1. **Test on Intel ANV and NVIDIA.** Everything runs on one AMD RADV
+   machine; a second driver decides whether the per-driver freedom is real.
+2. **Native single-stream 4:4:4, and AV1/HEVC.** Vulkan Video exposes HEVC
    and AV1 profiles; a 4:4:4 profile on some driver would retire the split.
-4. **Verified ssh path** from a cold machine, including the `WAYLAND_DISPLAY` /
+3. **Verified ssh path** from a cold machine, including the `WAYLAND_DISPLAY` /
    `XDG_RUNTIME_DIR` environment setup, and a systemd user unit if wanted.
-5. **Polish**: multi-output selection UI, image clipboard, and `tc netem` tuning
+4. **Polish**: multi-output selection UI, image clipboard, and `tc netem` tuning
    of the adaptive ack window.
 
 See `docs/hardware-quirks.md` for driver-specific behaviour and the low-severity
