@@ -25,11 +25,12 @@ struct Cli {
     /// Dev only: listen on a TCP address (no auth; localhost).
     #[arg(long)]
     listen: Option<String>,
-    /// Mirror an existing output (attended use): a name like `DP-1`, or
-    /// `auto` for the focused one.
+    /// Mirror an existing output: a name like `DP-1`, or `auto` for the
+    /// focused one (the default).
     #[arg(long, conflicts_with = "headless")]
     output: Option<String>,
-    /// Create a dedicated headless output sized to the client.
+    /// Create a dedicated headless output sized and scaled to the client
+    /// window instead of mirroring.
     #[arg(long)]
     headless: bool,
     /// Hyprland instance signature (default: newest).
@@ -58,9 +59,6 @@ fn main() -> Result<()> {
     if cli.stdio {
         assert_stdout_is_free()?;
     }
-    if !cli.headless && cli.output.is_none() {
-        anyhow::bail!("choose --headless or --output <name>");
-    }
 
     let target = Target {
         display: None,
@@ -68,7 +66,11 @@ fn main() -> Result<()> {
     };
     let cfg = session::Config {
         target,
-        output: cli.output.clone(),
+        output: if cli.headless {
+            None
+        } else {
+            Some(cli.output.clone().unwrap_or_else(|| "auto".into()))
+        },
         render_node: hypr_capture::render_node(cli.render_node.as_deref()),
         low_bandwidth: cli.low_bandwidth,
         bitrate: cli.bitrate,

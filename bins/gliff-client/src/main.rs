@@ -44,11 +44,11 @@ struct Cli {
     /// Remote gliff-server path.
     #[arg(long, default_value = "gliff-server")]
     server_bin: String,
-    /// Mirror the remote's focused screen instead of creating a headless
-    /// output sized to the window.
+    /// Create a private headless output on the remote, sized and scaled to
+    /// this window, instead of mirroring the remote's focused screen.
     #[arg(long, conflicts_with = "output")]
-    mirror: bool,
-    /// Mirror the named remote output (e.g. `DP-1`).
+    headless: bool,
+    /// Mirror the named remote output (e.g. `DP-1`) instead of the focused one.
     #[arg(long)]
     output: Option<String>,
     /// Hotkey that releases captured shortcuts and hands the keyboard back to
@@ -193,10 +193,11 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         let host_entry = host_entry.clone();
         let connect = cli.connect.clone();
         let server_bin = cli.server_bin.clone();
-        let output = cli
-            .output
-            .clone()
-            .or_else(|| cli.mirror.then(|| "auto".to_string()));
+        let server_args: Vec<String> = match (&cli.output, cli.headless) {
+            (Some(name), _) => vec!["--output".into(), name.clone()],
+            (None, true) => vec!["--headless".into()],
+            (None, false) => vec!["--output".into(), "auto".into()],
+        };
         connect_btn.connect_clicked(move |_| {
             let endpoint = match &connect {
                 Some(addr) => Endpoint::Tcp(addr.clone()),
@@ -208,10 +209,7 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
                     }
                     let mut t = SshTarget::new(host);
                     t.server_bin = server_bin.clone();
-                    t.server_args = match &output {
-                        Some(name) => vec!["--output".into(), name.clone()],
-                        None => vec!["--headless".into()],
-                    };
+                    t.server_args = server_args.clone();
                     Endpoint::Ssh(t)
                 }
             };

@@ -54,6 +54,26 @@ To run under the Khronos validation layer during development:
 VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation gliff-probe roundtrip
 ```
 
+## Run (ssh, the real path)
+
+```
+gliff-client user@host
+```
+
+This mirrors the remote's focused screen: it spawns
+`ssh -T user@host gliff-server --stdio --output auto`. Other modes:
+
+```
+gliff-client --output DP-1 user@host   # mirror a named remote screen
+gliff-client --headless user@host      # a private remote screen sized and
+                                       # scaled to this window (resizes live)
+```
+
+A mirrored screen keeps its own size and scale and is letterboxed in the
+window; a headless one follows the window. The ssh session
+must see the user's `WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR`; if `gliff-server` is not
+on PATH over ssh, pass `--server-bin /path/to/gliff-server`.
+
 ## Run (development, localhost)
 
 Start a nested Hyprland, then:
@@ -62,16 +82,6 @@ Start a nested Hyprland, then:
 gliff-server --listen 127.0.0.1:9000 --headless
 gliff-client --connect 127.0.0.1:9000
 ```
-
-## Run (ssh, the real path)
-
-```
-gliff-client user@host
-```
-
-This spawns `ssh -T user@host gliff-server --stdio --headless`. The ssh session
-must see the user's `WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR`; if `gliff-server` is not
-on PATH over ssh, pass `--server-bin /path/to/gliff-server`.
 
 ## Testing
 

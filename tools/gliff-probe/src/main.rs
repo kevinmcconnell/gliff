@@ -485,7 +485,7 @@ fn serve_test(node: &std::path::Path, addr: &str, frames: usize) -> Result<()> {
         writer.write_msg(&ClientMsg::Bye).await?;
         eprintln!("RESULT decoded {got} frames, {keyframes} keyframes");
         status(got >= frames && keyframes >= 1, &format!("decoded {got} frames from the server ({keyframes} keyframes, resize honoured)"));
-        if frames > 3 {
+        if frames > 3 && session.headless {
             status(scaled, "server applied the requested output scale");
         }
         Ok::<(), anyhow::Error>(())
