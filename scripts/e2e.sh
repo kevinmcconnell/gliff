@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# End-to-end test for haver. Must run inside a Hyprland session (it starts a
+# End-to-end test for gliff. Must run inside a Hyprland session (it starts a
 # nested Hyprland as the device under test). Requires a GPU with Vulkan Video.
 #
 # It exercises, and asserts PASS on:
-#   1. haver-probe protocols / vulkan / GPU encode-decode round-trip
-#   2. haver-probe pipeline: capture one frame and run the whole GPU 4:4:4 path
+#   1. gliff-probe protocols / vulkan / GPU encode-decode round-trip
+#   2. gliff-probe pipeline: capture one frame and run the whole GPU 4:4:4 path
 #   3. server --listen --headless  + serve-test client  (Dual420 4:4:4)
 #   4. server --listen --headless --low-bandwidth + serve-test (Single420)
 #
@@ -26,8 +26,8 @@ command -v Hyprland >/dev/null || fail "Hyprland not found"
 
 echo "== building (release) =="
 cargo build --release --workspace >/dev/null 2>&1 || fail "build failed"
-PROBE=target/release/haver-probe
-SERVER=target/release/haver-server
+PROBE=target/release/gliff-probe
+SERVER=target/release/gliff-server
 
 echo "== starting nested Hyprland =="
 CONF=$(mktemp --suffix=-e2e-hypr.conf)
@@ -37,7 +37,7 @@ misc { disable_hyprland_logo = true; disable_splash_rendering = true }
 ecosystem { no_update_news = true; no_donation_nag = true }
 HYPR
 before=$(ls "$XDG_RUNTIME_DIR/hypr" 2>/dev/null)
-WAYLAND_DISPLAY="$WAYLAND_DISPLAY" HYPRLAND_INSTANCE_SIGNATURE= setsid Hyprland -c "$CONF" >/tmp/haver-e2e-hypr.log 2>&1 &
+WAYLAND_DISPLAY="$WAYLAND_DISPLAY" HYPRLAND_INSTANCE_SIGNATURE= setsid Hyprland -c "$CONF" >/tmp/gliff-e2e-hypr.log 2>&1 &
 sleep 6
 # The nested instance is the directory that was not there before we started it.
 NEST_SIG=$(comm -13 <(echo "$before" | sort) <(ls "$XDG_RUNTIME_DIR/hypr" | sort) | head -1)
@@ -67,7 +67,7 @@ echo "   pipeline PASS"
 run_server_test() {
     local port=$1; shift
     local label=$1; shift
-    "$SERVER" --listen "127.0.0.1:$port" --headless --instance "$NEST_SIG" "$@" >/tmp/haver-e2e-server.log 2>&1 &
+    "$SERVER" --listen "127.0.0.1:$port" --headless --instance "$NEST_SIG" "$@" >/tmp/gliff-e2e-server.log 2>&1 &
     local sp=$!; PIDS+=("$sp")
     sleep 2
     damage & local dp=$!; PIDS+=("$dp")
@@ -88,11 +88,11 @@ run_server_test 9041 "Single420 stream" --low-bandwidth
 echo "== 5. clipboard both directions =="
 command -v wl-copy >/dev/null && command -v wl-paste >/dev/null || fail "wl-clipboard not installed"
 wl-copy "e2e-clip-in" 2>/dev/null
-"$SERVER" --listen 127.0.0.1:9042 --headless --instance "$NEST_SIG" >/tmp/haver-e2e-server.log 2>&1 &
+"$SERVER" --listen 127.0.0.1:9042 --headless --instance "$NEST_SIG" >/tmp/gliff-e2e-server.log 2>&1 &
 csp=$!; PIDS+=("$csp"); sleep 2
 damage & cdp=$!; PIDS+=("$cdp")
 clipf=$(mktemp)
-HAVER_SEND_CLIP="e2e-clip-out" timeout 20 $PROBE serve-test --connect 127.0.0.1:9042 --frames 200 >"$clipf" 2>&1 &
+GLIFF_SEND_CLIP="e2e-clip-out" timeout 20 $PROBE serve-test --connect 127.0.0.1:9042 --frames 200 >"$clipf" 2>&1 &
 clipc=$!; PIDS+=("$clipc")
 sleep 5
 pasted=$(wl-paste -n 2>/dev/null)

@@ -1,4 +1,4 @@
-# haver
+# gliff
 
 Remote-desktop a Hyprland session from another Hyprland machine, over SSH only.
 Custom wire protocol, Vulkan Video hardware encode and decode, full-resolution
@@ -40,18 +40,18 @@ cargo build --release
 Needs Rust and the runtime libraries in the PKGBUILD `depends`: a Vulkan
 loader and a driver with Vulkan Video (Mesa RADV 24+ on AMD). No C toolchain
 is needed; the compute shaders are committed as SPIR-V
-(`crates/haver-vk/shaders/build.sh` rebuilds them with `glslc`). Verify the
+(`crates/gliff-vk/shaders/build.sh` rebuilds them with `glslc`). Verify the
 machine first:
 
 ```
-haver-probe all          # protocols, outputs, Vulkan, GPU encode/decode round-trip
-haver-probe pipeline     # capture one frame and run the whole GPU 4:4:4 path
+gliff-probe all          # protocols, outputs, Vulkan, GPU encode/decode round-trip
+gliff-probe pipeline     # capture one frame and run the whole GPU 4:4:4 path
 ```
 
 To run under the Khronos validation layer during development:
 
 ```
-VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation haver-probe roundtrip
+VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation gliff-probe roundtrip
 ```
 
 ## Run (development, localhost)
@@ -59,19 +59,19 @@ VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation haver-probe roundtrip
 Start a nested Hyprland, then:
 
 ```
-haver-server --listen 127.0.0.1:9000 --headless
-haver-client --connect 127.0.0.1:9000
+gliff-server --listen 127.0.0.1:9000 --headless
+gliff-client --connect 127.0.0.1:9000
 ```
 
 ## Run (ssh, the real path)
 
 ```
-haver-client user@host
+gliff-client user@host
 ```
 
-This spawns `ssh -T user@host haver-server --stdio --headless`. The ssh session
-must see the user's `WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR`; if `haver-server` is not
-on PATH over ssh, pass `--server-bin /path/to/haver-server`.
+This spawns `ssh -T user@host gliff-server --stdio --headless`. The ssh session
+must see the user's `WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR`; if `gliff-server` is not
+on PATH over ssh, pass `--server-bin /path/to/gliff-server`.
 
 ## Testing
 
@@ -87,13 +87,13 @@ Single420 server-plus-client streams.
 
 ## Layout
 
-- `crates/haver-proto` wire types, framing, and the CPU reference for colour
+- `crates/gliff-proto` wire types, framing, and the CPU reference for colour
   conversion and the AVC444 4:4:4 split/recombine that the shaders must match.
-- `crates/haver-transport` framed IO, ssh spawning.
+- `crates/gliff-transport` framed IO, ssh spawning.
 - `crates/hypr-ipc`, `crates/hypr-wl` Hyprland IPC and shared Wayland plumbing.
 - `crates/hypr-capture` output + cursor capture into dmabufs.
 - `crates/hypr-input` keyboard and pointer injection.
-- `crates/haver-vk` the Vulkan media pipeline: device, dmabuf import/export,
+- `crates/gliff-vk` the Vulkan media pipeline: device, dmabuf import/export,
   split and recombine compute shaders, H.264 encode/decode, header parser.
   The only crate with `unsafe`.
-- `bins/haver-server`, `bins/haver-client`, `tools/haver-probe`.
+- `bins/gliff-server`, `bins/gliff-client`, `tools/gliff-probe`.

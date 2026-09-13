@@ -1,0 +1,26 @@
+[package]
+name = "gliff-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio = { workspace = true }
+gtk4.workspace = true
+libadwaita.workspace = true
+gliff-proto.workspace = true
+gliff-transport.workspace = true
+gliff-vk.workspace = true
+hypr-capture.workspace = true
+bytes.workspace = true
+drm-fourcc.workspace = true
+hypr-ipc.workspace = true
+hypr-input.workspace = true

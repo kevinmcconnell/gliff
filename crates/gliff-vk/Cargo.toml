@@ -1,0 +1,19 @@
+[package]
+name = "gliff-vk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# This crate is the ONLY place in gliff that uses unsafe: Vulkan is a C API
+# and `ash` marks every call unsafe. Everything is wrapped behind plain Rust
+# types; every unsafe block carries a SAFETY comment.
+[lints]
+workspace = true
+
+[dependencies]
+ash = "0.38"
+drm-fourcc.workspace = true
+gliff-proto.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

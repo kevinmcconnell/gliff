@@ -1,6 +1,6 @@
 # Hardware and driver quirks
 
-haver targets Vulkan Video on both ends. Driver behaviour differs, so this
+gliff targets Vulkan Video on both ends. Driver behaviour differs, so this
 file records what we have found and where more testing is needed. Findings so
 far come from **one** machine:
 
@@ -8,7 +8,7 @@ far come from **one** machine:
 - Driver: Mesa RADV 26.2 (Vulkan 1.4), kernel 7.2.
 - Compositor: Hyprland 0.56.2.
 
-`haver-probe vulkan` prints the device and its video queues.
+`gliff-probe vulkan` prints the device and its video queues.
 
 ## Confirmed on AMD RADV
 
@@ -43,7 +43,7 @@ result is undefined. The encoder rebuilds the chain per frame.
 
 ### Encoded parameter sets and slices carry no start codes
 `vkGetEncodedVideoSessionParametersKHR` and the slice output are raw NAL units;
-haver prepends `00 00 00 01` when a start code is absent, and asks for the SPS
+gliff prepends `00 00 00 01` when a start code is absent, and asks for the SPS
 and PPS in two calls so each can be framed.
 
 ### Quality level and virtual buffer size barely matter

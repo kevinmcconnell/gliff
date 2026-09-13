@@ -28,7 +28,7 @@ impl ShmBuffer {
     {
         let stride = width * 4;
         let size = (stride * height) as u64;
-        let fd = memfd_create(c"haver-cursor", MFdFlags::MFD_CLOEXEC)
+        let fd = memfd_create(c"gliff-cursor", MFdFlags::MFD_CLOEXEC)
             .map_err(|e| Error::Capture(format!("memfd: {e}")))?;
         let file = File::from(fd);
         file.set_len(size)?;

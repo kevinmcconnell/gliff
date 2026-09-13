@@ -1,16 +1,16 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/haver-proto",
-    "crates/haver-transport",
+    "crates/gliff-proto",
+    "crates/gliff-transport",
     "crates/hypr-ipc",
     "crates/hypr-wl",
     "crates/hypr-capture",
     "crates/hypr-input",
-    "crates/haver-vk",
-    "bins/haver-server",
-    "bins/haver-client",
-    "tools/haver-probe",
+    "crates/gliff-vk",
+    "bins/gliff-server",
+    "bins/gliff-client",
+    "tools/gliff-probe",
 ]
 
 [workspace.package]
@@ -26,13 +26,13 @@ unsafe_op_in_unsafe_fn = "deny"
 undocumented_unsafe_blocks = "warn"
 
 [workspace.dependencies]
-haver-proto = { path = "crates/haver-proto" }
-haver-transport = { path = "crates/haver-transport" }
+gliff-proto = { path = "crates/gliff-proto" }
+gliff-transport = { path = "crates/gliff-transport" }
 hypr-ipc = { path = "crates/hypr-ipc" }
 hypr-wl = { path = "crates/hypr-wl" }
 hypr-capture = { path = "crates/hypr-capture" }
 hypr-input = { path = "crates/hypr-input" }
-haver-vk = { path = "crates/haver-vk" }
+gliff-vk = { path = "crates/gliff-vk" }
 
 anyhow = "1"
 thiserror = "2"

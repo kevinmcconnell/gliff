@@ -716,6 +716,102 @@ dependencies = [
 ]
 
 [[package]]
+name = "gliff-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "clap",
+ "drm-fourcc",
+ "gliff-proto",
+ "gliff-transport",
+ "gliff-vk",
+ "gtk4",
+ "hypr-capture",
+ "hypr-input",
+ "hypr-ipc",
+ "libadwaita",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "gliff-probe"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "drm-fourcc",
+ "gliff-proto",
+ "gliff-transport",
+ "gliff-vk",
+ "hypr-capture",
+ "hypr-input",
+ "hypr-ipc",
+ "hypr-wl",
+ "png",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "wayland-client",
+]
+
+[[package]]
+name = "gliff-proto"
+version = "0.1.0"
+dependencies = [
+ "postcard",
+ "proptest",
+ "rayon",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
+name = "gliff-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "drm-fourcc",
+ "gliff-proto",
+ "gliff-transport",
+ "gliff-vk",
+ "hypr-capture",
+ "hypr-input",
+ "hypr-ipc",
+ "hypr-wl",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "gliff-transport"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "gliff-proto",
+ "postcard",
+ "serde",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "gliff-vk"
+version = "0.1.0"
+dependencies = [
+ "ash",
+ "drm-fourcc",
+ "gliff-proto",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "gobject-sys"
 version = "0.22.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -844,102 +940,6 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
-
-[[package]]
-name = "haver-client"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytes",
- "clap",
- "drm-fourcc",
- "gtk4",
- "haver-proto",
- "haver-transport",
- "haver-vk",
- "hypr-capture",
- "hypr-input",
- "hypr-ipc",
- "libadwaita",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "haver-probe"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "drm-fourcc",
- "haver-proto",
- "haver-transport",
- "haver-vk",
- "hypr-capture",
- "hypr-input",
- "hypr-ipc",
- "hypr-wl",
- "png",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "wayland-client",
-]
-
-[[package]]
-name = "haver-proto"
-version = "0.1.0"
-dependencies = [
- "postcard",
- "proptest",
- "rayon",
- "serde",
- "thiserror",
-]
-
-[[package]]
-name = "haver-server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "drm-fourcc",
- "haver-proto",
- "haver-transport",
- "haver-vk",
- "hypr-capture",
- "hypr-input",
- "hypr-ipc",
- "hypr-wl",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "haver-transport"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "haver-proto",
- "postcard",
- "serde",
- "thiserror",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "haver-vk"
-version = "0.1.0"
-dependencies = [
- "ash",
- "drm-fourcc",
- "haver-proto",
- "thiserror",
- "tracing",
-]
 
 [[package]]
 name = "heapless"

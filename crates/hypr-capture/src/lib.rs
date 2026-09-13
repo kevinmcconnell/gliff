@@ -66,11 +66,11 @@ pub struct CaptureConfig {
 
 pub const DEFAULT_RENDER_NODE: &str = "/dev/dri/renderD128";
 
-/// The DRM render node to use: explicit, `HAVER_RENDER_NODE`, or the default.
+/// The DRM render node to use: explicit, `GLIFF_RENDER_NODE`, or the default.
 pub fn render_node(explicit: Option<&std::path::Path>) -> PathBuf {
     explicit
         .map(std::path::Path::to_path_buf)
-        .or_else(|| std::env::var_os("HAVER_RENDER_NODE").map(PathBuf::from))
+        .or_else(|| std::env::var_os("GLIFF_RENDER_NODE").map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from(DEFAULT_RENDER_NODE))
 }
 

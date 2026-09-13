@@ -1,4 +1,4 @@
-//! Shared Wayland plumbing for haver's compositor-facing crates: connecting to
+//! Shared Wayland plumbing for gliff's compositor-facing crates: connecting to
 //! a chosen socket, listing globals, and tracking `wl_output`s and the seat.
 
 use std::os::unix::net::UnixStream;

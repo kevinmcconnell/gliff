@@ -148,7 +148,7 @@ impl State {
     }
 
     fn upload_keymap(&mut self) -> Result<()> {
-        let fd = memfd_create(c"haver-keymap", MFdFlags::MFD_CLOEXEC)
+        let fd = memfd_create(c"gliff-keymap", MFdFlags::MFD_CLOEXEC)
             .map_err(|e| Error::Input(format!("memfd: {e}")))?;
         let mut file = File::from(fd);
         file.write_all(self.keys.text.as_bytes())?;
