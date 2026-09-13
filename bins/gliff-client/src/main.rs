@@ -463,7 +463,7 @@ fn to_remote(ui: &App, x: f64, y: f64) -> (f64, f64) {
     let (ox, oy) = ((aw - fw) / 2.0, (ah - fh) / 2.0);
     let px = ((x - ox) / fit).clamp(0.0, rw as f64);
     let py = ((y - oy) / fit).clamp(0.0, rh as f64);
-    let scale = ui.stream_scale.get().max(0.5) as f64;
+    let scale = ui.stream_scale.get().max(0.01) as f64;
     (px / scale, py / scale)
 }
 

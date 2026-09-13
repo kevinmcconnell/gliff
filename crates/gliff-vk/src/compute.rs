@@ -34,13 +34,19 @@ pub(crate) struct Pass {
 }
 
 impl Pass {
-    fn new(gpu: &Arc<Gpu>, spirv: &[u8], sampled: u32, storage: u32) -> Result<Self> {
+    fn new(
+        gpu: &Arc<Gpu>,
+        spirv: &[u8],
+        sampled: u32,
+        storage: u32,
+        filter: vk::Filter,
+    ) -> Result<Self> {
         // SAFETY: valid create infos; every handle is destroyed in Drop.
         unsafe {
             let sampler = gpu.device.create_sampler(
                 &vk::SamplerCreateInfo::default()
-                    .mag_filter(vk::Filter::NEAREST)
-                    .min_filter(vk::Filter::NEAREST)
+                    .mag_filter(filter)
+                    .min_filter(filter)
                     .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
                     .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE),
                 None,
@@ -228,7 +234,8 @@ pub(crate) struct Split(Pass);
 
 impl Split {
     pub(crate) fn new(gpu: &Arc<Gpu>) -> Result<Self> {
-        Ok(Self(Pass::new(gpu, SPLIT_SPV, 1, 4)?))
+        // Linear: the split may downscale a mirrored screen to the window.
+        Ok(Self(Pass::new(gpu, SPLIT_SPV, 1, 4, vk::Filter::LINEAR)?))
     }
 
     /// `src` must be in SHADER_READ_ONLY_OPTIMAL and the outputs in GENERAL.
@@ -261,7 +268,13 @@ pub(crate) struct Recombine(Pass);
 
 impl Recombine {
     pub(crate) fn new(gpu: &Arc<Gpu>) -> Result<Self> {
-        Ok(Self(Pass::new(gpu, RECOMBINE_SPV, 4, 1)?))
+        Ok(Self(Pass::new(
+            gpu,
+            RECOMBINE_SPV,
+            4,
+            1,
+            vk::Filter::NEAREST,
+        )?))
     }
 
     /// Inputs must be in SHADER_READ_ONLY_OPTIMAL and `dst` in GENERAL.

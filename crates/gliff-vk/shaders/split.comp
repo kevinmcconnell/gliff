@@ -2,6 +2,11 @@
 // AVC444 split: one BGRA/RGBA frame -> main NV12 (Y + even-position chroma)
 // and aux NV12 (the chroma the main stream dropped). One thread per 2x2
 // block. Layout matches gliff-proto::chroma::split_yuv444 exactly.
+//
+// The source is sampled at normalized coordinates with a linear sampler:
+// when the output is the source's size this is an exact texel fetch, and
+// when the output is smaller (a mirrored screen larger than the client's
+// window) it is a box-filtered downscale.
 #include "common.glsl"
 layout(local_size_x = 16, local_size_y = 16) in;
 layout(set = 0, binding = 0) uniform sampler2D src;
@@ -12,7 +17,8 @@ layout(set = 0, binding = 4, rg8) uniform writeonly image2D aux_uv;
 layout(push_constant) uniform Push { int width; int height; int has_aux; } pc;
 
 vec3 px(int x, int y) {
-    return texelFetch(src, ivec2(clamp(x, 0, pc.width - 1), clamp(y, 0, pc.height - 1)), 0).rgb * 255.0;
+    vec2 uv = (vec2(clamp(x, 0, pc.width - 1), clamp(y, 0, pc.height - 1)) + 0.5) / vec2(pc.width, pc.height);
+    return texture(src, uv).rgb * 255.0;
 }
 
 void main() {

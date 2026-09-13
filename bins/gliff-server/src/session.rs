@@ -92,7 +92,8 @@ where
             }],
         })
         .await?;
-    send_stream_config(&mut writer, codec, chroma, &output).await?;
+    let stream = (output.width, output.height);
+    send_stream_config(&mut writer, codec, chroma, &output, stream).await?;
 
     let (cap_tx, mut cap_rx) = mpsc::unbounded_channel();
     let capturer = start_capture(&cfg.target, &output.name, &cfg.render_node, cap_tx)?;
@@ -115,7 +116,7 @@ where
         cfg.bitrate
             .unwrap_or_else(|| EncoderSettings::default_bitrate(output.width, output.height, 60)),
     );
-    let settings = encoder_settings(output.width, output.height, bitrate_ctl.current());
+    let settings = encoder_settings(stream.0, stream.1, bitrate_ctl.current());
     let encoder = Encoder::new(&gpu, settings.clone(), chroma == ChromaMode::Dual420)
         .context("create encoder")?;
 
@@ -127,6 +128,7 @@ where
         gpu,
         instance,
         output,
+        stream,
         caps,
         bitrate_ctl,
         codec,
@@ -254,6 +256,9 @@ struct Session<W> {
     gpu: Arc<Gpu>,
     instance: hypr_ipc::Instance,
     output: SessionOutput,
+    /// Encoded size. Equals the output size, except for a mirrored screen
+    /// larger than the client's window, which is scaled down to fit.
+    stream: (u32, u32),
     caps: ClientCaps,
     bitrate_ctl: BitrateController,
     codec: Codec,
@@ -359,9 +364,15 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         } else {
             1.0
         };
+        if width < 320 || height < 240 {
+            return Ok(());
+        }
+        if !self.output.is_headless() {
+            return self.fit_mirror(width, height).await;
+        }
         let same_size = (width, height) == (self.output.width, self.output.height);
         let same_scale = (scale - self.output.scale).abs() < 0.01;
-        if !self.output.is_headless() || width < 320 || height < 240 || (same_size && same_scale) {
+        if same_size && same_scale {
             return Ok(());
         }
         tracing::info!(width, height, scale, "resizing headless output");
@@ -383,6 +394,7 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                     self.settings = settings;
                     self.output.width = width;
                     self.output.height = height;
+                    self.stream = (width, height);
                     self.pending = None;
                     self.want_keyframe = true;
                 }
@@ -401,7 +413,60 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         }
         self.output.scale = applied;
         self.inject(self.output.logical_extent());
-        send_stream_config(&mut self.writer, self.codec, self.chroma, &self.output).await
+        send_stream_config(
+            &mut self.writer,
+            self.codec,
+            self.chroma,
+            &self.output,
+            self.stream,
+        )
+        .await
+    }
+
+    /// A mirrored screen keeps its size; when it is larger than the client's
+    /// window the stream is scaled down to fit (never up), so the link and
+    /// the decoder carry only what the window can show.
+    async fn fit_mirror(&mut self, win_w: u32, win_h: u32) -> Result<()> {
+        let (ow, oh) = (self.output.width as f64, self.output.height as f64);
+        let fit = (win_w as f64 / ow).min(win_h as f64 / oh).min(1.0);
+        let stream = (
+            ((ow * fit).round() as u32).max(2) & !1,
+            ((oh * fit).round() as u32).max(2) & !1,
+        );
+        if stream == self.stream {
+            return Ok(());
+        }
+        let settings = encoder_settings(stream.0, stream.1, self.bitrate_ctl.current());
+        match Encoder::new(
+            &self.gpu,
+            settings.clone(),
+            self.chroma == ChromaMode::Dual420,
+        ) {
+            Ok(encoder) => {
+                tracing::info!(
+                    width = stream.0,
+                    height = stream.1,
+                    "scaling the mirrored screen to the window"
+                );
+                self.encoder = encoder;
+                self.settings = settings;
+                self.stream = stream;
+                self.pending = None;
+                self.want_keyframe = true;
+                send_stream_config(
+                    &mut self.writer,
+                    self.codec,
+                    self.chroma,
+                    &self.output,
+                    self.stream,
+                )
+                .await
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "encoder rejected the fitted size; keeping the current one");
+                Ok(())
+            }
+        }
     }
 
     /// Poll until the output reports the requested mode (Hyprland applies it
@@ -512,7 +577,7 @@ impl<W: AsyncWrite + Unpin> Session<W> {
     }
 
     async fn encode_and_send(&mut self, frame: &CapturedFrame) -> Result<()> {
-        let (width, height) = (self.output.width, self.output.height);
+        let (width, height) = self.stream;
         let info = &frame.buffer.info;
         let fourcc = drm_fourcc::DrmFourcc::try_from(info.fourcc).map_err(|_| {
             anyhow::anyhow!("capture fourcc {:#x} is not a DRM format", info.fourcc)
@@ -585,10 +650,6 @@ impl SessionOutput {
         self.headless.is_some()
     }
 
-    fn scale_milli(&self) -> u32 {
-        (self.scale * 1000.0).round() as u32
-    }
-
     /// The logical extent Hyprland exposes to clients and the virtual pointer.
     fn logical_extent(&self) -> InputCmd {
         let s = self.scale.max(0.5);
@@ -612,14 +673,18 @@ async fn send_stream_config<W: AsyncWrite + Unpin>(
     codec: Codec,
     chroma: ChromaMode,
     output: &SessionOutput,
+    stream: (u32, u32),
 ) -> Result<()> {
+    // The scale the client divides stream pixels by to reach the remote's
+    // logical space: the output scale times any downscale of the stream.
+    let effective_scale = output.scale * stream.0 as f32 / output.width.max(1) as f32;
     // Parameter sets ride in-band on every keyframe, so extradata is empty.
     let msg = ServerMsg::StreamConfig {
         codec,
         chroma,
-        width: output.width,
-        height: output.height,
-        scale_milli: output.scale_milli(),
+        width: stream.0,
+        height: stream.1,
+        scale_milli: (effective_scale * 1000.0).round() as u32,
         extradata: Vec::new(),
         aux_extradata: None,
     };

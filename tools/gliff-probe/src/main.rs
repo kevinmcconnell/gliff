@@ -470,7 +470,7 @@ fn serve_test(node: &std::path::Path, addr: &str, frames: usize) -> Result<()> {
                 ServerMsg::StreamConfig { width, height, chroma, scale_milli, .. } => {
                     w = width as usize; h = height as usize;
                     eprintln!("  reconfig to {w}x{h} scale {scale_milli}");
-                    scaled = scale_milli == 2000;
+                    scaled = if session.headless { scale_milli == 2000 } else { w <= 800 && h <= 600 && scale_milli < 1000 };
                     decoder = Decoder::new(&gpu, chroma != ChromaMode::Single420, w as u32, h as u32)?;
                 }
                 ServerMsg::CursorShape { argb_len, .. } => { let _ = reader.read_payload(argb_len).await?; }
@@ -485,8 +485,9 @@ fn serve_test(node: &std::path::Path, addr: &str, frames: usize) -> Result<()> {
         writer.write_msg(&ClientMsg::Bye).await?;
         eprintln!("RESULT decoded {got} frames, {keyframes} keyframes");
         status(got >= frames && keyframes >= 1, &format!("decoded {got} frames from the server ({keyframes} keyframes, resize honoured)"));
-        if frames > 3 && session.headless {
-            status(scaled, "server applied the requested output scale");
+        if frames > 3 {
+            let what = if session.headless { "server applied the requested output scale" } else { "server scaled the mirrored screen down to the window" };
+            status(scaled, what);
         }
         Ok::<(), anyhow::Error>(())
     })?;
