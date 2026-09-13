@@ -1,4 +1,4 @@
-//! gliff-client: a GTK4/libadwaita window that connects to a gliff server,
+//! gliff: a GTK4/libadwaita window that connects to a gliff server,
 //! decodes the video, shows it, and forwards keyboard and pointer input.
 //!
 //! Decode runs on a worker thread (see `net`); this file is the UI. Decoded
@@ -31,10 +31,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 type OutSender = UnboundedSender<(ClientMsg, Vec<u8>)>;
 
 #[derive(Parser)]
-#[command(
-    name = "gliff-client",
-    about = "Remote-desktop a Hyprland session over ssh"
-)]
+#[command(name = "gliff", about = "Remote-desktop a Hyprland session over ssh")]
 struct Cli {
     /// `user@host` to ssh to and spawn gliff-server, or empty to type it in.
     host: Option<String>,

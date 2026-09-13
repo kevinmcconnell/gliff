@@ -22,7 +22,7 @@ build() {
 package() {
     cd "$startdir"
     install -Dm755 target/release/gliff-server "$pkgdir/usr/bin/gliff-server"
-    install -Dm755 target/release/gliff-client "$pkgdir/usr/bin/gliff-client"
+    install -Dm755 target/release/gliff "$pkgdir/usr/bin/gliff"
     install -Dm755 target/release/gliff-probe  "$pkgdir/usr/bin/gliff-probe"
     install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
     install -Dm644 docs/hardware-quirks.md "$pkgdir/usr/share/doc/$pkgname/hardware-quirks.md"

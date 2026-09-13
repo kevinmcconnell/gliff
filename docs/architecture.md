@@ -44,7 +44,7 @@ video, cursor and pongs flow server→client.
 | `hypr-input` | virtual keyboard (xkb state) + virtual pointer + text clipboard on calloop threads | none |
 | `gliff-vk` | Vulkan device, dmabuf import/export, split/recombine compute, H.264 encode/decode, header parser | **yes, isolated here** |
 | `gliff-server` | ties capture+input+encoder to the protocol; `--stdio`/`--listen` | none |
-| `gliff-client` | GTK4/libadwaita UI, decode worker | one block: hands GTK a dmabuf fd |
+| `gliff` | GTK4/libadwaita UI, decode worker | one block: hands GTK a dmabuf fd |
 | `gliff-probe` | environment checks and the headless test client | none |
 
 `gliff-vk` wraps `ash`, whose every call is `unsafe` because Vulkan is a C API
@@ -175,7 +175,7 @@ items surfaced by code review.
 
 The binaries are dynamically linked: `gliff-server`/`gliff-probe` need
 libvulkan, libgbm, libdrm, libwayland-client, libxkbcommon and libc, and the
-Vulkan loader `dlopen`s the GPU's ICD; `gliff-client` additionally pulls the
+Vulkan loader `dlopen`s the GPU's ICD; `gliff` additionally pulls the
 full GTK4 runtime. A normal Hyprland desktop already has all of these (they are
 the PKGBUILD `depends`). The Rust side is `ash` (thin generated bindings, no C
 build step) plus the Wayland, GTK and async crates. The compute shaders are

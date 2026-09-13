@@ -57,15 +57,15 @@ VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation gliff-probe roundtrip
 ## Run (ssh, the real path)
 
 ```
-gliff-client user@host
+gliff user@host
 ```
 
 This mirrors the remote's focused screen: it spawns
 `ssh -T user@host gliff-server --stdio --output auto`. Other modes:
 
 ```
-gliff-client --output DP-1 user@host   # mirror a named remote screen
-gliff-client --headless user@host      # a private remote screen sized and
+gliff --output DP-1 user@host   # mirror a named remote screen
+gliff --headless user@host      # a private remote screen sized and
                                        # scaled to this window (resizes live)
 ```
 
@@ -80,7 +80,7 @@ Start a nested Hyprland, then:
 
 ```
 gliff-server --listen 127.0.0.1:9000 --headless
-gliff-client --connect 127.0.0.1:9000
+gliff --connect 127.0.0.1:9000
 ```
 
 ## Testing
@@ -106,4 +106,4 @@ Single420 server-plus-client streams.
 - `crates/gliff-vk` the Vulkan media pipeline: device, dmabuf import/export,
   split and recombine compute shaders, H.264 encode/decode, header parser.
   The only crate with `unsafe`.
-- `bins/gliff-server`, `bins/gliff-client`, `tools/gliff-probe`.
+- `bins/gliff-server`, `bins/gliff`, `tools/gliff-probe`.
