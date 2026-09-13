@@ -7,6 +7,7 @@
 
 mod keymap;
 mod net;
+mod paintable;
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
@@ -61,7 +62,8 @@ struct Cli {
 struct App {
     /// The picture, upcast; input controllers attach to it and we measure it.
     video: gtk::Widget,
-    picture: gtk::Picture,
+    /// What the picture shows: the latest frame at 1:1 device pixels.
+    frame: paintable::FramePaintable,
     stats: gtk::Label,
     status: gtk::Label,
     /// Size of the stream the server is sending, from the last StreamConfig.
@@ -135,8 +137,10 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         .hexpand(true)
         .vexpand(true)
         .can_shrink(true)
-        .content_fit(gtk::ContentFit::Contain)
+        .content_fit(gtk::ContentFit::ScaleDown)
         .build();
+    let frame = paintable::FramePaintable::default();
+    picture.set_paintable(Some(&frame));
     let video: gtk::Widget = picture.clone().upcast();
 
     let overlay = gtk::Overlay::new();
@@ -151,7 +155,7 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
 
     let ui = Rc::new(App {
         video: video.clone(),
-        picture,
+        frame,
         stats: stats.clone(),
         status: status.clone(),
         stream_size: Cell::new((0, 0)),
@@ -331,7 +335,7 @@ fn poll_frames(ui: Rc<App>, rx: Receiver<DisplayFrame>) {
         }
         if let Some(f) = latest {
             match dmabuf_texture(f) {
-                Ok(texture) => ui.picture.set_paintable(Some(&texture)),
+                Ok(texture) => ui.frame.set_frame(texture, ui.video.scale_factor()),
                 Err(e) => tracing::warn!(error = %e, "dmabuf texture import failed"),
             }
         }
@@ -456,13 +460,17 @@ fn to_remote(ui: &App, x: f64, y: f64) -> (f64, f64) {
     if rw == 0 || rh == 0 {
         return (0.0, 0.0);
     }
+    // The frame is drawn at one stream pixel per device pixel, centred, and
+    // only ever shrunk to fit (ScaleDown): its logical size is stream / device
+    // scale, times a fit factor of at most 1.
+    let device = ui.video.scale_factor().max(1) as f64;
+    let (lw, lh) = (rw as f64 / device, rh as f64 / device);
     let (aw, ah) = (ui.video.width() as f64, ui.video.height() as f64);
-    // The picture letterboxes the video; compute the fitted rect.
-    let fit = (aw / rw as f64).min(ah / rh as f64);
-    let (fw, fh) = (rw as f64 * fit, rh as f64 * fit);
+    let fit = (aw / lw).min(ah / lh).min(1.0);
+    let (fw, fh) = (lw * fit, lh * fit);
     let (ox, oy) = ((aw - fw) / 2.0, (ah - fh) / 2.0);
-    let px = ((x - ox) / fit).clamp(0.0, rw as f64);
-    let py = ((y - oy) / fit).clamp(0.0, rh as f64);
+    let px = ((x - ox) / fit * device).clamp(0.0, rw as f64);
+    let py = ((y - oy) / fit * device).clamp(0.0, rh as f64);
     let scale = ui.stream_scale.get().max(0.01) as f64;
     (px / scale, py / scale)
 }
