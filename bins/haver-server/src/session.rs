@@ -224,6 +224,9 @@ where
         loop {
             match reader.read_msg::<ClientMsg>().await {
                 Ok(ClientMsg::ClipboardData { data_len, .. }) => {
+                    if data_len as u64 > haver_proto::CLIPBOARD_MAX {
+                        break;
+                    }
                     match reader.read_payload(data_len).await {
                         Ok(bytes) => {
                             if let Ok(text) = String::from_utf8(bytes.to_vec()) {

@@ -276,6 +276,9 @@ where
                 });
             }
             ServerMsg::ClipboardData { data_len, .. } => {
+                if data_len as u64 > haver_proto::CLIPBOARD_MAX {
+                    anyhow::bail!("clipboard payload of {data_len} bytes exceeds the limit");
+                }
                 let bytes = reader.read_payload(data_len).await?;
                 if let Ok(text) = String::from_utf8(bytes.to_vec()) {
                     let _ = status.send(Status::Clipboard(text));

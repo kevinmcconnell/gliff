@@ -86,7 +86,10 @@ impl Sps {
     pub fn display_size(&self) -> (u32, u32) {
         let (w, h) = self.coded_size();
         match self.frame_cropping {
-            Some([l, r, t, b]) => (w.saturating_sub(2 * (l + r)), h.saturating_sub(2 * (t + b))),
+            Some([l, r, t, b]) => (
+                w.saturating_sub(l.saturating_add(r).saturating_mul(2)),
+                h.saturating_sub(t.saturating_add(b).saturating_mul(2)),
+            ),
             None => (w, h),
         }
     }
@@ -265,7 +268,13 @@ pub fn parse_sps(nal: &[u8]) -> Result<Sps> {
     }
     sps.direct_8x8_inference = r.bit()?;
     if r.bit()? {
-        sps.frame_cropping = Some([r.ue()?, r.ue()?, r.ue()?, r.ue()?]);
+        let crop = [
+            ue_max(&mut r, 8192, "frame_crop_left_offset")?,
+            ue_max(&mut r, 8192, "frame_crop_right_offset")?,
+            ue_max(&mut r, 8192, "frame_crop_top_offset")?,
+            ue_max(&mut r, 8192, "frame_crop_bottom_offset")?,
+        ];
+        sps.frame_cropping = Some(crop);
     }
     sps.vui_present = r.bit()?;
     if !sps.frame_mbs_only {
@@ -409,6 +418,13 @@ pub fn parse_slice_header(
                 let op = r.ue()?;
                 if op == 0 {
                     break;
+                }
+                // A conformant stream needs at most a few operations; a long
+                // run is slice data misread as a header, or hostile input.
+                if ops.len() >= 32 {
+                    return Err(Error::Bitstream(
+                        "too many memory_management_control_operations",
+                    ));
                 }
                 let mut m = Mmco {
                     op,

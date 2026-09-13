@@ -209,6 +209,8 @@ pub struct Decoder {
     outputs: Vec<(Image, ExportedDmabuf)>,
     /// Images handed out as `DisplayFrame`s and not yet dropped.
     busy: Vec<bool>,
+    /// Busy images in hand-out order, oldest first.
+    handed_out: std::collections::VecDeque<usize>,
     release_tx: Sender<usize>,
     release_rx: Receiver<usize>,
     /// CPU readback staging, allocated on first use (tests and the probe).
@@ -240,6 +242,7 @@ impl Decoder {
             },
             outputs,
             busy: vec![false; DISPLAY_RING],
+            handed_out: std::collections::VecDeque::new(),
             release_tx,
             release_rx,
             readback: None,
@@ -255,6 +258,7 @@ impl Decoder {
         let Some(idx) = idx else { return Ok(None) };
         let (_, dmabuf) = &self.outputs[idx];
         self.busy[idx] = true;
+        self.handed_out.push_back(idx);
         Ok(Some(DisplayFrame {
             fd: dmabuf.fd.as_fd().try_clone_to_owned()?,
             width: dmabuf.width,
@@ -297,19 +301,28 @@ impl Decoder {
     fn free_output(&mut self) -> usize {
         loop {
             while let Ok(i) = self.release_rx.try_recv() {
-                self.busy[i] = false;
+                self.mark_free(i);
             }
             if let Some(i) = self.busy.iter().position(|b| !b) {
                 return i;
             }
             match self.release_rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(i) => self.busy[i] = false,
+                Ok(i) => self.mark_free(i),
                 Err(_) => {
-                    tracing::warn!("display frames not released; reusing one");
-                    self.busy.fill(false);
+                    // Reclaim only the image handed out longest ago: it is the
+                    // one least likely to still be on screen.
+                    if let Some(i) = self.handed_out.pop_front() {
+                        tracing::warn!(image = i, "display frame not released; reusing the oldest");
+                        self.busy[i] = false;
+                    }
                 }
             }
         }
+    }
+
+    fn mark_free(&mut self, i: usize) {
+        self.busy[i] = false;
+        self.handed_out.retain(|&h| h != i);
     }
 
     fn decode_to_output(&mut self, main: &[u8], aux: &[u8]) -> Result<Option<usize>> {
