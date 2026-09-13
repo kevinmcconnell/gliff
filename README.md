@@ -25,8 +25,7 @@ Working and validated on AMD (Ryzen Granite Ridge, Mesa RADV):
   nested Hyprland: connect, stream, resize, ack pacing, both chroma modes.
 
 Design and the full picture are in `docs/architecture.md`; driver-specific
-behaviour and test gaps are in `docs/hardware-quirks.md`; the Vulkan design
-record is `docs/vulkan-plan.md`.
+behaviour and test gaps are in `docs/hardware-quirks.md`.
 
 Not done yet: image/binary clipboard (text works both ways); native
 single-stream 4:4:4 and AV1/HEVC; a verified ssh-from-cold-machine path; and

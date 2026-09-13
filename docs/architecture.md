@@ -75,8 +75,9 @@ round-trip.
 
 - **One GPU API.** Import, colour conversion, split, encode, decode, recombine
   and export all happen in Vulkan on one device, ordered by a timeline
-  semaphore. There is no GBM→VA-API→EGL hand-off and no per-driver VA-API
-  workaround; the same code runs on any driver with Vulkan Video.
+  semaphore. Buffers never cross between GPU APIs, and driver differences are
+  read from the Vulkan capability queries rather than special-cased; the same
+  code runs on any driver with Vulkan Video.
 
 - **Low-delay H.264.** The encoder emits IDR then P frames with one reference
   and no reordering (POC type 0), High profile, CABAC, CBR at the configured
@@ -144,10 +145,11 @@ Dual420, from `haver-probe roundtrip`:
 | two decodes + recombine (GPU, one fence wait) | ~5 ms |
 | CPU readback of the BGRX frame (probe only, cached host memory) | ~1.5 ms |
 
-The old CPU colour/split stages measured ~1.6 ms server and ~2.1 ms client at
-1080p and ~9 ms / ~8.5 ms at 4K; those are gone entirely. The remaining cost is the encode hardware itself:
-the VCN block serialises the two streams, so a 1080p Dual420 frame costs about
-two encodes' worth of time.
+No pixel work happens on the CPU at any resolution; the remaining cost is the
+encode hardware itself, which serialises the two streams, so a 1080p Dual420
+frame costs about two encodes' worth of time. The server adapts the CBR
+target to the link (see the session's `BitrateController`), so a slow link
+lowers quality rather than frame rate.
 
 ## Pending and recommended improvements
 
@@ -176,6 +178,6 @@ libvulkan, libgbm, libdrm, libwayland-client, libxkbcommon and libc, and the
 Vulkan loader `dlopen`s the GPU's ICD; `haver-client` additionally pulls the
 full GTK4 runtime. A normal Hyprland desktop already has all of these (they are
 the PKGBUILD `depends`). The Rust side is `ash` (thin generated bindings, no C
-build step) plus the same Wayland, GTK and async crates as before; the
-vendored VA-API crates and their seven local patches are gone. The compute
-shaders are committed as SPIR-V, so no shader compiler is needed to build.
+build step) plus the Wayland, GTK and async crates. The compute shaders are
+committed as SPIR-V, so no shader compiler is needed to build; rerun
+`crates/haver-vk/shaders/build.sh` (needs `glslc`) after editing a shader.

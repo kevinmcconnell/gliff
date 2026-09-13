@@ -8,9 +8,7 @@ far come from **one** machine:
 - Driver: Mesa RADV 26.2 (Vulkan 1.4), kernel 7.2.
 - Compositor: Hyprland 0.56.2.
 
-`haver-probe vulkan` prints the device and its video queues; the throwaway
-capability dump that informed the design is summarised in
-`docs/vulkan-plan.md`.
+`haver-probe vulkan` prints the device and its video queues.
 
 ## Confirmed on AMD RADV
 
