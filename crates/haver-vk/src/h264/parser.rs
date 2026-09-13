@@ -421,9 +421,9 @@ pub fn parse_slice_header(
                 }
                 // A conformant stream needs at most a few operations; a long
                 // run is slice data misread as a header, or hostile input.
-                if ops.len() >= 32 {
+                if ops.len() >= 32 || op > 6 {
                     return Err(Error::Bitstream(
-                        "too many memory_management_control_operations",
+                        "bad memory_management_control_operation list",
                     ));
                 }
                 let mut m = Mmco {

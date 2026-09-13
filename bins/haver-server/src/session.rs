@@ -137,6 +137,7 @@ where
         capturer,
         pending: None,
         capture_asked: true,
+        blocked_noted: false,
         in_flight: 0,
         n_limit: 2,
         frame_id: 0,
@@ -264,6 +265,9 @@ struct Session<W> {
     /// The newest captured frame not yet encoded.
     pending: Option<CapturedFrame>,
     capture_asked: bool,
+    /// The pending frame has already counted as blocked for the bitrate
+    /// controller.
+    blocked_noted: bool,
     /// Frames sent but not yet acked; bounded by `n_limit` for pacing.
     in_flight: u32,
     n_limit: u32,
@@ -366,25 +370,61 @@ impl<W: AsyncWrite + Unpin> Session<W> {
             .ok();
         // Hyprland applies the mode asynchronously and may round the scale
         // so the logical size is whole; wait for it and use what it chose.
-        let applied = self
-            .instance
-            .wait_for_mode(&self.output.name, width, height, scale);
+        let applied = self.wait_for_mode(width, height, scale).await;
+        if !same_size {
+            let settings = encoder_settings(width, height, self.bitrate_ctl.current());
+            match Encoder::new(
+                &self.gpu,
+                settings.clone(),
+                self.chroma == ChromaMode::Dual420,
+            ) {
+                Ok(encoder) => {
+                    self.encoder = encoder;
+                    self.settings = settings;
+                    self.output.width = width;
+                    self.output.height = height;
+                    self.pending = None;
+                    self.want_keyframe = true;
+                }
+                Err(e) => {
+                    // Keep streaming at the old size rather than end the session.
+                    tracing::warn!(error = %e, width, height, "encoder rejected the new size; keeping the old one");
+                    let (w, h, s) = (self.output.width, self.output.height, self.output.scale);
+                    self.instance
+                        .set_monitor_mode(&self.output.name, w, h, 60, s)
+                        .ok();
+                    self.wait_for_mode(w, h, s).await;
+                    self.inject(self.output.logical_extent());
+                    return Ok(());
+                }
+            }
+        }
         self.output.scale = applied;
         self.inject(self.output.logical_extent());
-        if !same_size {
-            self.output.width = width;
-            self.output.height = height;
-            self.settings = encoder_settings(width, height, self.bitrate_ctl.current());
-            self.encoder = Encoder::new(
-                &self.gpu,
-                self.settings.clone(),
-                self.chroma == ChromaMode::Dual420,
-            )
-            .context("reconfigure encoder")?;
-            self.pending = None;
-            self.want_keyframe = true;
-        }
         send_stream_config(&mut self.writer, self.codec, self.chroma, &self.output).await
+    }
+
+    /// Poll until the output reports the requested mode (Hyprland applies it
+    /// asynchronously and may round the scale), for up to half a second,
+    /// without blocking the session. Returns the scale in effect.
+    async fn wait_for_mode(&self, width: u32, height: u32, scale: f32) -> f32 {
+        let mut seen = None;
+        for _ in 0..10 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let Ok(mons) = self.instance.monitors() else {
+                continue;
+            };
+            if let Some(m) = mons
+                .iter()
+                .find(|m| m.name == self.output.name && m.width == width && m.height == height)
+            {
+                seen = Some(m.scale);
+                if (m.scale - scale).abs() < 0.15 {
+                    return m.scale;
+                }
+            }
+        }
+        seen.unwrap_or(scale)
     }
 
     async fn send_clipboard(&mut self, text: String) -> Result<()> {
@@ -404,6 +444,7 @@ impl<W: AsyncWrite + Unpin> Session<W> {
             Some(Incoming::Frame(image)) => {
                 self.pending = Some(image);
                 self.capture_asked = false;
+                self.blocked_noted = false;
             }
             Some(Incoming::Cursor {
                 width,
@@ -449,8 +490,10 @@ impl<W: AsyncWrite + Unpin> Session<W> {
     /// Encode and send the pending frame if the client has ack capacity, then
     /// ask the capture thread for the next one.
     async fn pump_encoder(&mut self) -> Result<()> {
-        if self.pending.is_some() && self.in_flight >= self.n_limit {
+        // Count a blocked frame once, not once per event-loop pass.
+        if self.pending.is_some() && self.in_flight >= self.n_limit && !self.blocked_noted {
             self.bitrate_ctl.note_blocked();
+            self.blocked_noted = true;
         }
         if self.in_flight < self.n_limit {
             if let Some(frame) = self.pending.take() {

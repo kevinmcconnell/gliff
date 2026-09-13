@@ -171,7 +171,11 @@ impl LoopState for State {
         match cmd {
             Cmd::SetText(text) => self.set_selection(text),
             Cmd::Received(text) => {
-                if self.last_set.as_deref() != Some(text.as_str()) {
+                // One-shot guard: swallow the echo of the value we set, then
+                // let a later genuine copy of the same text through.
+                if self.last_set.as_deref() == Some(text.as_str()) {
+                    self.last_set = None;
+                } else {
                     (self.sink)(ClipboardEvent::Text(text));
                 }
             }
@@ -240,6 +244,27 @@ impl State {
     fn clear_offers(&mut self) {
         for (off, _) in self.offers.drain() {
             off.destroy();
+        }
+    }
+}
+
+/// Write our selection to a paste target's pipe, giving up if the target
+/// stops draining it for a second, so a stuck target cannot pin a thread.
+fn write_selection(fd: OwnedFd, mut data: &[u8]) {
+    use nix::poll::{PollFd, PollFlags, PollTimeout};
+    let mut file = File::from(fd);
+    while !data.is_empty() {
+        {
+            let borrowed = file.as_fd();
+            let mut fds = [PollFd::new(borrowed, PollFlags::POLLOUT)];
+            match nix::poll::poll(&mut fds, PollTimeout::from(1000u16)) {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+        }
+        match file.write(data) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => data = &data[n..],
         }
     }
 }
@@ -378,9 +403,7 @@ impl Dispatch<ExtDataControlSourceV1, ()> for State {
                         // reads slowly would otherwise stall dispatch once the
                         // pipe buffer fills.
                         let text = text.clone();
-                        std::thread::spawn(move || {
-                            let _ = File::from(fd).write_all(text.as_bytes());
-                        });
+                        std::thread::spawn(move || write_selection(fd, text.as_bytes()));
                     }
                 }
             }

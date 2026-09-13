@@ -73,7 +73,7 @@ impl KeyState {
             xkb::KeyDirection::Up
         };
         self.state
-            .update_key(xkb::Keycode::new(evdev_code + 8), dir);
+            .update_key(xkb::Keycode::new(evdev_code.saturating_add(8)), dir);
         let mods = (
             self.state.serialize_mods(xkb::STATE_MODS_DEPRESSED),
             self.state.serialize_mods(xkb::STATE_MODS_LATCHED),

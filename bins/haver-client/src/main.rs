@@ -429,7 +429,8 @@ fn poll_status(ui: Rc<App>, rx: Receiver<Status>) {
 /// Show the remote cursor as the video widget's own cursor, so the local
 /// compositor draws it at the real pointer position with no added latency.
 fn set_remote_cursor(ui: &App, width: u32, height: u32, hot_x: i32, hot_y: i32, argb: &[u8]) {
-    if width == 0 || height == 0 || argb.len() < (width * height * 4) as usize {
+    let needed = width as u64 * height as u64 * 4;
+    if width == 0 || height == 0 || width > 1024 || height > 1024 || (argb.len() as u64) < needed {
         return;
     }
     let opaque = argb.chunks_exact(4).any(|p| p[3] != 0);
