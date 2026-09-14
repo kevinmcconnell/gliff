@@ -119,15 +119,23 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
     let fullscreen_btn = gtk::ToggleButton::builder()
         .icon_name("view-fullscreen-symbolic")
         .build();
+    let stats_btn = gtk::ToggleButton::builder()
+        .icon_name("utilities-system-monitor-symbolic")
+        .tooltip_text("Show stats")
+        .build();
     header.pack_start(&host_entry);
     header.pack_start(&connect_btn);
     header.pack_end(&fullscreen_btn);
+    header.pack_end(&stats_btn);
 
     let stats = gtk::Label::builder()
         .halign(gtk::Align::Start)
         .valign(gtk::Align::Start)
         .css_classes(["stats"])
-        .visible(false)
+        .build();
+    stats_btn
+        .bind_property("active", &stats, "visible")
+        .sync_create()
         .build();
     let status = gtk::Label::builder().label("Not connected").build();
 
@@ -392,7 +400,6 @@ fn poll_status(ui: Rc<App>, rx: Receiver<Status>) {
                     mbit,
                     decode_ms,
                 } => {
-                    ui.stats.set_visible(true);
                     ui.stats.set_text(&format!(
                         "{fps:.0} fps  {mbit:.1} Mbit/s  decode {decode_ms:.1} ms"
                     ));
