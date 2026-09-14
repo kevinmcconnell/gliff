@@ -62,5 +62,5 @@ drm = "0.14"
 nix = { version = "0.30", features = ["fs", "socket", "uio", "poll"] }
 rustix = { version = "1", features = ["fs", "mm"] }
 
-gtk4 = { version = "0.11", features = ["v4_18"] }
-libadwaita = { version = "0.9", features = ["v1_6"] }
+gtk4 = { version = "0.11", features = ["v4_14"] }
+libadwaita = { version = "0.9", features = ["v1_5"] }
