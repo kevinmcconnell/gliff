@@ -8,9 +8,9 @@ members = [
     "crates/hypr-capture",
     "crates/hypr-input",
     "crates/gliff-vk",
-    "bins/gliff-server",
-    "bins/gliff-client",
-    "tools/gliff-probe",
+    "crates/gliff",
+    "crates/gliff-server",
+    "crates/gliff-probe",
 ]
 
 [workspace.package]

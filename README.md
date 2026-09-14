@@ -114,4 +114,4 @@ Single420 server-plus-client streams.
 - `crates/gliff-vk` the Vulkan media pipeline: device, dmabuf import/export,
   split and recombine compute shaders, H.264 encode/decode, header parser.
   The only crate with `unsafe`.
-- `bins/gliff-server`, `bins/gliff`, `tools/gliff-probe`.
+- `crates/gliff` the GTK client, `crates/gliff-server`, `crates/gliff-probe`.
