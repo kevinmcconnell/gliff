@@ -9,6 +9,7 @@ use drm_fourcc::{DrmFourcc, DrmModifier};
 use gbm::{BufferObjectFlags, Device};
 use wayland_client::globals::GlobalListContents;
 use wayland_client::protocol::wl_buffer::WlBuffer;
+use wayland_client::protocol::wl_callback::{self, WlCallback};
 use wayland_client::protocol::wl_output::{self, WlOutput};
 use wayland_client::protocol::wl_pointer::WlPointer;
 use wayland_client::protocol::wl_registry::WlRegistry;
@@ -104,6 +105,8 @@ struct State {
     cursor_hotspot: (i32, i32),
     cursor_pos: (i32, i32),
     cursor_visible: bool,
+    cursor_capture_dead: bool,
+    cursor_restart_at: Option<std::time::Instant>,
 
     stopped: bool,
     quit: bool,
@@ -194,6 +197,8 @@ fn run(
         cursor_hotspot: (0, 0),
         cursor_pos: (0, 0),
         cursor_visible: false,
+        cursor_capture_dead: false,
+        cursor_restart_at: None,
         stopped: false,
         quit: false,
         cfg,
@@ -317,19 +322,7 @@ impl State {
         if let Some((frame, _)) = self.in_flight.take() {
             frame.destroy();
         }
-        if let Some(f) = self.cursor_frame.take() {
-            f.destroy();
-        }
-        self.cursor_buf = None;
-        if let Some(s) = self.cursor_capture.take() {
-            s.destroy();
-        }
-        if let Some(s) = self.cursor_session.take() {
-            s.destroy();
-        }
-        if let Some(p) = self.pointer.take() {
-            p.release();
-        }
+        self.teardown_cursor();
         for slot in self.ring.drain(..) {
             slot.wl_buffer.destroy();
         }
@@ -564,7 +557,12 @@ impl State {
                     Kind::Cursor => {
                         self.cursor_constraints.shm_formats.clear();
                         self.cursor_constraints.formats.clear();
-                        self.realloc_cursor_buffer();
+                        // The compositor completes the in-flight frame right
+                        // after new constraints; let it finish and reallocate
+                        // once its result is in.
+                        if self.cursor_frame.is_none() {
+                            self.realloc_cursor_buffer();
+                        }
                     }
                 }
             }
@@ -663,6 +661,24 @@ impl State {
         }
     }
 
+    fn teardown_cursor(&mut self) {
+        if let Some(f) = self.cursor_frame.take() {
+            f.destroy();
+        }
+        self.cursor_buf = None;
+        if let Some(s) = self.cursor_capture.take() {
+            s.destroy();
+        }
+        if let Some(s) = self.cursor_session.take() {
+            s.destroy();
+        }
+        if let Some(p) = self.pointer.take() {
+            p.release();
+        }
+        self.cursor_constraints = Constraints::default();
+        self.cursor_capture_dead = false;
+    }
+
     fn start_cursor_session(&mut self) {
         let (Some(seat), Some(source)) = (self.seat.seat.clone(), self.source.clone()) else {
             return;
@@ -675,6 +691,37 @@ impl State {
         self.pointer = Some(pointer);
         self.cursor_session = Some(cs);
         self.cursor_capture = Some(capture);
+        // Hyprland drops the capture session without a word when the cursor
+        // is not a compositor buffer at this moment; the sync tells us whether
+        // constraints came back at all.
+        self.conn.display().sync(&self.qh, CursorSync);
+    }
+
+    fn on_cursor_sync(&mut self) {
+        if self.cursor_capture.is_some() && !self.cursor_constraints.done {
+            tracing::debug!(
+                "cursor capture session sent no constraints; will retry on cursor change"
+            );
+            self.cursor_capture_dead = true;
+        }
+    }
+
+    /// Recreate a dead cursor capture session, at most once per second when
+    /// only the position moved.
+    fn maybe_restart_cursor_session(&mut self, cursor_changed: bool) {
+        if !self.cursor_capture_dead {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let due = self
+            .cursor_restart_at
+            .is_none_or(|t| now.duration_since(t) >= std::time::Duration::from_secs(1));
+        if !cursor_changed && !due {
+            return;
+        }
+        self.cursor_restart_at = Some(now);
+        self.teardown_cursor();
+        self.start_cursor_session();
     }
 
     fn realloc_cursor_buffer(&mut self) {
@@ -682,9 +729,6 @@ impl State {
             self.cursor_constraints.width,
             self.cursor_constraints.height,
         );
-        if let Some(f) = self.cursor_frame.take() {
-            f.destroy();
-        }
         let same = self
             .cursor_buf
             .as_ref()
@@ -734,11 +778,17 @@ impl State {
                 if let Some(f) = self.cursor_frame.take() {
                     f.destroy();
                 }
-                if let Some(buf) = self.cursor_buf.as_ref() {
+                let current = self.cursor_buf.as_ref().is_some_and(|b| {
+                    b.width == self.cursor_constraints.width
+                        && b.height == self.cursor_constraints.height
+                });
+                if let Some(buf) = self.cursor_buf.as_ref().filter(|_| current) {
                     match buf.read_argb() {
                         Ok(argb) => {
                             let (hot_x, hot_y) = self.cursor_hotspot;
                             let (width, height) = (buf.width, buf.height);
+                            let opaque = argb.chunks_exact(4).filter(|p| p[3] != 0).count();
+                            tracing::debug!(width, height, hot_x, hot_y, opaque, "cursor shape");
                             self.emit(CaptureEvent::CursorShape {
                                 width,
                                 height,
@@ -750,7 +800,7 @@ impl State {
                         Err(e) => tracing::warn!(error = %e, "cursor read failed"),
                     }
                 }
-                self.capture_cursor();
+                self.realloc_cursor_buffer();
             }
             frame_proto::Event::Failed { reason } => {
                 if let Some(f) = self.cursor_frame.take() {
@@ -761,7 +811,7 @@ impl State {
                     reason,
                     wayland_client::WEnum::Value(frame_proto::FailureReason::Stopped)
                 ) {
-                    self.capture_cursor();
+                    self.realloc_cursor_buffer();
                 }
             }
             _ => {}
@@ -771,6 +821,7 @@ impl State {
     fn on_cursor_session_event(&mut self, event: cursor_session::Event) {
         match event {
             cursor_session::Event::Enter => {
+                self.maybe_restart_cursor_session(true);
                 self.cursor_visible = true;
                 let (x, y) = self.cursor_pos;
                 self.emit(CaptureEvent::CursorPos {
@@ -789,11 +840,15 @@ impl State {
                 });
             }
             cursor_session::Event::Position { x, y } => {
+                self.maybe_restart_cursor_session(false);
                 self.cursor_pos = (x, y);
                 let visible = self.cursor_visible;
                 self.emit(CaptureEvent::CursorPos { x, y, visible });
             }
-            cursor_session::Event::Hotspot { x, y } => self.cursor_hotspot = (x, y),
+            cursor_session::Event::Hotspot { x, y } => {
+                self.maybe_restart_cursor_session(true);
+                self.cursor_hotspot = (x, y);
+            }
             _ => {}
         }
     }
@@ -860,6 +915,23 @@ impl Dispatch<ExtImageCopyCaptureFrameV1, Kind> for State {
         _: &QueueHandle<Self>,
     ) {
         s.on_frame_event(*kind, f, e);
+    }
+}
+
+struct CursorSync;
+
+impl Dispatch<WlCallback, CursorSync> for State {
+    fn event(
+        s: &mut Self,
+        _: &WlCallback,
+        e: wl_callback::Event,
+        _: &CursorSync,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_callback::Event::Done { .. } = e {
+            s.on_cursor_sync();
+        }
     }
 }
 
