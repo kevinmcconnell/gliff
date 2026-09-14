@@ -125,10 +125,13 @@ where
     .ok();
 
     let gpu = Gpu::open(Some(&cfg.render_node)).context("open Vulkan device")?;
-    let bitrate_ctl = BitrateController::new(
-        cfg.bitrate
-            .unwrap_or_else(|| EncoderSettings::default_bitrate(output.width, output.height, 60)),
-    );
+    let bitrate_ctl = match cfg.bitrate {
+        Some(fixed) => BitrateController::new(fixed, true),
+        None => BitrateController::new(
+            EncoderSettings::default_bitrate(stream.0, stream.1, 60),
+            false,
+        ),
+    };
     let settings = encoder_settings(stream.0, stream.1, bitrate_ctl.current());
     let encoder = Encoder::new(&gpu, settings.clone(), chroma == ChromaMode::Dual420)
         .context("create encoder")?;
@@ -316,7 +319,15 @@ impl<W: AsyncWrite + Unpin> Session<W> {
             } => {
                 self.in_flight = self.in_flight.saturating_sub(1);
                 self.rtt.record(frame_id, decoded_at_ms);
-                self.n_limit = self.rtt.window(self.settings.framerate);
+                let n_limit = self.rtt.window(self.settings.framerate);
+                if n_limit != self.n_limit {
+                    tracing::debug!(
+                        rtt_ms = format!("{:.1}", self.rtt.smoothed_ms),
+                        n_limit,
+                        "ack window changed"
+                    );
+                    self.n_limit = n_limit;
+                }
                 if let Some(bitrate) = self.bitrate_ctl.on_ack(self.rtt.smoothed_ms) {
                     self.settings.bitrate = bitrate;
                     self.encoder.set_bitrate(bitrate);
@@ -411,6 +422,8 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         // so the logical size is whole; wait for it and use what it chose.
         let applied = self.wait_for_mode(width, height, scale).await;
         if !same_size {
+            self.bitrate_ctl
+                .retarget(EncoderSettings::default_bitrate(width, height, 60));
             let settings = encoder_settings(width, height, self.bitrate_ctl.current());
             match Encoder::new(
                 &self.gpu,
@@ -464,6 +477,8 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         if stream == self.stream {
             return Ok(());
         }
+        self.bitrate_ctl
+            .retarget(EncoderSettings::default_bitrate(stream.0, stream.1, 60));
         let settings = encoder_settings(stream.0, stream.1, self.bitrate_ctl.current());
         match Encoder::new(
             &self.gpu,
@@ -865,6 +880,8 @@ struct BitrateController {
     min: u32,
     max: u32,
     current: u32,
+    /// Set by `--bitrate`: the target does not follow the stream size.
+    fixed: bool,
     base_rtt_ms: f64,
     last_eval: Instant,
     last_change: Instant,
@@ -878,12 +895,13 @@ impl BitrateController {
     const QUEUE_HIGH_MS: f64 = 50.0;
     const QUEUE_LOW_MS: f64 = 15.0;
 
-    fn new(max: u32) -> Self {
+    fn new(max: u32, fixed: bool) -> Self {
         let now = Instant::now();
         Self {
             min: (max / 8).max(1_000_000).min(max),
             max,
             current: max,
+            fixed,
             base_rtt_ms: f64::MAX,
             last_eval: now,
             last_change: now,
@@ -894,6 +912,18 @@ impl BitrateController {
 
     fn current(&self) -> u32 {
         self.current
+    }
+
+    /// The stream size changed: keep the same share of the new ceiling, so
+    /// bits per pixel stay constant across a resize.
+    fn retarget(&mut self, max: u32) {
+        if self.fixed || max == self.max {
+            return;
+        }
+        let share = self.current as f64 / self.max as f64;
+        self.max = max;
+        self.min = (max / 8).max(1_000_000).min(max);
+        self.current = ((max as f64 * share) as u32).clamp(self.min, self.max);
     }
 
     fn note_sent(&mut self) {
