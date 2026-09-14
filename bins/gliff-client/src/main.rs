@@ -427,17 +427,16 @@ fn poll_status(ui: Rc<App>, rx: Receiver<Status>) {
 
 /// Show the remote cursor as the video widget's own cursor, so the local
 /// compositor draws it at the real pointer position with no added latency.
+/// An image with no visible shape (fully transparent, or one flat colour as
+/// Hyprland sends when it has no cursor image to share) falls back to the
+/// default pointer so the user is never left without one.
 fn set_remote_cursor(ui: &App, width: u32, height: u32, hot_x: i32, hot_y: i32, argb: &[u8]) {
     let needed = width as u64 * height as u64 * 4;
     if width == 0 || height == 0 || width > 1024 || height > 1024 || (argb.len() as u64) < needed {
         return;
     }
-    let opaque = argb.chunks_exact(4).any(|p| p[3] != 0);
-    if !opaque {
-        // Fully transparent: hide the pointer over the video.
-        if let Some(cursor) = gdk::Cursor::from_name("none", None) {
-            ui.video.set_cursor(Some(&cursor));
-        }
+    if !has_visible_shape(argb) {
+        ui.video.set_cursor(None);
         return;
     }
     let bytes = glib::Bytes::from(argb);
@@ -450,6 +449,16 @@ fn set_remote_cursor(ui: &App, width: u32, height: u32, hot_x: i32, hot_y: i32, 
     );
     let cursor = gdk::Cursor::from_texture(&texture, hot_x, hot_y, None);
     ui.video.set_cursor(Some(&cursor));
+}
+
+fn has_visible_shape(argb: &[u8]) -> bool {
+    let mut pixels = argb.chunks_exact(4);
+    let Some(first) = pixels.next() else {
+        return false;
+    };
+    let opaque = first[3] != 0 || pixels.clone().any(|p| p[3] != 0);
+    let uniform = pixels.all(|p| p == first);
+    opaque && !uniform
 }
 
 /// Map a widget-space point to the remote output's logical coordinates:
@@ -889,6 +898,17 @@ fn evdev_button(n: u32) -> u32 {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[test]
+    fn visible_shape_needs_alpha_and_contrast() {
+        let transparent = [0u8; 16];
+        let black = [0, 0, 0, 255].repeat(4);
+        let mut arrow = [0u8; 16];
+        arrow[3] = 255;
+        assert!(!has_visible_shape(&transparent));
+        assert!(!has_visible_shape(&black));
+        assert!(has_visible_shape(&arrow));
+    }
 
     #[test]
     fn parse_chord_and_double_and_none() {

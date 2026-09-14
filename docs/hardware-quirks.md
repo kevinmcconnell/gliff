@@ -57,6 +57,39 @@ through `HOST_CACHED` memory it takes ~1 ms. `HostBuffer` prefers cached
 memory and falls back to write-combined. The encoder's bitstream buffer uses
 the same path.
 
+## Hyprland cursor capture (0.56.2, and upstream main as of 2026-09-02)
+
+The server captures the remote cursor with an `ext-image-copy-capture-v1`
+cursor session. Three Hyprland behaviours shape how `hypr-capture` drives it:
+
+- **Every shared cursor image is fully transparent.**
+  `CCursorshareSession::render()` draws the cursor texture only when the
+  pointer image has both a buffer and a surface set, and the pointer manager
+  never sets both. The buffer is cleared to `{0,0,0,0}` instead, or to opaque
+  black when the pointer is on another output. The client therefore treats an
+  image with no visible shape as "no remote image" and shows the default
+  pointer. Upstream fix: in `render()`, take
+  `Pointer::mgr()->getCurrentCursorTexture()` and draw it when non-null.
+- **Surface cursors have no constraints.** `calculateConstraints` records the
+  format and size only for shm buffer cursors (hyprcursor shapes). If the
+  pointer shows a client-provided cursor surface (a terminal's I-beam, say)
+  when the capture session is created, the format is invalid and Hyprland
+  drops the capture session without sending `stopped`. The capture thread
+  detects this with a `wl_display.sync` after creation and recreates the
+  cursor session on the next cursor change. If the surface cursor appears
+  later, the size stays at the previous value and `capture` fails with
+  `stopped`, which is not a real stop: constraints arrive again on the next
+  cursor change, so the thread waits for `done`.
+- **Constraints arrive before the in-flight frame completes.** On a cursor
+  change Hyprland sends `buffer_size` + `done`, then `ready` for the pending
+  frame; the next frame only completes on the following change. The capture
+  thread must not destroy the in-flight frame on `done`, or every shape after
+  the first is lost.
+
+Hyprland also sends the hotspot in logical units while the image is in
+physical pixels, so on a scaled output the hotspot will be off once real
+images arrive.
+
 ## Not yet tested anywhere
 - Intel ANV and NVIDIA (proprietary and NVK) for every item above.
 - Native 4:4:4 encode (HEVC 4:4:4 / AV1) to retire the dual-stream split.

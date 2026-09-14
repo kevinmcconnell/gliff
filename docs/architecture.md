@@ -109,7 +109,8 @@ round-trip.
 
 - **Cursor.** The remote cursor is shown as the video widget's own cursor, so
   the local compositor draws it at the real pointer with no added latency; it is
-  never baked into the video.
+  never baked into the video. An image with no visible shape falls back to the
+  default pointer (see `hardware-quirks.md` for why Hyprland sends those).
 
 - **Clipboard (text).** The server bridges the compositor's text selection with
   `ext-data-control-v1` on its own thread; the client bridges `gdk::Clipboard`.
