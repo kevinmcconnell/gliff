@@ -703,6 +703,7 @@ fn install_input_handlers(
                 return glib::Propagation::Stop;
             }
             let code = keycode.saturating_sub(8);
+            tracing::debug!(code, "key pressed");
             if track_key(&ui, code, true) {
                 send(
                     &ui,
@@ -817,6 +818,7 @@ fn install_input_handlers(
             hk => Some(format!("Shortcuts captured — {} to release", hk.describe())),
         };
         focus.connect_enter(move |_| {
+            tracing::debug!("video focused; inhibiting system shortcuts");
             if let Some(toplevel) = window.surface().and_downcast::<gdk::Toplevel>() {
                 toplevel.inhibit_system_shortcuts(None::<&gdk::Event>);
             }
@@ -829,6 +831,7 @@ fn install_input_handlers(
         let window = window.clone();
         let ui = ui.clone();
         focus.connect_leave(move |_| {
+            tracing::debug!("video unfocused; restoring system shortcuts");
             release_pressed_keys(&ui);
             if let Some(toplevel) = window.surface().and_downcast::<gdk::Toplevel>() {
                 toplevel.restore_system_shortcuts();

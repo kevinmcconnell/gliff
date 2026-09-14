@@ -90,6 +90,23 @@ Hyprland also sends the hotspot in logical units while the image is in
 physical pixels, so on a scaled output the hotspot will be off once real
 images arrive.
 
+- **Removing a monitor under a live cursor session aborts Hyprland.**
+  `output remove` on a headless output unmaps its layer surfaces, which
+  refocuses and re-renders the cursor; `CCursorshareSession::copy()` then
+  renders into the vanishing monitor and `beginRender` aborts (SIGABRT, seen
+  twice on 0.56.2; Hyprland restarts in safe mode). The server ends the
+  capture thread, flushes its Wayland connection, and only then removes the
+  headless output.
+
+## Hyprland with the Lua config (Omarchy)
+
+`hyprctl keyword` is rejected (`keyword can't work with non-legacy parsers`).
+`hypr-ipc` falls back to `eval hl.monitor({ output = ..., mode = ...,
+position = "auto", scale = ... })`, which applies at runtime. `output create
+headless` and `output remove` are hyprctl commands and work with both config
+types. The server reads back the mode Hyprland applied instead of assuming
+the request took effect.
+
 ## Not yet tested anywhere
 - Intel ANV and NVIDIA (proprietary and NVK) for every item above.
 - Native 4:4:4 encode (HEVC 4:4:4 / AV1) to retire the dual-stream split.

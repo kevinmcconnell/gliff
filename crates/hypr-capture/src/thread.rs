@@ -213,6 +213,7 @@ fn run(
         state.emit(CaptureEvent::Error(e.to_string()));
     }
     state.teardown();
+    let _ = state.conn.flush();
     std::mem::swap(&mut state.sink, sink);
     result
 }
