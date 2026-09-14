@@ -62,6 +62,20 @@ round-trip.
   payloads ride outside the postcard body so the encoder output is sent with
   `write_vectored` and read straight into the decoder.
 
+- **Why not UDP.** Measured on 2026-09-14 between two Wi-Fi machines over
+  Tailscale's direct path (MTU 1280, 330-380 Mbit/s of SSH throughput, RTT
+  3-12 ms with contention spikes): a 1856x1238 Dual420 mirror ran at 58 fps
+  with a worst frame-arrival gap of 71 ms while TCP retransmitted 0.7-6.5% of
+  segments. A frame is ~115 packets, so raw UDP would damage most frames at
+  those loss rates, and a working UDP path needs NACK or FEC, a jitter buffer
+  and codec resilience, whose recovery also costs one RTT. TCP in SSH stays
+  until a high-RTT lossy path becomes a primary use; then QUIC (one stream
+  per frame, keys handed over SSH) is the candidate, not raw UDP. To measure
+  again: client `RUST_LOG=info,gliff_vk=debug`, server
+  `--server-bin 'env RUST_LOG=info,gliff_server=debug gliff-server'`, compare
+  the `sent frame` and `decode + recombine` timestamps, and sample
+  `ss -tin` on the server for retransmits.
+
 - **4:4:4 by two 4:2:0 streams (AVC444).** Hardware H.264 encoders only do
   4:2:0, which blurs coloured text. gliff splits full 4:4:4 into a main stream
   (luma + even-position chroma) and an auxiliary stream (the dropped chroma), and
