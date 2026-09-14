@@ -1,5 +1,7 @@
 # gliff
 
+[![CI](https://github.com/kevinmcconnell/gliff/actions/workflows/ci.yml/badge.svg)](https://github.com/kevinmcconnell/gliff/actions/workflows/ci.yml)
+
 Remote-desktop a Hyprland session from another Hyprland machine, over SSH only.
 Custom wire protocol, Vulkan Video hardware encode and decode, full-resolution
 4:4:4 colour by the RDP AVC444 technique (two 4:2:0 H.264 streams recombined on
@@ -32,6 +34,12 @@ single-stream 4:4:4 and AV1/HEVC; a verified ssh-from-cold-machine path; and
 testing on Intel and NVIDIA Vulkan drivers.
 
 ## Build
+
+Prebuilt x86_64 binaries are on the [releases
+page](https://github.com/kevinmcconnell/gliff/releases): every push to `main`
+updates the `latest` pre-release, and `v*` tags make permanent releases.
+
+To build from source:
 
 ```
 cargo build --release
