@@ -418,6 +418,7 @@ fn poll_status(ui: Rc<App>, rx: Receiver<Status>) {
                     }
                 }
                 Status::Error(e) => {
+                    tracing::error!(error = %e, "connection failed");
                     ui.status.set_text(&format!("Error: {e}"));
                     schedule_reconnect(ui.clone());
                     return glib::ControlFlow::Break;
