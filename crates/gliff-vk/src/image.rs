@@ -52,6 +52,9 @@ pub enum Role {
     DecodeOutput,
     /// Decoder reference pictures.
     DecodeDpb,
+    /// Decoder reference picture that is also the decode output and is
+    /// read by the recombine shader.
+    DecodeDpbAndOutput,
 }
 
 impl Image {
@@ -86,6 +89,13 @@ impl Image {
             Role::DecodeDpb => (
                 vk::ImageUsageFlags::VIDEO_DECODE_DPB_KHR,
                 vk::ImageCreateFlags::empty(),
+            ),
+            Role::DecodeDpbAndOutput => (
+                vk::ImageUsageFlags::VIDEO_DECODE_DPB_KHR
+                    | vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR
+                    | vk::ImageUsageFlags::SAMPLED
+                    | vk::ImageUsageFlags::TRANSFER_SRC,
+                vk::ImageCreateFlags::MUTABLE_FORMAT | vk::ImageCreateFlags::EXTENDED_USAGE,
             ),
         };
         let families = gpu.families.all();
@@ -144,7 +154,10 @@ impl Image {
                 video_usage,
             )?);
         }
-        if matches!(role, Role::EncodeSource | Role::DecodeOutput) {
+        if matches!(
+            role,
+            Role::EncodeSource | Role::DecodeOutput | Role::DecodeDpbAndOutput
+        ) {
             let plane_usage = usage & compute_usage;
             img.plane_views.push(img.view(
                 vk::Format::R8_UNORM,
