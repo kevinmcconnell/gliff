@@ -3,7 +3,8 @@
 //! The application supplies what the hardware does not parse: SPS/PPS as
 //! `StdVideo` structs, the per-picture header fields, picture order counts,
 //! and the DPB (reference slot) state. Decoded pictures land in a small ring
-//! of output images that the recombine pass reads.
+//! of output images that the recombine pass reads, or, on drivers whose DPB
+//! and output must coincide, in the DPB slot image itself.
 
 use std::sync::Arc;
 
@@ -29,15 +30,42 @@ struct DpbPicture {
     poc: i32,
 }
 
+/// Where decoded pictures go, decided by the driver's decode capabilities.
+enum Pictures {
+    /// One array image for the DPB and a separate ring of output images.
+    Distinct {
+        dpb: Image,
+        outputs: Vec<Image>,
+        next_output: usize,
+    },
+    /// One image per DPB slot, each also usable as decode output and shader
+    /// input, plus one spare for pictures that are not references.
+    Coincide { slots: Vec<Image> },
+}
+
+impl Pictures {
+    fn slot_view(&self, slot: usize) -> vk::ImageView {
+        match self {
+            Pictures::Distinct { dpb, .. } => dpb.layer_views[slot],
+            Pictures::Coincide { slots } => slots[slot].view0(),
+        }
+    }
+
+    fn output(&self, index: usize) -> &Image {
+        match self {
+            Pictures::Distinct { outputs, .. } => &outputs[index],
+            Pictures::Coincide { slots } => &slots[index],
+        }
+    }
+}
+
 struct Stream {
     sps: Sps,
     pps: Pps,
     session: Session,
     params: SessionParameters,
-    dpb: Image,
+    pictures: Pictures,
     slots: Vec<Option<DpbPicture>>,
-    outputs: Vec<Image>,
-    next_output: usize,
     coded: vk::Extent2D,
     started: bool,
 }
@@ -49,6 +77,7 @@ pub struct H264Decoder {
     bitstream_align: usize,
     max_dpb_slots: u32,
     max_coded_extent: vk::Extent2D,
+    coincide: bool,
     sps_bytes: Vec<u8>,
     pps_bytes: Vec<u8>,
     stream: Option<Stream>,
@@ -70,36 +99,43 @@ impl H264Decoder {
         let queue = gpu
             .decode_queue
             .ok_or_else(|| Error::Unsupported("no decode queue".into()))?;
-        let (align, max_dpb_slots, max_coded_extent) = with_h264_profile(false, |profile| {
-            let mut h264_caps = vk::VideoDecodeH264CapabilitiesKHR::default();
-            let mut dec_caps = vk::VideoDecodeCapabilitiesKHR::default();
-            let mut caps = vk::VideoCapabilitiesKHR::default()
-                .push_next(&mut dec_caps)
-                .push_next(&mut h264_caps);
-            // SAFETY: valid physical device and chained structs.
-            unsafe {
-                (gpu.video_instance
-                    .fp()
-                    .get_physical_device_video_capabilities_khr)(
-                    gpu.physical, profile, &mut caps
-                )
-                .result()?
-            };
-            let align = caps
-                .min_bitstream_buffer_size_alignment
-                .max(caps.min_bitstream_buffer_offset_alignment) as usize;
-            let max_dpb_slots = caps.max_dpb_slots;
-            let max_coded_extent = caps.max_coded_extent;
-            if !dec_caps
-                .flags
-                .contains(vk::VideoDecodeCapabilityFlagsKHR::DPB_AND_OUTPUT_DISTINCT)
-            {
-                return Err(Error::Unsupported(
-                    "decoder requires DPB and output to coincide; not implemented".into(),
-                ));
-            }
-            Ok((align, max_dpb_slots, max_coded_extent))
-        })?;
+        let (align, max_dpb_slots, max_coded_extent, coincide) =
+            with_h264_profile(false, |profile| {
+                let mut h264_caps = vk::VideoDecodeH264CapabilitiesKHR::default();
+                let mut dec_caps = vk::VideoDecodeCapabilitiesKHR::default();
+                let mut caps = vk::VideoCapabilitiesKHR::default()
+                    .push_next(&mut dec_caps)
+                    .push_next(&mut h264_caps);
+                // SAFETY: valid physical device and chained structs.
+                unsafe {
+                    (gpu.video_instance
+                        .fp()
+                        .get_physical_device_video_capabilities_khr)(
+                        gpu.physical,
+                        profile,
+                        &mut caps,
+                    )
+                    .result()?
+                };
+                let align = caps
+                    .min_bitstream_buffer_size_alignment
+                    .max(caps.min_bitstream_buffer_offset_alignment)
+                    as usize;
+                let max_dpb_slots = caps.max_dpb_slots;
+                let max_coded_extent = caps.max_coded_extent;
+                let distinct = dec_caps
+                    .flags
+                    .contains(vk::VideoDecodeCapabilityFlagsKHR::DPB_AND_OUTPUT_DISTINCT);
+                let coincide = dec_caps
+                    .flags
+                    .contains(vk::VideoDecodeCapabilityFlagsKHR::DPB_AND_OUTPUT_COINCIDE);
+                if !distinct && !coincide {
+                    return Err(Error::Unsupported(
+                        "decoder reports neither distinct nor coincident DPB and output".into(),
+                    ));
+                }
+                Ok((align, max_dpb_slots, max_coded_extent, !distinct))
+            })?;
         let bitstream = with_h264_profile(false, |profile| {
             HostBuffer::new(
                 gpu,
@@ -115,6 +151,7 @@ impl H264Decoder {
             bitstream_align: align.max(1),
             max_dpb_slots,
             max_coded_extent,
+            coincide,
             sps_bytes: Vec::new(),
             pps_bytes: Vec::new(),
             stream: None,
@@ -239,15 +276,24 @@ impl H264Decoder {
             .enumerate()
             .filter_map(|(i, s)| s.map(|p| (i, p)))
             .collect();
-        let output_index = stream.next_output;
-        stream.next_output = (stream.next_output + 1) % OUTPUT_RING;
+        // Coincident output is the slot being set up (or the spare image past
+        // the last slot for a non-reference picture).
+        let output_index = match &mut stream.pictures {
+            Pictures::Distinct { next_output, .. } => {
+                let i = *next_output;
+                *next_output = (i + 1) % OUTPUT_RING;
+                i
+            }
+            Pictures::Coincide { .. } => setup_slot.unwrap_or(stream.slots.len()),
+        };
 
         let coded = stream.coded;
+        let pictures = &stream.pictures;
         let dpb_resource = |slot: usize| {
             vk::VideoPictureResourceInfoKHR::default()
                 .coded_extent(coded)
                 .base_array_layer(0)
-                .image_view_binding(stream.dpb.layer_views[slot])
+                .image_view_binding(pictures.slot_view(slot))
         };
         let ref_std = |p: DpbPicture| {
             let flags = zeroed::<std_video::StdVideoDecodeH264ReferenceInfoFlags>();
@@ -331,7 +377,7 @@ impl H264Decoder {
         let mut h264_pic = vk::VideoDecodeH264PictureInfoKHR::default()
             .std_picture_info(&std_pic)
             .slice_offsets(&offsets);
-        let output = &stream.outputs[output_index];
+        let output = pictures.output(output_index);
         let dst = vk::VideoPictureResourceInfoKHR::default()
             .coded_extent(coded)
             .base_array_layer(0)
@@ -354,11 +400,29 @@ impl H264Decoder {
         let video = self.gpu.video.fp();
         let decode = self.gpu.decode.fp();
         let started = stream.started;
-        let dpb = &stream.dpb;
         self.commands
             .run(timeline.semaphore, None, Some(signal), false, |cmd| {
-                dpb.transition(cmd, vk::ImageLayout::VIDEO_DECODE_DPB_KHR);
-                output.transition(cmd, vk::ImageLayout::VIDEO_DECODE_DST_KHR);
+                match pictures {
+                    Pictures::Distinct { dpb, .. } => {
+                        dpb.transition(cmd, vk::ImageLayout::VIDEO_DECODE_DPB_KHR);
+                        output.transition(cmd, vk::ImageLayout::VIDEO_DECODE_DST_KHR);
+                    }
+                    Pictures::Coincide { slots } => {
+                        for (slot, _) in &refs {
+                            slots[*slot].transition(cmd, vk::ImageLayout::VIDEO_DECODE_DPB_KHR);
+                        }
+                        // A coincident output is the reconstructed picture, so
+                        // it takes the DPB layout; the spare is only a decode
+                        // destination and takes the output layout.
+                        output.transition(
+                            cmd,
+                            match setup_slot {
+                                Some(_) => vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
+                                None => vk::ImageLayout::VIDEO_DECODE_DST_KHR,
+                            },
+                        );
+                    }
+                }
                 // SAFETY: recording valid video commands on a decode-family queue;
                 // every referenced struct outlives the call.
                 unsafe {
@@ -400,7 +464,7 @@ impl H264Decoder {
         } else {
             header.frame_num
         };
-        Ok(Some(&stream.outputs[output_index]))
+        Ok(Some(stream.pictures.output(output_index)))
     }
 
     /// Wait for all submitted decodes to finish (before teardown or resize).
@@ -442,24 +506,40 @@ impl H264Decoder {
             let session = Session::new(&self.gpu, &info)?;
             let pps = pps.unwrap_or_default();
             let params = create_params(&self.gpu, session.handle, &sps, &pps)?;
-            let dpb = Image::nv12(&self.gpu, Role::DecodeDpb, cw, ch, dpb_slots, Some(profile))?;
-            let outputs = (0..OUTPUT_RING)
-                .map(|_| Image::nv12(&self.gpu, Role::DecodeOutput, cw, ch, 1, Some(profile)))
-                .collect::<Result<Vec<_>>>()?;
+            let nv12 = |role, layers| Image::nv12(&self.gpu, role, cw, ch, layers, Some(profile));
+            let pictures = if self.coincide {
+                let slots = (0..dpb_slots + 1)
+                    .map(|_| nv12(Role::DecodeDpbAndOutput, 1))
+                    .collect::<Result<Vec<_>>>()?;
+                Pictures::Coincide { slots }
+            } else {
+                let dpb = nv12(Role::DecodeDpb, dpb_slots)?;
+                let outputs = (0..OUTPUT_RING)
+                    .map(|_| nv12(Role::DecodeOutput, 1))
+                    .collect::<Result<Vec<_>>>()?;
+                Pictures::Distinct {
+                    dpb,
+                    outputs,
+                    next_output: 0,
+                }
+            };
             Ok::<_, Error>(Stream {
                 sps,
                 pps,
                 session,
                 params,
-                dpb,
+                pictures,
                 slots: vec![None; dpb_slots as usize],
-                outputs,
-                next_output: 0,
                 coded,
                 started: false,
             })
         })?;
-        tracing::info!(coded = ?coded, dpb_slots, "vulkan decoder stream opened");
+        tracing::info!(
+            coded = ?coded,
+            dpb_slots,
+            coincide = self.coincide,
+            "vulkan decoder stream opened"
+        );
         self.stream = Some(stream);
         self.poc = PocState::default();
         Ok(())
