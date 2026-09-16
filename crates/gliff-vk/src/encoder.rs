@@ -389,10 +389,10 @@ impl RateControl {
 
     /// `constantQp` for the next slice; the spec wants 0 unless the mode is
     /// `DISABLED`.
-    fn slice_qp(&self) -> i32 {
+    fn slice_qp(&self, idr: bool) -> i32 {
         match self {
             Self::Cbr => 0,
-            Self::ConstantQp(c) => c.qp(),
+            Self::ConstantQp(c) => c.qp_for(idr),
         }
     }
 
@@ -410,7 +410,8 @@ impl RateControl {
     }
 }
 
-/// The QP of the first frame: ANV's preferred constant QP.
+/// The QP of the first frame, and the lowest an IDR takes: ANV's preferred
+/// constant QP.
 const START_QP: i32 = 26;
 /// Below this QP a desktop gains nothing visible, and the first movement
 /// after a static spell would burst for many frames.
@@ -444,7 +445,7 @@ struct QpController {
 
 impl QpController {
     fn new(settings: &EncoderSettings, min_qp: i32, max_qp: i32) -> Self {
-        let (min_qp, max_qp) = if max_qp > min_qp {
+        let (min_qp, max_qp) = if max_qp > 0 && max_qp >= min_qp {
             (min_qp, max_qp)
         } else {
             H264_QP_RANGE
@@ -471,6 +472,17 @@ impl QpController {
 
     fn qp(&self) -> i32 {
         self.qp
+    }
+
+    /// The QP for the next frame. An IDR never takes a QP below the start
+    /// value: a quiet spell drives the QP down, and a keyframe requested then
+    /// (reconnect, resize, loss) would otherwise fill the link for seconds.
+    fn qp_for(&self, idr: bool) -> i32 {
+        if idr {
+            self.qp.max(START_QP).min(self.max_qp)
+        } else {
+            self.qp
+        }
     }
 
     /// Account for a finished frame of `bytes` and choose the next QP. An
@@ -859,7 +871,7 @@ impl H264Encoder {
                 pWeightTable: std::ptr::null(),
             };
             let slices = [vk::VideoEncodeH264NaluSliceInfoKHR::default()
-                .constant_qp(self.rate.slice_qp())
+                .constant_qp(self.rate.slice_qp(idr))
                 .std_slice_header(&std_slice)];
             let mut h264_pic = vk::VideoEncodeH264PictureInfoKHR::default()
                 .nalu_slice_entries(&slices)
@@ -1197,6 +1209,25 @@ mod tests {
     fn a_driver_without_a_qp_range_gets_the_h264_range_above_the_floor() {
         let c = QpController::new(&EncoderSettings::new(64, 64, BITRATE), 0, 0);
         assert_eq!((c.min_qp, c.max_qp), (QP_FLOOR, 51));
+        let single = QpController::new(&EncoderSettings::new(64, 64, BITRATE), 30, 30);
+        assert_eq!((single.min_qp, single.max_qp), (30, 30));
+        assert_eq!(single.qp_for(true), 30);
+    }
+
+    #[test]
+    fn an_idr_never_takes_a_qp_below_the_start_value() {
+        let mut c = controller();
+        let budget = budget(&c);
+        for _ in 0..30 {
+            c.observe(budget / 4, false);
+        }
+        assert_eq!(c.qp(), QP_FLOOR);
+        assert_eq!(c.qp_for(false), QP_FLOOR);
+        assert_eq!(c.qp_for(true), START_QP);
+        for _ in 0..30 {
+            c.observe(budget * 10, false);
+        }
+        assert_eq!(c.qp_for(true), c.qp(), "a high qp is kept for the IDR");
     }
 
     #[test]
