@@ -176,8 +176,19 @@ Not yet built, roughly in priority order:
 
 1. **Test on Intel ANV and NVIDIA.** Everything runs on one AMD RADV
    machine; a second driver decides whether the per-driver freedom is real.
-2. **Native single-stream 4:4:4, and AV1/HEVC.** Vulkan Video exposes HEVC
-   and AV1 profiles; a 4:4:4 profile on some driver would retire the split.
+2. **Optional AV1 for outputs above 4096 wide.** The VCN H.264 encoder
+   stops at 4096x4096 (the kernel amdgpu codec table, reported through RADV
+   as `maxCodedExtent`), so a 5K output streams at 4096x2304 today: the
+   server scales the stream to the encoder maximum and the client scales it
+   back up. AV1 and HEVC on the same engine reach 8192x4352. AV1 is the
+   preferred second codec: it is royalty-free, and hardware supports it for
+   encode on AMD VCN 4.0 (RDNA3, Ryzen 7040) and later, Intel Arc and
+   Meteor Lake and later, and NVIDIA RTX 40 and later; for decode on AMD
+   VCN 3.0 and later, Intel 11th generation and later, and NVIDIA RTX 30
+   and later. H.264 stays as the codec every GPU has. The server picks AV1
+   only when both ends list it in `ClientCaps.codecs`, and the size clamp
+   stays as the guard for whichever codec is chosen. A native 4:4:4 profile
+   on some driver would also retire the split.
 3. **Verified ssh path** from a cold machine, including the `WAYLAND_DISPLAY` /
    `XDG_RUNTIME_DIR` environment setup, and a systemd user unit if wanted.
 4. **Polish**: multi-output selection UI, image clipboard, and `tc netem` tuning

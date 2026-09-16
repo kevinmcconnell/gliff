@@ -45,6 +45,11 @@ pub struct Encoder {
 }
 
 impl Encoder {
+    /// The largest size the device encodes, as (width, height).
+    pub fn max_size(gpu: &Gpu) -> Result<(u32, u32)> {
+        H264Encoder::max_coded_extent(gpu)
+    }
+
     pub fn new(gpu: &Arc<Gpu>, settings: EncoderSettings, dual: bool) -> Result<Self> {
         let main = H264Encoder::new(gpu, settings.clone())?;
         let aux = if dual {

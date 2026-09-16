@@ -92,7 +92,16 @@ where
             }],
         })
         .await?;
-    let stream = (output.width, output.height);
+    let gpu = Gpu::open(Some(&cfg.render_node)).context("open Vulkan device")?;
+    let encoder_max = Encoder::max_size(&gpu).context("query encoder limits")?;
+    let stream = EncoderSettings::fit_extent(output.width, output.height, encoder_max);
+    if stream != (output.width, output.height) {
+        tracing::info!(
+            width = stream.0,
+            height = stream.1,
+            "scaling the stream to the encoder maximum"
+        );
+    }
     send_stream_config(&mut writer, codec, chroma, &output, stream).await?;
 
     let (cap_tx, mut cap_rx) = mpsc::unbounded_channel();
@@ -124,7 +133,6 @@ where
     .map_err(|e| tracing::warn!(error = %e, "clipboard bridge unavailable"))
     .ok();
 
-    let gpu = Gpu::open(Some(&cfg.render_node)).context("open Vulkan device")?;
     let bitrate_ctl = match cfg.bitrate {
         Some(fixed) => BitrateController::new(fixed, true),
         None => BitrateController::new(
@@ -145,6 +153,7 @@ where
         instance,
         output,
         stream,
+        encoder_max,
         caps,
         bitrate_ctl,
         codec,
@@ -284,8 +293,11 @@ struct Session<W> {
     instance: hypr_ipc::Instance,
     output: SessionOutput,
     /// Encoded size. Equals the output size, except for a mirrored screen
-    /// larger than the client's window, which is scaled down to fit.
+    /// larger than the client's window, or any output larger than the
+    /// encoder's maximum, which are scaled down to fit.
     stream: (u32, u32),
+    /// The largest size the encoder accepts.
+    encoder_max: (u32, u32),
     caps: ClientCaps,
     bitrate_ctl: BitrateController,
     codec: Codec,
@@ -422,9 +434,17 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         // so the logical size is whole; wait for it and use what it chose.
         let applied = self.wait_for_mode(width, height, scale).await;
         if !same_size {
+            let stream = EncoderSettings::fit_extent(width, height, self.encoder_max);
+            if stream != (width, height) {
+                tracing::info!(
+                    width = stream.0,
+                    height = stream.1,
+                    "scaling the stream to the encoder maximum"
+                );
+            }
             self.bitrate_ctl
-                .retarget(EncoderSettings::default_bitrate(width, height, 60));
-            let settings = encoder_settings(width, height, self.bitrate_ctl.current());
+                .retarget(EncoderSettings::default_bitrate(stream.0, stream.1, 60));
+            let settings = encoder_settings(stream.0, stream.1, self.bitrate_ctl.current());
             match Encoder::new(
                 &self.gpu,
                 settings.clone(),
@@ -435,7 +455,7 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                     self.settings = settings;
                     self.output.width = width;
                     self.output.height = height;
-                    self.stream = (width, height);
+                    self.stream = stream;
                     self.pending = None;
                     self.want_keyframe = true;
                 }
@@ -470,9 +490,10 @@ impl<W: AsyncWrite + Unpin> Session<W> {
     async fn fit_mirror(&mut self, win_w: u32, win_h: u32) -> Result<()> {
         let (ow, oh) = (self.output.width as f64, self.output.height as f64);
         let fit = (win_w as f64 / ow).min(win_h as f64 / oh).min(1.0);
-        let stream = (
+        let stream = EncoderSettings::fit_extent(
             ((ow * fit).round() as u32).max(2) & !1,
             ((oh * fit).round() as u32).max(2) & !1,
+            self.encoder_max,
         );
         if stream == self.stream {
             return Ok(());

@@ -26,6 +26,16 @@ usage is invalid.
 - **Needs testing on Intel/NVIDIA:** if STORAGE is refused, fall back to
   writing R8/R8G8 images and `vkCmdCopyImage` into the NV12 planes.
 
+### H.264 encode maximum is 4096x4096
+`maxCodedExtent` for H.264 encode is 4096x4096 on VCN 4.0 (RX 7600). The
+value is the kernel's static codec table for the VCN generation
+(`drivers/gpu/drm/amd/amdgpu/soc21.c`), read by Mesa through
+`AMDGPU_INFO_VIDEO_CAPS_ENCODE` and passed on by RADV. No AMD generation
+encodes H.264 above 4096 in either dimension; HEVC and AV1 on the same
+engine reach 8192x4352. The server and `gliff-probe pipeline` scale a
+larger output down to fit (5120x2880 becomes 4096x2304), and
+`gliff-probe vulkan` prints the limit.
+
 ### Decode DPB and output are distinct
 `VK_VIDEO_DECODE_CAPABILITY_DPB_AND_OUTPUT_DISTINCT_BIT_KHR` only. The decoder
 keeps a DPB array image (`VIDEO_DECODE_DPB`) and a separate ring of output

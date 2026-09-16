@@ -34,9 +34,10 @@ why.
 Design and the full picture are in `docs/architecture.md`; driver-specific
 behaviour and test gaps are in `docs/hardware-quirks.md`.
 
-Not done yet: image/binary clipboard (text works both ways); native
-single-stream 4:4:4 and AV1/HEVC; a verified ssh-from-cold-machine path; Intel
-server support; and testing on NVIDIA Vulkan drivers.
+Not done yet: image/binary clipboard (text works both ways); AV1 for outputs
+above 4096 wide (H.264 is scaled to fit today) and native single-stream
+4:4:4; a verified ssh-from-cold-machine path; Intel server support; and
+testing on NVIDIA Vulkan drivers.
 
 ## Build
 
