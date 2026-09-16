@@ -132,15 +132,10 @@ where
             false,
         ),
     };
-    let settings = encoder_settings(stream.0, stream.1, bitrate_ctl.current());
+    let settings = EncoderSettings::new(stream.0, stream.1, bitrate_ctl.current());
     let encoder = Encoder::new(&gpu, settings.clone(), chroma == ChromaMode::Dual420)
         .context("create encoder")?;
-    tracing::info!(
-        gpu = %gpu.name,
-        driver = %gpu.driver,
-        rate_control = %encoder.rate_control(),
-        "encoder ready"
-    );
+    tracing::info!(rate_control = %encoder.rate_control(), "encoder ready");
 
     let (mut msg_rx, mut clip_in_rx) = spawn_reader(reader);
 
@@ -430,7 +425,7 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         if !same_size {
             self.bitrate_ctl
                 .retarget(EncoderSettings::default_bitrate(width, height, 60));
-            let settings = encoder_settings(width, height, self.bitrate_ctl.current());
+            let settings = EncoderSettings::new(width, height, self.bitrate_ctl.current());
             match Encoder::new(
                 &self.gpu,
                 settings.clone(),
@@ -485,7 +480,7 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         }
         self.bitrate_ctl
             .retarget(EncoderSettings::default_bitrate(stream.0, stream.1, 60));
-        let settings = encoder_settings(stream.0, stream.1, self.bitrate_ctl.current());
+        let settings = EncoderSettings::new(stream.0, stream.1, self.bitrate_ctl.current());
         match Encoder::new(
             &self.gpu,
             settings.clone(),
@@ -738,16 +733,6 @@ async fn send_stream_config<W: AsyncWrite + Unpin>(
         aux_extradata: None,
     };
     Ok(writer.write_msg(&msg).await?)
-}
-
-fn encoder_settings(width: u32, height: u32, bitrate: u32) -> EncoderSettings {
-    EncoderSettings {
-        width,
-        height,
-        bitrate,
-        framerate: 60,
-        force_constant_qp: false,
-    }
 }
 
 /// Pick the named output, or create a headless one sized to the client.

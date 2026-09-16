@@ -684,13 +684,8 @@ fn roundtrip(node: &std::path::Path, opts: RoundtripOptions) -> Result<()> {
     let gpu = Gpu::open(Some(node))?;
     println!("  {} ({}) dual={dual}", gpu.name, gpu.driver);
     let bitrate = bitrate.unwrap_or(4 * EncoderSettings::default_bitrate(width, height, 60));
-    let settings = EncoderSettings {
-        width,
-        height,
-        bitrate,
-        framerate: 60,
-        force_constant_qp: constant_qp,
-    };
+    let mut settings = EncoderSettings::new(width, height, bitrate);
+    settings.force_constant_qp = constant_qp;
     let mut encoder = Encoder::new(&gpu, settings, dual).context("vulkan encoder")?;
     println!("  rate control: {}", encoder.rate_control());
     let mut decoder = Decoder::new(&gpu, dual, width, height).context("vulkan decoder")?;
@@ -844,13 +839,8 @@ fn pipeline(
     };
 
     let gpu = Gpu::open(Some(node))?;
-    let settings = EncoderSettings {
-        width: w,
-        height: h,
-        bitrate: EncoderSettings::default_bitrate(w, h, 60),
-        framerate: 60,
-        force_constant_qp: constant_qp,
-    };
+    let mut settings = EncoderSettings::new(w, h, EncoderSettings::default_bitrate(w, h, 60));
+    settings.force_constant_qp = constant_qp;
     let mut encoder = Encoder::new(&gpu, settings, true).context("encoder")?;
     println!("  rate control: {}", encoder.rate_control());
     let mut decoder = Decoder::new(&gpu, true, w, h).context("decoder")?;

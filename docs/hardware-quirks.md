@@ -153,9 +153,11 @@ and 8x8 transform advertised, scaling matrices and weighted prediction not.
 
 The encoder picks its mode from the capabilities: CBR when offered, else
 `DISABLED` with a per-frame QP chosen by `QpController` from the bytes each
-frame produced (a 500 ms bucket, +/-1 QP per frame, +2 when far over budget,
-floor at QP 16 so a static desktop does not race to the driver minimum). The
-server's bitrate adaptation is unchanged; it retargets the controller.
+frame produced: a frame over budget raises the QP by up to 4 steps in
+proportion to the overshoot, frames under budget lower it by 1 once a 500 ms
+bucket is clear, an IDR is charged one frame budget at most, and the floor is
+QP 16 so a static desktop does not race to the driver minimum. The server's
+bitrate adaptation is unchanged; it retargets the controller.
 `gliff-probe roundtrip --constant-qp` forces this path on a driver that has
 CBR too, and on RADV it decodes 60/60 frames at the same PSNR as CBR.
 `gliff-probe vulkan` prints which mode a machine will take.
