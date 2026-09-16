@@ -24,7 +24,9 @@ limited with `VkImageViewUsageCreateInfo`: the plane formats have no video
 usage and NV12 has no storage usage, so a view that inherits the image's full
 usage is invalid.
 - **Needs testing on Intel/NVIDIA:** if STORAGE is refused, fall back to
-  writing R8/R8G8 images and `vkCmdCopyImage` into the NV12 planes.
+  writing R8/R8G8 images and `vkCmdCopyImage` into the NV12 planes. ANV's
+  format query echoes whatever usage is asked for, so only `vkCreateImage`
+  on the machine tells; `EXTENDED_USAGE` makes the request legal per spec.
 
 ### Decode DPB and output are distinct
 `VK_VIDEO_DECODE_CAPABILITY_DPB_AND_OUTPUT_DISTINCT_BIT_KHR` only. The decoder
@@ -35,7 +37,10 @@ preferred whenever it is offered.
 ### Encode DPB must be one array image
 The encode capabilities report no `SEPARATE_REFERENCE_IMAGES`, so the two
 reference slots are layers of one image. Decode allows separate images but the
-same array layout is used for both.
+same array layout is used for both. ANV reports `SEPARATE_REFERENCE_IMAGES`
+and also addresses layers, but gives array video images a special interleaved
+layout; if the array DPB fails there, one image per slot (as the decoder's
+coincide path does) is the fallback.
 
 ### Rate control must ride on every begin
 Once CBR is set with `vkCmdControlVideoCodingKHR`, every later
@@ -123,8 +128,45 @@ then passes on both the H.264 decode and encode queues. Nothing in the kernel
 withholds this: the `vcs0`, `vcs1` and `vecs0` engines are present and GuC and
 HuC are authenticated without the variable.
 
-`ANV_VIDEO_DECODE=1` and `ANV_VIDEO_ENCODE=1`, which most search results still
-name, do nothing on Mesa 26.2.
+Every gliff binary now sets the variable itself at the top of `main`
+(`gliff_vk::prepare_driver_env`), adding the two flags to whatever `ANV_DEBUG`
+already holds, so users never see it. The gate is still in Mesa `main` (issue
+13059 asks for it to go). `ANV_VIDEO_DECODE=1` and `ANV_VIDEO_ENCODE=1`, which
+most search results still name, do nothing on Mesa 26.2 (they were the names
+up to Mesa 25.0).
+
+### Encode exists only on Gen12 and Gen12.5
+`anv_physical_device.c` enables `VK_KHR_video_encode_queue` only for
+`verx10 <= 125`: Tiger Lake through Raptor Lake, Arc Alchemist and Meteor
+Lake (Gen12.5 came back in Mesa 26.2). Lunar Lake, Battlemage and newer have
+decode only, so they can run the client but not the server. The i915 and Xe
+kernel drivers make no difference to ANV's video code.
+
+### Encode has no bitrate control: constant QP only (from Mesa source, untested)
+`VkVideoEncodeCapabilitiesKHR::rateControlModes` is `DEFAULT | DISABLED`; there
+is no CBR or VBR, and `vkCmdControlVideoCodingKHR` asserts on any other mode.
+In `DISABLED` the driver takes the QP from
+`VkVideoEncodeH264NaluSliceInfoKHR::constantQp` (`minQp` 10, `maxQp` 51); in
+`DEFAULT` it uses `pic_init_qp` from the PPS and ignores bitrates. One quality
+level, one slice per picture, level 5.1, `maxCodedExtent` 4096x4096, CABAC
+and 8x8 transform advertised, scaling matrices and weighted prediction not.
+
+The encoder picks its mode from the capabilities: CBR when offered, else
+`DISABLED` with a per-frame QP chosen by `QpController` from the bytes each
+frame produced (a 500 ms bucket, +/-1 QP per frame, +2 when far over budget,
+floor at QP 16 so a static desktop does not race to the driver minimum). The
+server's bitrate adaptation is unchanged; it retargets the controller.
+`gliff-probe roundtrip --constant-qp` forces this path on a driver that has
+CBR too, and on RADV it decodes 60/60 frames at the same PSNR as CBR.
+`gliff-probe vulkan` prints which mode a machine will take.
+- **Needs testing on Intel:** the whole server path. Nobody has run
+  `gliff-probe roundtrip` or `gliff-server` on ANV yet.
+
+### Bitstream buffer size must be a multiple of 4096
+ANV reports `minBitstreamBufferSizeAlignment` 4096 and offset alignment 32.
+The encoder now rounds its bitstream buffer (and so `dstBufferRange`) up to
+the reported alignment; the old `width * height * 2` was not a multiple at
+1080p. RADV never minded.
 
 ### Decode DPB and output coincide
 `VK_VIDEO_DECODE_CAPABILITY_DPB_AND_OUTPUT_COINCIDE_BIT_KHR` only, so the

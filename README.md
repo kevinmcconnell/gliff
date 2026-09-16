@@ -26,17 +26,19 @@ Working and validated on AMD (Ryzen Granite Ridge, Mesa RADV):
   `--release-hotkey`), and auto-reconnects. Validated over localhost against a
   nested Hyprland: connect, stream, resize, ack pacing, both chroma modes.
 
-On Intel (Mesa ANV) the client has been tested and works, but we have not
-started server support yet. The client needs
-`ANV_DEBUG=video-decode,video-encode` set; `docs/hardware-quirks.md` explains
-why.
+On Intel (Mesa ANV) the client has been tested and works. The server builds
+on the same driver but is untested there: ANV's encoder has no bitrate
+control, so gliff drives the QP itself on Intel (see `docs/hardware-quirks.md`),
+and only Gen12 / Gen12.5 GPUs have Vulkan encode at all. The binaries set the
+`ANV_DEBUG` flags ANV needs to expose Vulkan Video, so nothing is required of
+the user.
 
 Design and the full picture are in `docs/architecture.md`; driver-specific
 behaviour and test gaps are in `docs/hardware-quirks.md`.
 
 Not done yet: image/binary clipboard (text works both ways); native
-single-stream 4:4:4 and AV1/HEVC; a verified ssh-from-cold-machine path; Intel
-server support; and testing on NVIDIA Vulkan drivers.
+single-stream 4:4:4 and AV1/HEVC; a verified ssh-from-cold-machine path; a
+test of the server on Intel; and testing on NVIDIA Vulkan drivers.
 
 ## Build
 
