@@ -13,7 +13,7 @@ use wayland_client::protocol::wl_registry::WlRegistry;
 use wayland_client::{Connection, Dispatch, QueueHandle};
 
 use gliff_proto::color::{bgra_to_yuv444, psnr, yuv444_to_bgra};
-use gliff_vk::{Decoder, DmabufPlane, Encoder, EncoderSettings, Gpu};
+use gliff_vk::{Decoder, DmabufPlane, Encoder, EncoderSettings, Gpu, RateControlMode};
 use hypr_capture::{CaptureConfig, CaptureEvent, Capturer};
 use hypr_input::{keys, Input, InputConfig, InputEvent};
 use hypr_wl::Target;
@@ -615,7 +615,7 @@ fn vulkan_info(node: &std::path::Path) -> Result<()> {
     println!("  {} ({})", gpu.name, gpu.driver);
     status(gpu.can_encode(), "Vulkan H.264 encode queue");
     if gpu.can_encode() {
-        match gliff_vk::encode_rate_control(&gpu, false) {
+        match gliff_vk::encode_rate_control(&gpu, None) {
             Ok(mode) => status(true, &format!("encode rate control: {mode}")),
             Err(e) => status(false, &format!("encode rate control: {e}")),
         }
@@ -685,7 +685,7 @@ fn roundtrip(node: &std::path::Path, opts: RoundtripOptions) -> Result<()> {
     println!("  {} ({}) dual={dual}", gpu.name, gpu.driver);
     let bitrate = bitrate.unwrap_or(4 * EncoderSettings::default_bitrate(width, height, 60));
     let mut settings = EncoderSettings::new(width, height, bitrate);
-    settings.force_constant_qp = constant_qp;
+    settings.rate_control = constant_qp.then_some(RateControlMode::ConstantQp);
     let mut encoder = Encoder::new(&gpu, settings, dual).context("vulkan encoder")?;
     println!("  rate control: {}", encoder.rate_control());
     let mut decoder = Decoder::new(&gpu, dual, width, height).context("vulkan decoder")?;
@@ -840,7 +840,7 @@ fn pipeline(
 
     let gpu = Gpu::open(Some(node))?;
     let mut settings = EncoderSettings::new(w, h, EncoderSettings::default_bitrate(w, h, 60));
-    settings.force_constant_qp = constant_qp;
+    settings.rate_control = constant_qp.then_some(RateControlMode::ConstantQp);
     let mut encoder = Encoder::new(&gpu, settings, true).context("encoder")?;
     println!("  rate control: {}", encoder.rate_control());
     let mut decoder = Decoder::new(&gpu, true, w, h).context("decoder")?;

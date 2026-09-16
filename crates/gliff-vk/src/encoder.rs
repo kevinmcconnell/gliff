@@ -26,9 +26,9 @@ pub struct EncoderSettings {
     /// Target bitrate in bits per second.
     pub bitrate: u32,
     pub framerate: u32,
-    /// Take the constant-QP path even when the driver offers CBR, to test
-    /// that path on a driver that has both.
-    pub force_constant_qp: bool,
+    /// The rate control to use; `None` takes the best the driver offers.
+    /// A requested mode the driver lacks is an error.
+    pub rate_control: Option<RateControlMode>,
 }
 
 /// How the encoder holds its target bitrate.
@@ -51,11 +51,15 @@ impl fmt::Display for RateControlMode {
 }
 
 /// Query the encode capabilities and pick the rate control the driver can
-/// run. Fails when it has neither CBR nor constant QP.
-pub fn encode_rate_control(gpu: &Gpu, force_constant_qp: bool) -> Result<RateControlMode> {
+/// run: the `requested` one, or with `None` CBR when offered, else constant
+/// QP. Fails when the driver has no fitting mode.
+pub fn encode_rate_control(
+    gpu: &Gpu,
+    requested: Option<RateControlMode>,
+) -> Result<RateControlMode> {
     with_h264_profile(true, |profile| {
         let caps = EncodeCaps::query(gpu, profile)?;
-        caps.pick_rate_control(force_constant_qp)
+        caps.pick_rate_control(requested)
     })
 }
 
@@ -99,20 +103,27 @@ impl EncodeCaps {
         })
     }
 
-    fn pick_rate_control(&self, force_constant_qp: bool) -> Result<RateControlMode> {
+    fn pick_rate_control(&self, requested: Option<RateControlMode>) -> Result<RateControlMode> {
         let modes = self.rate_control_modes;
-        if modes.contains(vk::VideoEncodeRateControlModeFlagsKHR::CBR) && !force_constant_qp {
-            Ok(RateControlMode::Cbr)
-        } else if modes.contains(vk::VideoEncodeRateControlModeFlagsKHR::DISABLED) {
-            Ok(RateControlMode::ConstantQp)
-        } else if force_constant_qp {
-            Err(Error::Unsupported(format!(
-                "constant QP was requested but the encoder has no DISABLED rate control ({modes:?})"
-            )))
-        } else {
-            Err(Error::Unsupported(format!(
-                "encoder offers neither CBR nor constant-QP rate control ({modes:?})"
-            )))
+        let offers = |mode: RateControlMode| {
+            modes.contains(match mode {
+                RateControlMode::Cbr => vk::VideoEncodeRateControlModeFlagsKHR::CBR,
+                RateControlMode::ConstantQp => vk::VideoEncodeRateControlModeFlagsKHR::DISABLED,
+            })
+        };
+        match requested {
+            Some(mode) if offers(mode) => Ok(mode),
+            Some(mode) => Err(Error::Unsupported(format!(
+                "{mode} rate control was requested but the encoder offers {modes:?}"
+            ))),
+            None => [RateControlMode::Cbr, RateControlMode::ConstantQp]
+                .into_iter()
+                .find(|m| offers(*m))
+                .ok_or_else(|| {
+                    Error::Unsupported(format!(
+                        "encoder offers neither CBR nor constant-QP rate control ({modes:?})"
+                    ))
+                }),
         }
     }
 }
@@ -125,7 +136,7 @@ impl EncoderSettings {
             height,
             bitrate,
             framerate: 60,
-            force_constant_qp: false,
+            rate_control: None,
         }
     }
 
@@ -408,14 +419,17 @@ const QP_FLOOR: i32 = 16;
 const H264_QP_RANGE: (i32, i32) = (0, 51);
 /// The most one frame may raise the QP.
 const MAX_UP_STEP: i32 = 4;
+/// A frame below this share of the budget is a skip frame with nothing to
+/// say about what a lower QP would cost.
+const SKIP_RATIO: f64 = 0.15;
 /// How much of the target the running budget may run ahead or behind, like
 /// the CBR virtual buffer.
 const BUCKET_MS: f64 = 500.0;
 
 /// Constant-QP bitrate control: one QP per frame, moved from the bytes each
 /// frame produced. A frame over budget raises the QP by an amount that
-/// follows the overshoot; frames under budget lower it by one, once the
-/// running budget is no longer in debt.
+/// follows the overshoot; a real frame under budget lowers it by one, once
+/// the running budget is no longer in debt. Skip-sized frames hold it.
 struct QpController {
     qp: i32,
     min_qp: i32,
@@ -480,7 +494,7 @@ impl QpController {
             ((6.0 * ratio.log2()).round() as i32).clamp(1, MAX_UP_STEP)
         } else if ratio > 1.0 && debt > 0.25 {
             1
-        } else if ratio < 0.8 && debt < 0.0 {
+        } else if (SKIP_RATIO..0.8).contains(&ratio) && debt < 0.0 {
             -1
         } else {
             0
@@ -509,7 +523,7 @@ impl H264Encoder {
                     coded.width, coded.height, caps.max_coded_extent
                 )));
             }
-            let rate = match caps.pick_rate_control(settings.force_constant_qp)? {
+            let rate = match caps.pick_rate_control(settings.rate_control)? {
                 RateControlMode::Cbr => RateControl::Cbr,
                 RateControlMode::ConstantQp => {
                     RateControl::ConstantQp(QpController::new(&settings, caps.min_qp, caps.max_qp))
@@ -614,7 +628,7 @@ impl H264Encoder {
         self.rate.mode()
     }
 
-    /// Change the CBR target from the next frame on, without resetting the
+    /// Change the target bitrate from the next frame on, without resetting the
     /// session (no keyframe is forced).
     pub fn set_bitrate(&mut self, bitrate: u32) {
         if bitrate != self.settings.bitrate {
@@ -1218,9 +1232,19 @@ mod tests {
         }
         assert_eq!(c.qp(), 51);
         for _ in 0..200 {
-            c.observe(0, false);
+            c.observe(budget / 4, false);
         }
         assert_eq!(c.qp(), QP_FLOOR);
+    }
+
+    #[test]
+    fn skip_frames_hold_the_qp() {
+        let mut c = controller();
+        let budget = budget(&c);
+        for _ in 0..100 {
+            c.observe(budget / 20, false);
+        }
+        assert_eq!(c.qp(), START_QP);
     }
 
     #[test]

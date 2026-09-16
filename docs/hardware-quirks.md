@@ -43,10 +43,11 @@ layout; if the array DPB fails there, one image per slot (as the decoder's
 coincide path does) is the fallback.
 
 ### Rate control must ride on every begin
-Once CBR is set with `vkCmdControlVideoCodingKHR`, every later
+Once a rate control mode is set with `vkCmdControlVideoCodingKHR`, every later
 `vkCmdBeginVideoCodingKHR` must carry the same `VkVideoEncodeRateControlInfoKHR`
-(+ H.264 layer info) in its pNext, or validation flags VUID 08253 and the
-result is undefined. The encoder rebuilds the chain per frame.
+(+ H.264 layer info for CBR; none for `DISABLED`) in its pNext, or validation
+flags VUID 08253 and the result is undefined. The encoder rebuilds the chain
+per frame in both modes.
 
 ### Encoded parameter sets and slices carry no start codes
 `vkGetEncodedVideoSessionParametersKHR` and the slice output are raw NAL units;
@@ -167,8 +168,9 @@ CBR too, and on RADV it decodes 60/60 frames at the same PSNR as CBR.
 ### Bitstream buffer size must be a multiple of 4096
 ANV reports `minBitstreamBufferSizeAlignment` 4096 and offset alignment 32.
 The encoder now rounds its bitstream buffer (and so `dstBufferRange`) up to
-the reported alignment; the old `width * height * 2` was not a multiple at
-1080p. RADV never minded.
+the reported alignment; the old `coded_width * coded_height * 2` was not a
+multiple for most sizes (1888x1072, the Intel tester's stream, gives 4047872).
+RADV never minded.
 
 ### Decode DPB and output coincide
 `VK_VIDEO_DECODE_CAPABILITY_DPB_AND_OUTPUT_COINCIDE_BIT_KHR` only, so the

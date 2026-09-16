@@ -94,8 +94,9 @@ round-trip.
   code runs on any driver with Vulkan Video.
 
 - **Low-delay H.264.** The encoder emits IDR then P frames with one reference
-  and no reordering (POC type 0), High profile, CABAC, CBR at the configured
-  bitrate, with the SPS and PPS prepended to every IDR so any keyframe is a
+  and no reordering (POC type 0), High profile, CABAC, held at the configured
+  bitrate by the driver's CBR, or by a per-frame QP where the driver has no
+  CBR (Intel ANV), with the SPS and PPS prepended to every IDR so any keyframe is a
   random-access point. The decoder parses only what the hardware does not
   (SPS, PPS, slice header up to the reference marking) and manages a two-slot
   DPB with sliding-window marking.
@@ -162,7 +163,7 @@ Dual420, from `gliff-probe roundtrip`:
 
 No pixel work happens on the CPU at any resolution; the remaining cost is the
 encode hardware itself, which serialises the two streams, so a 1080p Dual420
-frame costs about two encodes' worth of time. The server adapts the CBR
+frame costs about two encodes' worth of time. The server adapts the bitrate
 target to the link (see the session's `BitrateController`), so a slow link
 lowers quality rather than frame rate.
 

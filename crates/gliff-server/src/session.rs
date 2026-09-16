@@ -865,7 +865,7 @@ struct RttEstimator {
     smoothed_ms: f64,
 }
 
-/// Adapts the CBR target to the path. The ack RTT is the signal: its
+/// Adapts the target bitrate to the path. The ack RTT is the signal: its
 /// minimum is the base delay, growth over the base is queueing; a queue or
 /// a starved send window cuts the rate, a quiet path grows it back slowly.
 struct BitrateController {
