@@ -63,6 +63,10 @@ enum Cmd {
         /// restore it, to exercise the live rate-control update.
         #[arg(long)]
         adapt: bool,
+        /// Use the constant-QP path (the one drivers without CBR, such as
+        /// Intel ANV, take) even if this driver offers CBR.
+        #[arg(long)]
+        constant_qp: bool,
     },
     /// Capture one frame of an output and write it as PNG
     Capture {
@@ -89,6 +93,9 @@ enum Cmd {
     Pipeline {
         #[arg(long)]
         output: Option<String>,
+        /// Use the constant-QP path even if this driver offers CBR.
+        #[arg(long)]
+        constant_qp: bool,
     },
     /// Connect to a running `gliff-server --listen` and decode a few frames
     ServeTest {
@@ -120,6 +127,7 @@ fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_writer(std::io::stderr)
         .init();
+    gliff_vk::prepare_driver_env();
     let cli = Cli::parse();
     let target = Target {
         display: cli.display.clone(),
@@ -138,7 +146,19 @@ fn main() -> Result<()> {
             single,
             bitrate,
             adapt,
-        } => roundtrip(&node, width, height, frames, !single, bitrate, adapt)?,
+            constant_qp,
+        } => roundtrip(
+            &node,
+            RoundtripOptions {
+                width,
+                height,
+                frames,
+                dual: !single,
+                bitrate,
+                adapt,
+                constant_qp,
+            },
+        )?,
         Cmd::Capture {
             output,
             png,
@@ -149,7 +169,10 @@ fn main() -> Result<()> {
             text,
             click,
         } => input(&target, output, &text, click)?,
-        Cmd::Pipeline { output } => pipeline(&target, &node, output)?,
+        Cmd::Pipeline {
+            output,
+            constant_qp,
+        } => pipeline(&target, &node, output, constant_qp)?,
         Cmd::ServeTest { connect, frames } => serve_test(&node, &connect, frames)?,
         Cmd::Clipboard { set, secs } => clipboard(&target, set, secs)?,
         Cmd::Bench { iters } => bench(iters)?,
@@ -158,7 +181,7 @@ fn main() -> Result<()> {
             outputs(&target)?;
             permissions(&target)?;
             vulkan_info(&node)?;
-            roundtrip(&node, 640, 360, 10, true, None, false)?;
+            roundtrip(&node, RoundtripOptions::quick())?;
         }
     }
     Ok(())
@@ -591,6 +614,12 @@ fn vulkan_info(node: &std::path::Path) -> Result<()> {
     let gpu = Gpu::open(Some(node))?;
     println!("  {} ({})", gpu.name, gpu.driver);
     status(gpu.can_encode(), "Vulkan H.264 encode queue");
+    if gpu.can_encode() {
+        match gliff_vk::encode_rate_control(&gpu, false) {
+            Ok(mode) => status(true, &format!("encode rate control: {mode}")),
+            Err(e) => status(false, &format!("encode rate control: {e}")),
+        }
+    }
     status(gpu.can_decode(), "Vulkan H.264 decode queue");
     Ok(())
 }
@@ -618,15 +647,40 @@ fn synthetic_bgra(w: usize, h: usize, t: usize) -> Vec<u8> {
     out
 }
 
-fn roundtrip(
-    node: &std::path::Path,
+struct RoundtripOptions {
     width: u32,
     height: u32,
     frames: usize,
     dual: bool,
     bitrate: Option<u32>,
     adapt: bool,
-) -> Result<()> {
+    constant_qp: bool,
+}
+
+impl RoundtripOptions {
+    fn quick() -> Self {
+        Self {
+            width: 640,
+            height: 360,
+            frames: 10,
+            dual: true,
+            bitrate: None,
+            adapt: false,
+            constant_qp: false,
+        }
+    }
+}
+
+fn roundtrip(node: &std::path::Path, opts: RoundtripOptions) -> Result<()> {
+    let RoundtripOptions {
+        width,
+        height,
+        frames,
+        dual,
+        bitrate,
+        adapt,
+        constant_qp,
+    } = opts;
     let gpu = Gpu::open(Some(node))?;
     println!("  {} ({}) dual={dual}", gpu.name, gpu.driver);
     let bitrate = bitrate.unwrap_or(4 * EncoderSettings::default_bitrate(width, height, 60));
@@ -635,8 +689,10 @@ fn roundtrip(
         height,
         bitrate,
         framerate: 60,
+        force_constant_qp: constant_qp,
     };
     let mut encoder = Encoder::new(&gpu, settings, dual).context("vulkan encoder")?;
+    println!("  rate control: {}", encoder.rate_control());
     let mut decoder = Decoder::new(&gpu, dual, width, height).context("vulkan decoder")?;
     let (w, h) = (width as usize, height as usize);
     let mut min_psnr = f64::MAX;
@@ -730,7 +786,12 @@ fn roundtrip(
 /// Capture one frame and push it through the exact server and client
 /// pipelines: dmabuf import, GPU split, two encodes, two decodes, GPU
 /// recombine. Compares the result with the CPU 4:4:4 reference.
-fn pipeline(target: &Target, node: &std::path::Path, output: Option<String>) -> Result<()> {
+fn pipeline(
+    target: &Target,
+    node: &std::path::Path,
+    output: Option<String>,
+    constant_qp: bool,
+) -> Result<()> {
     let output = pick_output(target, output)?;
     let mut cfg = CaptureConfig::new(output.clone());
     cfg.target = target.clone();
@@ -788,8 +849,10 @@ fn pipeline(target: &Target, node: &std::path::Path, output: Option<String>) -> 
         height: h,
         bitrate: EncoderSettings::default_bitrate(w, h, 60),
         framerate: 60,
+        force_constant_qp: constant_qp,
     };
     let mut encoder = Encoder::new(&gpu, settings, true).context("encoder")?;
+    println!("  rate control: {}", encoder.rate_control());
     let mut decoder = Decoder::new(&gpu, true, w, h).context("decoder")?;
     let t0 = std::time::Instant::now();
     let packet = encoder.encode_dmabuf(1, &plane, true).context("encode")?;

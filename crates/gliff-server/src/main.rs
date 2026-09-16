@@ -55,6 +55,7 @@ fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_writer(std::io::stderr)
         .init();
+    gliff_vk::prepare_driver_env();
 
     if cli.stdio {
         assert_stdout_is_free()?;

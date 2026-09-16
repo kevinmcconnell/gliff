@@ -135,6 +135,12 @@ where
     let settings = encoder_settings(stream.0, stream.1, bitrate_ctl.current());
     let encoder = Encoder::new(&gpu, settings.clone(), chroma == ChromaMode::Dual420)
         .context("create encoder")?;
+    tracing::info!(
+        gpu = %gpu.name,
+        driver = %gpu.driver,
+        rate_control = %encoder.rate_control(),
+        "encoder ready"
+    );
 
     let (mut msg_rx, mut clip_in_rx) = spawn_reader(reader);
 
@@ -740,6 +746,7 @@ fn encoder_settings(width: u32, height: u32, bitrate: u32) -> EncoderSettings {
         height,
         bitrate,
         framerate: 60,
+        force_constant_qp: false,
     }
 }
 

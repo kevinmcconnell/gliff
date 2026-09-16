@@ -67,6 +67,33 @@ const OPTIONAL_EXTENSIONS: &[&CStr] = &[
     ash::khr::video_decode_h264::NAME,
 ];
 
+/// Mesa's Intel driver (ANV) compiles Vulkan Video in but hides it until
+/// `ANV_DEBUG` names `video-decode` and `video-encode`. gliff asks for both
+/// itself so no user has to know. Any flags already in the variable stay.
+/// Call this first thing in `main`, before the process has other threads.
+pub fn prepare_driver_env() {
+    const VAR: &str = "ANV_DEBUG";
+    const WANTED: [&str; 2] = ["video-decode", "video-encode"];
+    let current = std::env::var(VAR).unwrap_or_default();
+    let mut flags: Vec<&str> = current
+        .split(',')
+        .map(str::trim)
+        .filter(|f| !f.is_empty())
+        .collect();
+    let missing: Vec<&str> = WANTED
+        .iter()
+        .copied()
+        .filter(|w| !flags.contains(w))
+        .collect();
+    if missing.is_empty() {
+        return;
+    }
+    flags.extend(missing);
+    let value = flags.join(",");
+    tracing::debug!(%value, "setting {VAR} for Intel ANV video");
+    std::env::set_var(VAR, value);
+}
+
 impl Gpu {
     /// Open the GPU behind `render_node` (any suitable one when `None`).
     pub fn open(render_node: Option<&Path>) -> Result<Arc<Self>> {

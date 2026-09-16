@@ -90,6 +90,7 @@ fn main() -> glib::ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
+    gliff_vk::prepare_driver_env();
     let cli = Cli::parse();
     let app = adw::Application::builder()
         .application_id("com.gliff.Client")

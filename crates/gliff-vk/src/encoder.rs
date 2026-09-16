@@ -3,7 +3,12 @@
 //! Low-delay layout: IDR then P frames, one reference, no reordering. The DPB
 //! is one array image with two layers; each frame is reconstructed into one
 //! layer while it predicts from the other.
+//!
+//! The bitrate is held by the driver's CBR rate control when it offers one.
+//! Drivers that only encode at a constant QP (Intel ANV) get the same target
+//! through [`QpController`], which moves the QP from frame to frame.
 
+use std::fmt;
 use std::sync::Arc;
 
 use ash::vk;
@@ -18,9 +23,90 @@ use crate::{zeroed, Error, Result};
 pub struct EncoderSettings {
     pub width: u32,
     pub height: u32,
-    /// Target bitrate in bits per second (CBR).
+    /// Target bitrate in bits per second.
     pub bitrate: u32,
     pub framerate: u32,
+    /// Take the constant-QP path even when the driver offers CBR, to test
+    /// that path on a driver that has both.
+    pub force_constant_qp: bool,
+}
+
+/// How the encoder holds its target bitrate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateControlMode {
+    /// The driver's CBR rate control.
+    Cbr,
+    /// One QP per frame, chosen by the encoder from the size of the frames
+    /// before it. The path for drivers without CBR, such as Intel ANV.
+    ConstantQp,
+}
+
+impl fmt::Display for RateControlMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Cbr => "CBR",
+            Self::ConstantQp => "constant QP",
+        })
+    }
+}
+
+/// Query the encode capabilities and pick the rate control the driver can
+/// run. Fails when it has neither CBR nor constant QP.
+pub fn encode_rate_control(gpu: &Gpu, force_constant_qp: bool) -> Result<RateControlMode> {
+    with_h264_profile(true, |profile| {
+        let caps = EncodeCaps::query(gpu, profile)?;
+        caps.pick_rate_control(force_constant_qp)
+    })
+}
+
+/// What the encoder needs from the H.264 encode capabilities.
+struct EncodeCaps {
+    max_coded_extent: vk::Extent2D,
+    min_bitstream_buffer_size_alignment: u64,
+    rate_control_modes: vk::VideoEncodeRateControlModeFlagsKHR,
+    max_level_idc: std_video::StdVideoH264LevelIdc,
+    min_qp: i32,
+    max_qp: i32,
+}
+
+impl EncodeCaps {
+    fn query(gpu: &Gpu, profile: &vk::VideoProfileInfoKHR) -> Result<Self> {
+        let mut h264 = vk::VideoEncodeH264CapabilitiesKHR::default();
+        let mut encode = vk::VideoEncodeCapabilitiesKHR::default();
+        let mut video = vk::VideoCapabilitiesKHR::default()
+            .push_next(&mut encode)
+            .push_next(&mut h264);
+        // SAFETY: valid physical device and chained structs.
+        unsafe {
+            (gpu.video_instance
+                .fp()
+                .get_physical_device_video_capabilities_khr)(
+                gpu.physical, profile, &mut video
+            )
+            .result()?
+        };
+        Ok(Self {
+            max_coded_extent: video.max_coded_extent,
+            min_bitstream_buffer_size_alignment: video.min_bitstream_buffer_size_alignment,
+            rate_control_modes: encode.rate_control_modes,
+            max_level_idc: h264.max_level_idc,
+            min_qp: h264.min_qp,
+            max_qp: h264.max_qp,
+        })
+    }
+
+    fn pick_rate_control(&self, force_constant_qp: bool) -> Result<RateControlMode> {
+        let modes = self.rate_control_modes;
+        if modes.contains(vk::VideoEncodeRateControlModeFlagsKHR::CBR) && !force_constant_qp {
+            Ok(RateControlMode::Cbr)
+        } else if modes.contains(vk::VideoEncodeRateControlModeFlagsKHR::DISABLED) {
+            Ok(RateControlMode::ConstantQp)
+        } else {
+            Err(Error::Unsupported(format!(
+                "encoder offers neither CBR nor constant-QP rate control ({modes:?})"
+            )))
+        }
+    }
 }
 
 impl EncoderSettings {
@@ -254,6 +340,100 @@ pub struct H264Encoder {
     started: bool,
     /// A bitrate change to apply with the next frame's rate-control update.
     pending_bitrate: Option<u32>,
+    rate: RateControl,
+}
+
+/// The rate control the encoder runs, with the state the mode needs.
+enum RateControl {
+    Cbr,
+    ConstantQp(QpController),
+}
+
+impl RateControl {
+    fn mode(&self) -> RateControlMode {
+        match self {
+            Self::Cbr => RateControlMode::Cbr,
+            Self::ConstantQp(_) => RateControlMode::ConstantQp,
+        }
+    }
+}
+
+/// The QP the encoder gives an IDR frame, and its first P frame; ANV's
+/// preferred constant QP. The controller moves on from there.
+const START_QP: u32 = 26;
+/// The encoder does not lower the QP past this even when frames are far
+/// under budget: a static desktop would otherwise reach the driver minimum,
+/// and the first movement after it would produce a burst many frames wide.
+const QP_FLOOR: u32 = 16;
+/// How much of the target the running budget may run ahead or behind, like
+/// the CBR virtual buffer.
+const BUCKET_MS: f64 = 500.0;
+
+/// Constant-QP bitrate control: one QP per frame, moved from the bytes each
+/// frame produced. Frames over budget raise the QP; frames under budget
+/// lower it, once the running budget is no longer in debt.
+struct QpController {
+    qp: u32,
+    min_qp: u32,
+    max_qp: u32,
+    /// Bytes each frame may spend to hit the target bitrate.
+    frame_budget: f64,
+    /// Bytes the stream is over (positive) or under the running budget,
+    /// clamped to `bucket`.
+    fullness: f64,
+    bucket: f64,
+}
+
+impl QpController {
+    fn new(settings: &EncoderSettings, min_qp: i32, max_qp: i32) -> Self {
+        let min_qp = (min_qp.max(0) as u32).max(QP_FLOOR);
+        let max_qp = (max_qp.max(0) as u32).max(min_qp);
+        let mut c = Self {
+            qp: START_QP.clamp(min_qp, max_qp),
+            min_qp,
+            max_qp,
+            frame_budget: 0.0,
+            fullness: 0.0,
+            bucket: 0.0,
+        };
+        c.retarget(settings.bitrate, settings.framerate);
+        c
+    }
+
+    fn retarget(&mut self, bitrate: u32, framerate: u32) {
+        let bytes_per_second = bitrate as f64 / 8.0;
+        self.frame_budget = bytes_per_second / framerate.max(1) as f64;
+        self.bucket = bytes_per_second * BUCKET_MS / 1000.0;
+        self.fullness = self.fullness.clamp(-self.bucket, self.bucket);
+    }
+
+    fn qp(&self) -> u32 {
+        self.qp
+    }
+
+    /// Account for a finished frame of `bytes` and choose the next QP. An
+    /// IDR is expected to be large, so it fills the bucket but does not move
+    /// the QP by itself.
+    fn observe(&mut self, bytes: usize, idr: bool) {
+        let bytes = bytes as f64;
+        self.fullness =
+            (self.fullness + bytes - self.frame_budget).clamp(-self.bucket, self.bucket);
+        if idr {
+            return;
+        }
+        let ratio = bytes / self.frame_budget.max(1.0);
+        let debt = self.fullness / self.bucket.max(1.0);
+        let step: i32 = if ratio > 2.5 {
+            2
+        } else if ratio > 1.25 || debt > 0.25 {
+            1
+        } else if ratio < 0.8 && debt < 0.0 {
+            -1
+        } else {
+            0
+        };
+        self.qp = (self.qp as i32 + step).clamp(self.min_qp as i32, self.max_qp as i32) as u32;
+    }
 }
 
 impl H264Encoder {
@@ -267,21 +447,7 @@ impl H264Encoder {
             height: settings.coded_height(),
         };
         with_h264_profile(true, |profile| {
-            // Capabilities: make sure the size fits and CBR exists.
-            let mut h264_caps = vk::VideoEncodeH264CapabilitiesKHR::default();
-            let mut enc_caps = vk::VideoEncodeCapabilitiesKHR::default();
-            let mut caps = vk::VideoCapabilitiesKHR::default()
-                .push_next(&mut enc_caps)
-                .push_next(&mut h264_caps);
-            // SAFETY: valid physical device and chained structs.
-            unsafe {
-                (gpu.video_instance
-                    .fp()
-                    .get_physical_device_video_capabilities_khr)(
-                    gpu.physical, profile, &mut caps
-                )
-                .result()?
-            };
+            let caps = EncodeCaps::query(gpu, profile)?;
             if coded.width > caps.max_coded_extent.width
                 || coded.height > caps.max_coded_extent.height
             {
@@ -290,12 +456,12 @@ impl H264Encoder {
                     coded.width, coded.height, caps.max_coded_extent
                 )));
             }
-            if !enc_caps
-                .rate_control_modes
-                .contains(vk::VideoEncodeRateControlModeFlagsKHR::CBR)
-            {
-                return Err(Error::Unsupported("encoder has no CBR rate control".into()));
-            }
+            let rate = match caps.pick_rate_control(settings.force_constant_qp)? {
+                RateControlMode::Cbr => RateControl::Cbr,
+                RateControlMode::ConstantQp => {
+                    RateControl::ConstantQp(QpController::new(&settings, caps.min_qp, caps.max_qp))
+                }
+            };
             let header = std_header(true);
             let info = vk::VideoSessionCreateInfoKHR::default()
                 .queue_family_index(family)
@@ -308,7 +474,7 @@ impl H264Encoder {
                 .std_header_version(&header);
             let session = Session::new(gpu, &info)?;
 
-            let (sps, pps) = std_parameter_sets(&settings, h264_caps.max_level_idc);
+            let (sps, pps) = std_parameter_sets(&settings, caps.max_level_idc);
             let spss = [sps];
             let ppss = [pps];
             let add = vk::VideoEncodeH264SessionParametersAddInfoKHR::default()
@@ -331,10 +497,13 @@ impl H264Encoder {
                 2,
                 Some(profile),
             )?;
-            let size = (coded.width * coded.height * 2) as usize;
+            let align = (caps.min_bitstream_buffer_size_alignment as usize).max(1);
+            let size = ((coded.width * coded.height * 2) as usize)
+                .max(1 << 20)
+                .next_multiple_of(align);
             let bitstream = HostBuffer::new(
                 gpu,
-                size.max(1 << 20),
+                size,
                 vk::BufferUsageFlags::VIDEO_ENCODE_DST_KHR,
                 Some(profile),
             )?;
@@ -371,13 +540,15 @@ impl H264Encoder {
                 poc: 0,
                 started: false,
                 pending_bitrate: None,
+                rate,
             };
             enc.sps = enc.encoded_parameters(true, false)?;
             enc.pps = enc.encoded_parameters(false, true)?;
             tracing::debug!(
                 sps = enc.sps.len(),
                 pps = enc.pps.len(),
-                "encoder parameter sets"
+                rate_control = %enc.rate.mode(),
+                "encoder ready"
             );
             Ok(enc)
         })
@@ -385,6 +556,10 @@ impl H264Encoder {
 
     pub fn settings(&self) -> &EncoderSettings {
         &self.settings
+    }
+
+    pub fn rate_control(&self) -> RateControlMode {
+        self.rate.mode()
     }
 
     /// Change the CBR target from the next frame on, without resetting the
@@ -617,8 +792,12 @@ impl H264Encoder {
                 disable_deblocking_filter_idc: std_video::StdVideoH264DisableDeblockingFilterIdc_STD_VIDEO_H264_DISABLE_DEBLOCKING_FILTER_IDC_DISABLED,
                 pWeightTable: std::ptr::null(),
             };
+            let constant_qp = match &self.rate {
+                RateControl::Cbr => 0,
+                RateControl::ConstantQp(c) => c.qp() as i32,
+            };
             let slices = [vk::VideoEncodeH264NaluSliceInfoKHR::default()
-                .constant_qp(0)
+                .constant_qp(constant_qp)
                 .std_slice_header(&std_slice)];
             let mut h264_pic = vk::VideoEncodeH264PictureInfoKHR::default()
                 .nalu_slice_entries(&slices)
@@ -643,14 +822,18 @@ impl H264Encoder {
 
             // The rate control state must accompany every begin once it is
             // set; the first begin sets it with a control command instead.
-            let mut rc = RateControl::new(&self.settings);
+            let mode = self.rate.mode();
+            let mut rc = RateControlInfos::new(&self.settings, mode);
             let (mut rc_info, mut h264_rc) = rc.infos();
             let mut begin = vk::VideoBeginCodingInfoKHR::default()
                 .video_session(self.session.handle)
                 .video_session_parameters(self.params.handle)
                 .reference_slots(&begin_slots);
             if self.started {
-                begin = begin.push_next(&mut rc_info).push_next(&mut h264_rc);
+                begin = begin.push_next(&mut rc_info);
+                if let Some(h264_rc) = h264_rc.as_mut() {
+                    begin = begin.push_next(h264_rc);
+                }
             }
 
             let mut next_settings = self.settings.clone();
@@ -659,6 +842,9 @@ impl H264Encoder {
             }
             let settings = &next_settings;
             let started = self.started;
+            // Only CBR needs a control command for a new bitrate; constant QP
+            // takes it in the controller below.
+            let retarget = bitrate_change.is_some() && mode == RateControlMode::Cbr;
             let dev = &self.gpu.device;
             let video = self.gpu.video.fp();
             let encode = self.gpu.encode.fp();
@@ -674,9 +860,9 @@ impl H264Encoder {
                         dev.cmd_reset_query_pool(cmd, query_pool, 0, 1);
                         (video.cmd_begin_video_coding_khr)(cmd, &begin);
                         if !started {
-                            record_rate_control(cmd, video, settings, true);
-                        } else if bitrate_change.is_some() {
-                            record_rate_control(cmd, video, settings, false);
+                            record_rate_control(cmd, video, settings, mode, true);
+                        } else if retarget {
+                            record_rate_control(cmd, video, settings, mode, false);
                         }
                         dev.cmd_begin_query(cmd, query_pool, 0, vk::QueryControlFlags::empty());
                         (encode.cmd_encode_video_khr)(cmd, &encode_info);
@@ -694,6 +880,9 @@ impl H264Encoder {
         if let Some(b) = bitrate_change {
             tracing::info!(bitrate = b, "encoder bitrate changed");
             self.settings.bitrate = b;
+            if let RateControl::ConstantQp(c) = &mut self.rate {
+                c.retarget(b, self.settings.framerate);
+            }
         }
         // The DPB and counters describe the picture just recorded; the
         // bitstream itself is collected by `finish`.
@@ -729,6 +918,10 @@ impl H264Encoder {
             )));
         }
         let (offset, len) = (results[0] as usize, results[1] as usize);
+        if let RateControl::ConstantQp(c) = &mut self.rate {
+            c.observe(len, idr);
+            tracing::trace!(bytes = len, idr, qp = c.qp(), "constant-QP step");
+        }
         let slice = self.bitstream.read(offset, len);
         let mut data = Vec::with_capacity(len + self.sps.len() + self.pps.len() + 4);
         if idr {
@@ -751,7 +944,7 @@ pub(crate) struct PendingEncode {
     idr: bool,
 }
 
-/// Program CBR rate control (and the quality level) for `settings`; with
+/// Program the rate control (and the quality level) for `settings`; with
 /// `reset` this also starts the session, as the first frame must.
 ///
 /// # Safety
@@ -760,9 +953,10 @@ unsafe fn record_rate_control(
     cmd: vk::CommandBuffer,
     video: &ash::khr::video_queue::DeviceFn,
     settings: &EncoderSettings,
+    mode: RateControlMode,
     reset: bool,
 ) {
-    let mut rc = RateControl::new(settings);
+    let mut rc = RateControlInfos::new(settings, mode);
     let (mut rc_info, mut h264_rc) = rc.infos();
     let mut quality = vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(0);
     let mut flags = vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL;
@@ -772,8 +966,10 @@ unsafe fn record_rate_control(
     }
     let mut control = vk::VideoCodingControlInfoKHR::default()
         .flags(flags)
-        .push_next(&mut rc_info)
-        .push_next(&mut h264_rc);
+        .push_next(&mut rc_info);
+    if let Some(h264_rc) = h264_rc.as_mut() {
+        control = control.push_next(h264_rc);
+    }
     if reset {
         control = control.push_next(&mut quality);
     }
@@ -781,32 +977,44 @@ unsafe fn record_rate_control(
     unsafe { (video.cmd_control_video_coding_khr)(cmd, &control) };
 }
 
-/// The CBR rate control state: one layer at the target bitrate and frame
-/// rate. Owns the layer array the info structs point into.
-struct RateControl {
+/// The rate control state the driver is told: for CBR one layer at the
+/// target bitrate and frame rate, for constant QP the `DISABLED` mode with
+/// no layers. Owns the layer array the info structs point into.
+struct RateControlInfos {
+    mode: RateControlMode,
     h264_layer: vk::VideoEncodeH264RateControlLayerInfoKHR<'static>,
     layers: [vk::VideoEncodeRateControlLayerInfoKHR<'static>; 1],
 }
 
-impl RateControl {
-    fn new(s: &EncoderSettings) -> Self {
+impl RateControlInfos {
+    fn new(s: &EncoderSettings, mode: RateControlMode) -> Self {
         let h264_layer = vk::VideoEncodeH264RateControlLayerInfoKHR::default();
         let layers = [vk::VideoEncodeRateControlLayerInfoKHR::default()
             .average_bitrate(s.bitrate as u64)
             .max_bitrate(s.bitrate as u64)
             .frame_rate_numerator(s.framerate)
             .frame_rate_denominator(1)];
-        Self { h264_layer, layers }
+        Self {
+            mode,
+            h264_layer,
+            layers,
+        }
     }
 
-    /// The two structs to chain onto a control or begin info. Both borrow
-    /// `self`, which must outlive the command that records them.
+    /// The structs to chain onto a control or begin info. They borrow
+    /// `self`, which must outlive the command that records them. The H.264
+    /// struct only exists for CBR: `DISABLED` carries no layers.
     fn infos(
         &mut self,
     ) -> (
         vk::VideoEncodeRateControlInfoKHR<'_>,
-        vk::VideoEncodeH264RateControlInfoKHR<'_>,
+        Option<vk::VideoEncodeH264RateControlInfoKHR<'_>>,
     ) {
+        if self.mode == RateControlMode::ConstantQp {
+            let rc = vk::VideoEncodeRateControlInfoKHR::default()
+                .rate_control_mode(vk::VideoEncodeRateControlModeFlagsKHR::DISABLED);
+            return (rc, None);
+        }
         self.layers[0].p_next =
             (&mut self.h264_layer as *mut vk::VideoEncodeH264RateControlLayerInfoKHR).cast();
         let rc = vk::VideoEncodeRateControlInfoKHR::default()
@@ -823,7 +1031,7 @@ impl RateControl {
             .idr_period(0)
             .consecutive_b_frame_count(0)
             .temporal_layer_count(1);
-        (rc, h264)
+        (rc, Some(h264))
     }
 }
 
@@ -895,5 +1103,100 @@ impl Drop for H264Encoder {
         let _ = self.commands.wait();
         // SAFETY: work is complete; fields drop after this in declaration order.
         unsafe { self.gpu.device.destroy_query_pool(self.query_pool, None) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn controller(bitrate: u32) -> QpController {
+        let settings = EncoderSettings {
+            width: 1920,
+            height: 1080,
+            bitrate,
+            framerate: 60,
+            force_constant_qp: true,
+        };
+        QpController::new(&settings, 10, 51)
+    }
+
+    #[test]
+    fn starts_at_the_preferred_qp_within_the_driver_range() {
+        assert_eq!(controller(8_000_000).qp(), START_QP);
+        let narrow = QpController::new(
+            &EncoderSettings {
+                width: 64,
+                height: 64,
+                bitrate: 1_000_000,
+                framerate: 60,
+                force_constant_qp: true,
+            },
+            30,
+            40,
+        );
+        assert_eq!(narrow.qp(), 30);
+    }
+
+    #[test]
+    fn frames_over_budget_raise_the_qp_and_under_budget_lower_it() {
+        let mut c = controller(8_000_000);
+        let budget = c.frame_budget as usize;
+        c.observe(budget * 2, false);
+        assert_eq!(c.qp(), START_QP + 1);
+        c.observe(budget * 3, false);
+        assert_eq!(c.qp(), START_QP + 3);
+        for _ in 0..20 {
+            c.observe(budget / 4, false);
+        }
+        assert!(c.qp() < START_QP, "qp {} did not come down", c.qp());
+    }
+
+    #[test]
+    fn qp_stays_within_the_floor_and_the_driver_maximum() {
+        let mut c = controller(8_000_000);
+        let budget = c.frame_budget as usize;
+        for _ in 0..200 {
+            c.observe(budget * 10, false);
+        }
+        assert_eq!(c.qp(), 51);
+        for _ in 0..200 {
+            c.observe(0, false);
+        }
+        assert_eq!(c.qp(), QP_FLOOR);
+    }
+
+    #[test]
+    fn an_idr_fills_the_bucket_but_does_not_move_the_qp() {
+        let mut c = controller(8_000_000);
+        let budget = c.frame_budget as usize;
+        c.observe(budget * 20, true);
+        assert_eq!(c.qp(), START_QP);
+        assert!(c.fullness > 0.0);
+        c.observe(budget, false);
+        assert_eq!(
+            c.qp(),
+            START_QP + 1,
+            "the debt from the IDR is paid by P frames"
+        );
+    }
+
+    #[test]
+    fn a_steady_stream_on_budget_holds_its_qp() {
+        let mut c = controller(8_000_000);
+        let budget = c.frame_budget as usize;
+        for _ in 0..100 {
+            c.observe(budget, false);
+        }
+        assert_eq!(c.qp(), START_QP);
+    }
+
+    #[test]
+    fn retarget_rescales_the_budget_and_bucket() {
+        let mut c = controller(8_000_000);
+        let before = c.frame_budget;
+        c.retarget(2_000_000, 60);
+        assert!((c.frame_budget - before / 4.0).abs() < 1e-6);
+        assert!((c.bucket - 2_000_000.0 / 8.0 / 2.0).abs() < 1e-6);
     }
 }

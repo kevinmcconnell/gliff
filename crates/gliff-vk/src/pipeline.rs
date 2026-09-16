@@ -19,7 +19,7 @@ use ash::vk;
 use crate::compute::{Recombine, Split};
 use crate::decoder::H264Decoder;
 use crate::device::{Commands, Gpu, Timeline};
-use crate::encoder::{EncoderSettings, H264Encoder};
+use crate::encoder::{EncoderSettings, H264Encoder, RateControlMode};
 use crate::image::{DmabufPlane, ExportedDmabuf, HostBuffer, Image};
 use crate::Result;
 
@@ -70,6 +70,11 @@ impl Encoder {
 
     pub fn settings(&self) -> &EncoderSettings {
         &self.settings
+    }
+
+    /// How the streams hold their bitrate; both take the same mode.
+    pub fn rate_control(&self) -> RateControlMode {
+        self.main.rate_control()
     }
 
     /// Change the target bitrate of both streams from the next frame on.

@@ -39,7 +39,7 @@ pub(crate) fn zeroed<T: Copy>() -> T {
 pub mod decoder;
 pub mod pipeline;
 
-pub use device::Gpu;
-pub use encoder::EncoderSettings;
+pub use device::{prepare_driver_env, Gpu};
+pub use encoder::{encode_rate_control, EncoderSettings, RateControlMode};
 pub use image::{DmabufPlane, ExportedDmabuf};
 pub use pipeline::{Decoder, DisplayFrame, EncodedFrame, Encoder};
