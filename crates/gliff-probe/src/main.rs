@@ -830,11 +830,22 @@ fn pipeline(target: &Target, node: &std::path::Path, output: Option<String>) -> 
     // CPU downscale, whose filter differs from the shader's, so the PSNR
     // is then informational and the check is that the round trip ran.
     let pixels = if scaled {
-        downscale_bgra(&reference.pixels, reference.width, reference.height, sw as usize, sh as usize)
+        downscale_bgra(
+            &reference.pixels,
+            reference.width,
+            reference.height,
+            sw as usize,
+            sh as usize,
+        )
     } else {
         reference.pixels.clone()
     };
-    let cpu = yuv444_to_bgra(&bgra_to_yuv444(&pixels, sw as usize * 4, sw as usize, sh as usize));
+    let cpu = yuv444_to_bgra(&bgra_to_yuv444(
+        &pixels,
+        sw as usize * 4,
+        sw as usize,
+        sh as usize,
+    ));
     let rgb_psnr = psnr(&rgb_channels(&cpu), &rgb_channels(&out));
     println!("  decoded {dec_ms:.1} ms; end-to-end RGB PSNR vs CPU reference {rgb_psnr:.1} dB");
     let ok = scaled || rgb_psnr > 35.0;

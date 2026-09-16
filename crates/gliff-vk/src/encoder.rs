@@ -285,9 +285,7 @@ fn query_caps(gpu: &Gpu, profile: &vk::VideoProfileInfoKHR) -> Result<EncodeCaps
     unsafe {
         (gpu.video_instance
             .fp()
-            .get_physical_device_video_capabilities_khr)(
-            gpu.physical, profile, &mut caps
-        )
+            .get_physical_device_video_capabilities_khr)(gpu.physical, profile, &mut caps)
         .result()?
     };
     Ok(EncodeCaps {
@@ -944,28 +942,49 @@ mod tests {
 
     #[test]
     fn fit_extent_keeps_a_size_that_fits() {
-        assert_eq!(EncoderSettings::fit_extent(1920, 1080, (4096, 4096)), (1920, 1080));
-        assert_eq!(EncoderSettings::fit_extent(4096, 2304, (4096, 4096)), (4096, 2304));
+        assert_eq!(
+            EncoderSettings::fit_extent(1920, 1080, (4096, 4096)),
+            (1920, 1080)
+        );
+        assert_eq!(
+            EncoderSettings::fit_extent(4096, 2304, (4096, 4096)),
+            (4096, 2304)
+        );
     }
 
     #[test]
     fn fit_extent_scales_5k_to_the_encoder_maximum() {
-        assert_eq!(EncoderSettings::fit_extent(5120, 2880, (4096, 4096)), (4096, 2304));
+        assert_eq!(
+            EncoderSettings::fit_extent(5120, 2880, (4096, 4096)),
+            (4096, 2304)
+        );
     }
 
     #[test]
     fn fit_extent_scales_a_tall_output_by_height() {
-        assert_eq!(EncoderSettings::fit_extent(2880, 5120, (4096, 4096)), (2304, 4096));
+        assert_eq!(
+            EncoderSettings::fit_extent(2880, 5120, (4096, 4096)),
+            (2304, 4096)
+        );
     }
 
     #[test]
     fn fit_extent_result_is_even_and_codes_within_the_maximum() {
         let max = (4096, 2304);
-        for (w, h) in [(5120, 2880), (7680, 4320), (4097, 2305), (3000, 3000), (321, 9999)] {
+        for (w, h) in [
+            (5120, 2880),
+            (7680, 4320),
+            (4097, 2305),
+            (3000, 3000),
+            (321, 9999),
+        ] {
             let (fw, fh) = EncoderSettings::fit_extent(w, h, max);
             assert_eq!(fw % 2, 0, "{w}x{h}");
             assert_eq!(fh % 2, 0, "{w}x{h}");
-            assert!(coded(fw) <= max.0 && coded(fh) <= max.1, "{w}x{h} -> {fw}x{fh}");
+            assert!(
+                coded(fw) <= max.0 && coded(fh) <= max.1,
+                "{w}x{h} -> {fw}x{fh}"
+            );
         }
     }
 }
