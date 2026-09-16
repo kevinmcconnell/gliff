@@ -2,11 +2,14 @@
 
 gliff targets Vulkan Video on both ends. Driver behaviour differs, so this
 file records what we have found and where more testing is needed. Findings so
-far come from **one** machine:
+far come from **two** machines:
 
 - GPU: AMD Granite Ridge iGPU (Ryzen 9 9955HX), VCN 4 class.
-- Driver: Mesa RADV 26.2 (Vulkan 1.4), kernel 7.2.
-- Compositor: Hyprland 0.56.2.
+  Driver: Mesa RADV 26.2 (Vulkan 1.4), kernel 7.2.
+  Compositor: Hyprland 0.56.2.
+- GPU: Intel Gen12 iGPU.
+  Driver: Mesa ANV 26.2 on the i915 KMD, kernel 7.2.
+  Compositor: Hyprland 0.56.2.
 
 `gliff-probe vulkan` prints the device and its video queues.
 
@@ -26,9 +29,8 @@ usage is invalid.
 ### Decode DPB and output are distinct
 `VK_VIDEO_DECODE_CAPABILITY_DPB_AND_OUTPUT_DISTINCT_BIT_KHR` only. The decoder
 keeps a DPB array image (`VIDEO_DECODE_DPB`) and a separate ring of output
-images (`VIDEO_DECODE_DST | SAMPLED`) the recombine shader samples. The
-coincide mode is not implemented.
-- **Needs testing:** a driver that only offers coincide mode.
+images (`VIDEO_DECODE_DST | SAMPLED`) the recombine shader samples. Distinct is
+preferred whenever it is offered.
 
 ### Encode DPB must be one array image
 The encode capabilities report no `SEPARATE_REFERENCE_IMAGES`, so the two
@@ -107,8 +109,35 @@ headless` and `output remove` are hyprctl commands and work with both config
 types. The server reads back the mode Hyprland applied instead of assuming
 the request took effect.
 
+## Confirmed on Intel ANV
+
+### Vulkan Video stays hidden until `ANV_DEBUG` asks for it
+ANV compiles video support in but gates it off, so every gliff binary exits
+with `no suitable GPU: no Vulkan device with a compute queue, dmabuf import
+and video queues` until the environment carries
+`ANV_DEBUG=video-decode,video-encode`. With it set ANV advertises
+`VK_KHR_video_queue`, `VK_KHR_video_decode_queue`, `VK_KHR_video_encode_queue`,
+`VK_KHR_video_decode_h264` and `VK_KHR_video_encode_h264`, plus a second queue
+family carrying `VIDEO_DECODE_KHR | VIDEO_ENCODE_KHR`, and `gliff-probe vulkan`
+then passes on both the H.264 decode and encode queues. Nothing in the kernel
+withholds this: the `vcs0`, `vcs1` and `vecs0` engines are present and GuC and
+HuC are authenticated without the variable.
+
+`ANV_VIDEO_DECODE=1` and `ANV_VIDEO_ENCODE=1`, which most search results still
+name, do nothing on Mesa 26.2.
+
+### Decode DPB and output coincide
+`VK_VIDEO_DECODE_CAPABILITY_DPB_AND_OUTPUT_COINCIDE_BIT_KHR` only, so the
+decoder gives each DPB slot its own image with `VIDEO_DECODE_DPB |
+VIDEO_DECODE_DST | SAMPLED` usage, decodes into the slot being set up, and
+hands that slot to the recombine pass. A spare image past the last slot takes
+pictures that are not references.
+- **Needs testing:** the Khronos validation layer, which is not installed on
+  the Intel machine, so the coincide-mode VUIDs are unchecked.
+
 ## Not yet tested anywhere
-- Intel ANV and NVIDIA (proprietary and NVK) for every item above.
+- NVIDIA (proprietary and NVK) for every item above, and Intel ANV for every
+  item not listed under "Confirmed on Intel ANV".
 - Native 4:4:4 encode (HEVC 4:4:4 / AV1) to retire the dual-stream split.
 - `VK_VALVE_video_encode_rgb_conversion` (exposed by RADV here): the encoder
   converts RGB itself, which would remove the split pass for `Single420`.

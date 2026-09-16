@@ -26,12 +26,17 @@ Working and validated on AMD (Ryzen Granite Ridge, Mesa RADV):
   `--release-hotkey`), and auto-reconnects. Validated over localhost against a
   nested Hyprland: connect, stream, resize, ack pacing, both chroma modes.
 
+On Intel (Mesa ANV) the client has been tested and works, but we have not
+started server support yet. The client needs
+`ANV_DEBUG=video-decode,video-encode` set; `docs/hardware-quirks.md` explains
+why.
+
 Design and the full picture are in `docs/architecture.md`; driver-specific
 behaviour and test gaps are in `docs/hardware-quirks.md`.
 
 Not done yet: image/binary clipboard (text works both ways); native
-single-stream 4:4:4 and AV1/HEVC; a verified ssh-from-cold-machine path; and
-testing on Intel and NVIDIA Vulkan drivers.
+single-stream 4:4:4 and AV1/HEVC; a verified ssh-from-cold-machine path; Intel
+server support; and testing on NVIDIA Vulkan drivers.
 
 ## Build
 
