@@ -29,6 +29,7 @@ use hypr_input::{Axis as InAxis, Clipboard, ClipboardEvent, Input, InputCmd, Inp
 use hypr_wl::Target;
 
 use crate::clipboard::Bridge;
+use crate::notify;
 
 pub struct Config {
     pub target: Target,
@@ -167,7 +168,11 @@ where
     .map_err(|e| tracing::warn!(error = %e, "clipboard bridge unavailable"))
     .ok();
     let (clip_out_tx, mut clip_out_rx) = outbound_channel();
-    let jobs = Jobs::new(|id, progress| tracing::debug!(id, ?progress, "clipboard paste"));
+    let (report_tx, report_rx) = mpsc::unbounded_channel();
+    let jobs = Jobs::new(move |id, progress| {
+        let _ = report_tx.send((id, progress));
+    });
+    notify::start(report_rx, jobs.clone());
     let clipboard = Bridge::new(Transfers::new(clip_out_tx), jobs, compositor_clipboard);
 
     let bitrate_ctl = match cfg.bitrate {
