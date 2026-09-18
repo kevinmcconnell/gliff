@@ -29,6 +29,7 @@ use gliff_proto::{ClipboardFile, ClipboardItem, ClipboardMsg};
 use gliff_transport::clipboard::files::{
     fetch_files, list_files, open_source, retire, write_body, LocalFiles, Spool,
 };
+use gliff_transport::clipboard::progress::{describe_files, Jobs};
 use gliff_transport::clipboard::{Event, ReadSource, Transfers, WriteSink};
 use hypr_input::{Clipboard, ClipboardEvent};
 
@@ -52,6 +53,7 @@ struct RemoteOffer {
 
 pub struct Bridge {
     transfers: Transfers,
+    jobs: Jobs,
     compositor: Option<Clipboard>,
     local: Rc<RefCell<LocalOffer>>,
     remote: Rc<RefCell<RemoteOffer>>,
@@ -60,9 +62,10 @@ pub struct Bridge {
 }
 
 impl Bridge {
-    pub fn new(transfers: Transfers, compositor: Option<Clipboard>) -> Self {
+    pub fn new(transfers: Transfers, jobs: Jobs, compositor: Option<Clipboard>) -> Self {
         Self {
             transfers,
+            jobs,
             compositor,
             local: Rc::default(),
             remote: Rc::default(),
@@ -221,32 +224,27 @@ impl Bridge {
                     remote.spool.clone().expect("just created"),
                 )
             };
-            tokio::task::spawn_local(async move {
+            let (label, total) = describe_files(&files);
+            self.jobs.run(label, total, |meter| async move {
                 let paths = spooled
-                    .get_or_try_init(|| fetch_files(&transfers, &files, &spool))
-                    .await;
-                match paths {
-                    Ok(paths) => {
-                        let body = file_list_body(&mime_type, paths).unwrap_or_default();
-                        if let Err(e) = write_body(WriteSink(target), body).await {
-                            tracing::debug!(error = %e, "paste target closed early");
-                        }
-                    }
-                    Err(e) => tracing::warn!(error = %e, "clipboard file paste failed"),
+                    .get_or_try_init(|| fetch_files(&transfers, &files, &spool, &meter))
+                    .await?;
+                let body = file_list_body(&mime_type, paths).unwrap_or_default();
+                if let Err(e) = write_body(WriteSink(target), body).await {
+                    tracing::debug!(error = %e, "paste target closed early");
                 }
+                Ok(())
             });
         } else {
-            tokio::task::spawn_local(async move {
-                if let Err(e) = transfers
+            self.jobs.run(mime_type.clone(), None, |meter| async move {
+                transfers
                     .fetch(
                         ClipboardItem::Mime(mime_type),
-                        WriteSink(target),
+                        meter.wrap(WriteSink(target)),
                         Some(MAX_ITEM),
                     )
                     .await
-                {
-                    tracing::warn!(error = %e, "clipboard paste failed");
-                }
+                    .map(|_| ())
             });
         }
     }

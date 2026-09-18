@@ -18,6 +18,7 @@ use gliff_proto::{
     ServerMsg, SessionInfo, VideoPipeline, PROTOCOL_VERSION,
 };
 use gliff_sw::VideoMode;
+use gliff_transport::clipboard::progress::Jobs;
 use gliff_transport::clipboard::{outbound_channel, Transfers};
 use gliff_transport::Framed;
 use gliff_vk::{DmabufPlane, EncodedFrame, Encoder, EncoderSettings, Gpu};
@@ -166,7 +167,8 @@ where
     .map_err(|e| tracing::warn!(error = %e, "clipboard bridge unavailable"))
     .ok();
     let (clip_out_tx, mut clip_out_rx) = outbound_channel();
-    let clipboard = Bridge::new(Transfers::new(clip_out_tx), compositor_clipboard);
+    let jobs = Jobs::new(|id, progress| tracing::debug!(id, ?progress, "clipboard paste"));
+    let clipboard = Bridge::new(Transfers::new(clip_out_tx), jobs, compositor_clipboard);
 
     let bitrate_ctl = match cfg.bitrate {
         Some(fixed) => BitrateController::new(fixed, true),

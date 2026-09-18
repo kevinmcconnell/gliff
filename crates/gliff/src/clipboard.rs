@@ -27,7 +27,8 @@ use gliff_proto::{ClientMsg, ClipboardFile, ClipboardItem, ClipboardMsg};
 use gliff_transport::clipboard::files::{
     fetch_files, open_source, retire, write_body, LocalFiles, Spool,
 };
-use gliff_transport::clipboard::{Event, Transfers};
+use gliff_transport::clipboard::progress::{describe_files, Jobs};
+use gliff_transport::clipboard::{Event, TransferError, Transfers};
 
 use crate::net::Status;
 
@@ -46,6 +47,8 @@ pub enum ToWorker {
         sink: mpsc::Sender<Bytes>,
         result: oneshot::Sender<Result<(), String>>,
     },
+    /// The user pressed cancel on a transfer reported as `id`.
+    CancelTransfer(u32),
 }
 
 #[derive(Default)]
@@ -57,6 +60,7 @@ struct RemoteOffer {
 
 pub struct Bridge {
     transfers: Transfers,
+    jobs: Jobs,
     status: StdSender<Status>,
     local_files: RefCell<LocalFiles>,
     remote: RefCell<RemoteOffer>,
@@ -64,8 +68,12 @@ pub struct Bridge {
 
 impl Bridge {
     pub fn new(transfers: Transfers, status: StdSender<Status>) -> Self {
+        let report_to = status.clone();
         Self {
             transfers,
+            jobs: Jobs::new(move |id, progress| {
+                let _ = report_to.send(Status::ClipboardTransfer { id, progress });
+            }),
             status,
             local_files: RefCell::default(),
             remote: RefCell::default(),
@@ -150,6 +158,7 @@ impl Bridge {
                 sink,
                 result,
             } => self.fetch(mime_type, sink, result),
+            ToWorker::CancelTransfer(id) => self.jobs.cancel(id),
         }
     }
 
@@ -161,11 +170,16 @@ impl Bridge {
     ) {
         let transfers = self.transfers.clone();
         if !is_file_mime(&mime_type) {
-            tokio::task::spawn_local(async move {
+            self.jobs.run(mime_type.clone(), None, |meter| async move {
                 let r = transfers
-                    .fetch(ClipboardItem::Mime(mime_type), sink, Some(MAX_ITEM))
+                    .fetch(
+                        ClipboardItem::Mime(mime_type),
+                        meter.wrap(sink),
+                        Some(MAX_ITEM),
+                    )
                     .await;
-                let _ = result.send(r.map(|_| ()).map_err(|e| e.to_string()));
+                let _ = result.send(r.as_ref().map(|_| ()).map_err(|e| e.to_string()));
+                r.map(|_| ())
             });
             return;
         }
@@ -190,18 +204,20 @@ impl Bridge {
                 remote.spool.clone().expect("just created"),
             )
         };
-        tokio::task::spawn_local(async move {
+        let (label, total) = describe_files(&files);
+        self.jobs.run(label, total, |meter| async move {
             let r = match spooled
-                .get_or_try_init(|| fetch_files(&transfers, &files, &spool))
+                .get_or_try_init(|| fetch_files(&transfers, &files, &spool, &meter))
                 .await
             {
                 Ok(paths) => {
                     let body = file_list_body(&mime_type, paths).unwrap_or_default();
-                    write_body(sink, body).await.map_err(|e| e.to_string())
+                    write_body(sink, body).await.map_err(TransferError::from)
                 }
-                Err(e) => Err(e.to_string()),
+                Err(e) => Err(e),
             };
-            let _ = result.send(r);
+            let _ = result.send(r.as_ref().map(|_| ()).map_err(|e| e.to_string()));
+            r
         });
     }
 }

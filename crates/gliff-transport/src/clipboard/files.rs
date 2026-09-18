@@ -11,6 +11,7 @@ use gliff_proto::clipboard::{
 };
 use gliff_proto::{ClipboardFile, ClipboardItem};
 
+use super::progress::Meter;
 use super::{ChunkSink, TransferError, Transfers, WriteSink};
 
 /// The files behind a local offer: the entries sent to the peer and, at the
@@ -228,6 +229,7 @@ pub async fn fetch_files(
     transfers: &Transfers,
     files: &[ClipboardFile],
     spool: &Spool,
+    meter: &Meter,
 ) -> Result<Vec<PathBuf>, TransferError> {
     validate_files(files).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     for (i, f) in files.iter().enumerate() {
@@ -242,7 +244,11 @@ pub async fn fetch_files(
         }
         let file = tokio::fs::File::create(&dest).await?;
         transfers
-            .fetch(ClipboardItem::File(i as u32), WriteSink(file), Some(f.size))
+            .fetch(
+                ClipboardItem::File(i as u32),
+                meter.wrap(WriteSink(file)),
+                Some(f.size),
+            )
             .await?;
     }
     Ok(top_level(files)

@@ -16,6 +16,7 @@ use gliff_proto::{
     PROTOCOL_VERSION,
 };
 use gliff_sw::VideoMode;
+use gliff_transport::clipboard::progress::Progress;
 use gliff_transport::clipboard::{outbound_channel, Transfers};
 use gliff_transport::{spawn_ssh, Framed, SshTarget};
 use gliff_vk::{Decoder, DisplayFrame, Gpu};
@@ -59,6 +60,11 @@ pub enum Status {
     ClipboardRead {
         mime_type: String,
         reply: mpsc::Sender<std::io::Result<Bytes>>,
+    },
+    /// A paste from the server's offer that is taking a while, or ended.
+    ClipboardTransfer {
+        id: u32,
+        progress: Progress,
     },
     Error(String),
     Closed,
