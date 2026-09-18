@@ -9,6 +9,7 @@
 #   4. server --listen --headless --low-bandwidth + serve-test (Single420)
 #   5. text clipboard in both directions
 #   6. a 1 MiB binary clipboard item in both directions (chunked)
+#   7. copied files (a directory tree) in both directions, via the spool
 #
 # Exits non-zero on the first failure.
 set -uo pipefail
@@ -122,5 +123,28 @@ cmp -s "$blob" "$recvf" || fail "compositor->client binary clipboard differs"
 cmp -s "$blob" "$outf" || fail "client->compositor binary clipboard differs ($(stat -c %s "$outf") bytes)"
 rm -f "$clipf" "$blob" "$recvf" "$outf"
 echo "   binary clipboard both directions PASS"
+
+echo "== 7. copied files both directions (spooled) =="
+srcd=$(mktemp -d); mkdir -p "$srcd/photos/sub"
+head -c 300000 /dev/urandom >"$srcd/photos/a.bin"; echo "hello" >"$srcd/photos/sub/b.txt"; echo "solo" >"$srcd/solo.txt"
+recvd=$(mktemp -d)
+printf 'file://%s\r\nfile://%s\r\n' "$srcd/photos" "$srcd/solo.txt" | wl-copy --type text/uri-list 2>/dev/null
+"$SERVER" --listen 127.0.0.1:9044 --headless --instance "$NEST_SIG" >/tmp/gliff-e2e-server.log 2>&1 &
+fsp=$!; PIDS+=("$fsp"); sleep 2
+damage & fdp=$!; PIDS+=("$fdp")
+clipf=$(mktemp)
+GLIFF_SEND_CLIP_FILES="$srcd/photos:$srcd/solo.txt" GLIFF_RECV_CLIP_DIR="$recvd" timeout 20 $PROBE serve-test --connect 127.0.0.1:9044 --frames 200 >"$clipf" 2>&1 &
+fclipc=$!; PIDS+=("$fclipc")
+sleep 5
+pasted_uris=$(wl-paste --type text/uri-list 2>/dev/null | tr -d '\r')
+kill "$fclipc" "$fdp" "$fsp" 2>/dev/null
+grep -q "CLIP-RECV-FILES: 5 entries" "$clipf" || fail "compositor->client files (probe said: $(grep -iE 'clip|offer|serv|error|panick' "$clipf" | tail -8 | tr '\n' ' '); server said: $(grep -iE 'clip|warn' /tmp/gliff-e2e-server.log | tail -5 | tr '\n' ' '))"
+cmp -s "$srcd/photos/a.bin" "$recvd/photos/a.bin" && cmp -s "$srcd/photos/sub/b.txt" "$recvd/photos/sub/b.txt" && cmp -s "$srcd/solo.txt" "$recvd/solo.txt" || fail "compositor->client files differ"
+spool=$(echo "$pasted_uris" | head -1 | sed 's|^file://||; s|/photos$||')
+[ -n "$spool" ] && [ -d "$spool/photos" ] || fail "client->compositor files: no spool in URI list (got: $pasted_uris)"
+cmp -s "$srcd/photos/a.bin" "$spool/photos/a.bin" && cmp -s "$srcd/photos/sub/b.txt" "$spool/photos/sub/b.txt" && cmp -s "$srcd/solo.txt" "$spool/solo.txt" || fail "client->compositor files differ"
+rm -rf "$spool"
+rm -rf "$clipf" "$srcd" "$recvd"
+echo "   copied files both directions PASS"
 
 echo "E2E PASS: all checks passed"
