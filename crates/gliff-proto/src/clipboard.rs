@@ -315,7 +315,7 @@ pub enum FilesError {
 
 /// The top-level entries of a file list: those without a `/` in their path.
 /// They are what the pasting side puts in its URI list.
-pub fn top_level<'a>(files: &'a [ClipboardFile]) -> impl Iterator<Item = &'a ClipboardFile> {
+pub fn top_level(files: &[ClipboardFile]) -> impl Iterator<Item = &ClipboardFile> {
     files.iter().filter(|f| !f.path.contains('/'))
 }
 
@@ -403,6 +403,8 @@ pub enum ChunkError {
     AfterDone,
     #[error("ack for {received} bytes that were not sent")]
     BadAck { received: u64 },
+    #[error("more than {WINDOW} chunks in flight")]
+    WindowExceeded,
 }
 
 #[cfg(test)]
