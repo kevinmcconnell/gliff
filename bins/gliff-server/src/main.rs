@@ -102,7 +102,7 @@ fn main() -> Result<()> {
 
 async fn serve<R, W>(rd: R, wr: W, cfg: session::Config) -> Result<()>
 where
-    R: AsyncRead + Unpin + 'static,
+    R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + 'static,
 {
     match session::run(rd, wr, cfg).await {

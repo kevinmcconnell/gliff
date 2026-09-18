@@ -4,6 +4,7 @@ use std::collections::VecDeque;
 use std::ops::ControlFlow;
 use std::os::fd::AsFd;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -59,7 +60,7 @@ fn now_ms() -> u64 {
 
 pub async fn run<R, W>(rd: R, wr: W, cfg: Config) -> Result<()>
 where
-    R: AsyncRead + Unpin + 'static,
+    R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + 'static,
 {
     let mut reader = Framed::new(rd);
@@ -93,12 +94,14 @@ where
         })
         .await?;
     let stream = (output.width, output.height);
-    send_stream_config(&mut writer, codec, chroma, &output, stream).await?;
+    writer
+        .write_msg(&stream_config(codec, chroma, &output, stream))
+        .await?;
 
     let (cap_tx, mut cap_rx) = mpsc::unbounded_channel();
     let capturer = start_capture(&cfg.target, &output.name, &cfg.render_node, cap_tx)?;
 
-    let input = start_input(&cfg.target, &output.name, &keymap)?;
+    let input = Arc::new(start_input(&cfg.target, &output.name, &keymap)?);
     input.send(output.logical_extent()).ok();
 
     let (clip_out_tx, mut clip_out_rx) = mpsc::unbounded_channel::<String>();
@@ -118,11 +121,13 @@ where
     let encoder = Encoder::new(&gpu, settings.clone(), chroma == ChromaMode::Dual420)
         .context("create encoder")?;
 
-    let (mut msg_rx, mut clip_in_rx) = spawn_reader(reader);
+    let (mut msg_rx, mut clip_in_rx) = spawn_reader(reader, input.clone());
+    let (out, queued_frames) = spawn_writer(writer);
 
     capturer.request_frame().ok();
     let mut session = Session {
-        writer,
+        out,
+        queued_frames,
         gpu,
         instance,
         output,
@@ -135,6 +140,7 @@ where
         encoder,
         input,
         capturer,
+        resize_request: None,
         pending: None,
         capture_asked: true,
         blocked_noted: false,
@@ -150,7 +156,7 @@ where
     loop {
         let flow = tokio::select! {
             msg = msg_rx.recv() => match msg {
-                Some(msg) => session.on_client_msg(msg).await?,
+                Some(msg) => session.on_client_msg(msg)?,
                 None => {
                     tracing::info!("client disconnected");
                     ControlFlow::Break(())
@@ -158,7 +164,7 @@ where
             },
             text = clip_out_rx.recv() => {
                 if let Some(text) = text {
-                    session.send_clipboard(text).await?;
+                    session.send_clipboard(text)?;
                 }
                 ControlFlow::Continue(())
             }
@@ -168,10 +174,13 @@ where
                 }
                 ControlFlow::Continue(())
             }
-            ev = cap_rx.recv() => session.on_capture(ev).await?,
+            ev = cap_rx.recv() => session.on_capture(ev)?,
         };
         if flow.is_break() {
             break;
+        }
+        if let Some((w, h, scale)) = session.resize_request.take() {
+            session.resize(w, h, scale).await?;
         }
         session.pump_encoder().await?;
     }
@@ -211,47 +220,126 @@ where
     }
 }
 
-/// Drain the socket on its own task so a burst of input (a mouse drag) can
-/// never starve frame capture and a blocked write can never block reads.
-/// Clipboard payloads are consumed inline and delivered as text.
+/// Drain the socket on its own thread. Input is injected from there, so a
+/// key or pointer event never waits behind an encode or a blocked write on
+/// the session thread; everything else is handed over on a channel. Clipboard
+/// payloads are consumed inline and delivered as text.
 fn spawn_reader<R>(
     mut reader: Framed<R>,
+    input: Arc<Input>,
 ) -> (UnboundedReceiver<ClientMsg>, UnboundedReceiver<String>)
 where
-    R: AsyncRead + Unpin + 'static,
+    R: AsyncRead + Unpin + Send + 'static,
 {
     let (msg_tx, msg_rx) = mpsc::unbounded_channel();
     let (clip_tx, clip_rx) = mpsc::unbounded_channel();
-    tokio::task::spawn_local(async move {
-        loop {
-            match reader.read_msg::<ClientMsg>().await {
-                Ok(ClientMsg::ClipboardData { data_len, .. }) => {
-                    if data_len as u64 > gliff_proto::CLIPBOARD_MAX {
-                        break;
-                    }
-                    match reader.read_payload(data_len).await {
-                        Ok(bytes) => {
-                            if let Ok(text) = String::from_utf8(bytes.to_vec()) {
-                                let _ = clip_tx.send(text);
+    std::thread::Builder::new()
+        .name("gliff-reader".into())
+        .spawn(move || {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            rt.block_on(async move {
+                loop {
+                    match reader.read_msg::<ClientMsg>().await {
+                        Ok(ClientMsg::ClipboardData { data_len, .. }) => {
+                            if data_len as u64 > gliff_proto::CLIPBOARD_MAX {
+                                break;
+                            }
+                            match reader.read_payload(data_len).await {
+                                Ok(bytes) => {
+                                    if let Ok(text) = String::from_utf8(bytes.to_vec()) {
+                                        let _ = clip_tx.send(text);
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        Ok(msg) => {
+                            if let Some(cmd) = input_cmd(&msg) {
+                                if input.send(cmd).is_err() {
+                                    break;
+                                }
+                            } else if msg_tx.send(msg).is_err() {
+                                break;
                             }
                         }
                         Err(_) => break,
                     }
                 }
-                Ok(msg) => {
-                    if msg_tx.send(msg).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    });
+            });
+        })
+        .expect("spawn reader thread");
     (msg_rx, clip_rx)
 }
 
-struct Session<W> {
-    writer: Framed<W>,
+/// The input injection a client message asks for, if it is one.
+fn input_cmd(msg: &ClientMsg) -> Option<InputCmd> {
+    Some(match *msg {
+        ClientMsg::Key { keycode, pressed } => InputCmd::Key {
+            code: keycode,
+            pressed,
+        },
+        ClientMsg::PointerMotion { x, y } => InputCmd::Motion { x, y },
+        ClientMsg::PointerButton { button, pressed } => InputCmd::Button { button, pressed },
+        ClientMsg::PointerAxis {
+            axis,
+            value,
+            discrete,
+            stop,
+        } => InputCmd::Axis {
+            axis: match axis {
+                gliff_proto::Axis::Vertical => InAxis::Vertical,
+                gliff_proto::Axis::Horizontal => InAxis::Horizontal,
+            },
+            value,
+            discrete,
+            stop,
+        },
+        _ => return None,
+    })
+}
+
+/// A message and the payloads that follow it on the wire.
+struct Outgoing {
+    msg: ServerMsg,
+    payloads: Vec<Vec<u8>>,
+    video: bool,
+}
+
+/// Write on a separate task so a write that blocks on a full link stalls
+/// neither acks nor capture. The counter is the video frames handed over and
+/// not yet fully written, so the session can see the link is behind.
+fn spawn_writer<W>(mut writer: Framed<W>) -> (UnboundedSender<Outgoing>, Arc<AtomicU32>)
+where
+    W: AsyncWrite + Unpin + 'static,
+{
+    let (tx, mut rx) = mpsc::unbounded_channel::<Outgoing>();
+    let queued = Arc::new(AtomicU32::new(0));
+    let counter = queued.clone();
+    tokio::task::spawn_local(async move {
+        while let Some(out) = rx.recv().await {
+            let payloads: Vec<&[u8]> = out.payloads.iter().map(|p| p.as_slice()).collect();
+            let r = writer.write_msg_with_payloads(&out.msg, &payloads).await;
+            if out.video {
+                counter.fetch_sub(1, Ordering::AcqRel);
+            }
+            if let Err(e) = r {
+                tracing::info!(error = %e, "write failed; closing");
+                break;
+            }
+        }
+    });
+    (tx, queued)
+}
+
+struct Session {
+    out: UnboundedSender<Outgoing>,
+    /// Video frames handed to the writer and not yet on the wire.
+    queued_frames: Arc<AtomicU32>,
     gpu: Arc<Gpu>,
     instance: hypr_ipc::Instance,
     output: SessionOutput,
@@ -264,8 +352,10 @@ struct Session<W> {
     chroma: ChromaMode,
     settings: EncoderSettings,
     encoder: Encoder,
-    input: Input,
+    input: Arc<Input>,
     capturer: Capturer,
+    /// A Resize from the client, applied on the session loop.
+    resize_request: Option<(u32, u32, f32)>,
     /// The newest captured frame not yet encoded.
     pending: Option<CapturedFrame>,
     capture_asked: bool,
@@ -287,8 +377,22 @@ struct Session<W> {
 /// take too long to send.
 const MIN_RC_FPS: u32 = 5;
 
-impl<W: AsyncWrite + Unpin> Session<W> {
-    async fn on_client_msg(&mut self, msg: ClientMsg) -> Result<ControlFlow<()>> {
+impl Session {
+    /// Queue a message for the writer. A closed writer ends the session.
+    fn send(&self, msg: ServerMsg, payloads: Vec<Vec<u8>>, video: bool) -> Result<()> {
+        if video {
+            self.queued_frames.fetch_add(1, Ordering::AcqRel);
+        }
+        self.out
+            .send(Outgoing {
+                msg,
+                payloads,
+                video,
+            })
+            .map_err(|_| anyhow::anyhow!("connection closed"))
+    }
+
+    fn on_client_msg(&mut self, msg: ClientMsg) -> Result<ControlFlow<()>> {
         match msg {
             ClientMsg::Bye => return Ok(ControlFlow::Break(())),
             ClientMsg::FrameAck {
@@ -303,46 +407,28 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                 }
             }
             ClientMsg::RequestKeyframe => self.want_keyframe = true,
-            ClientMsg::Key { keycode, pressed } => self.inject(InputCmd::Key {
-                code: keycode,
-                pressed,
-            }),
-            ClientMsg::PointerMotion { x, y } => self.inject(InputCmd::Motion { x, y }),
-            ClientMsg::PointerButton { button, pressed } => {
-                self.inject(InputCmd::Button { button, pressed })
-            }
-            ClientMsg::PointerAxis {
-                axis,
-                value,
-                discrete,
-                stop,
-            } => {
-                let axis = match axis {
-                    gliff_proto::Axis::Vertical => InAxis::Vertical,
-                    gliff_proto::Axis::Horizontal => InAxis::Horizontal,
-                };
-                self.inject(InputCmd::Axis {
-                    axis,
-                    value,
-                    discrete,
-                    stop,
-                })
-            }
+            // Input is injected by the reader thread.
+            ClientMsg::Key { .. }
+            | ClientMsg::PointerMotion { .. }
+            | ClientMsg::PointerButton { .. }
+            | ClientMsg::PointerAxis { .. } => {}
             ClientMsg::Resize {
                 width,
                 height,
                 scale,
-            } => self.resize(width, height, scale).await?,
-            ClientMsg::Ping { t } => {
-                self.writer
-                    .write_msg(&ServerMsg::Pong {
-                        t,
-                        server_now_ms: now_ms(),
-                    })
-                    .await?
+            } => {
+                self.resize_request = Some((width, height, scale));
             }
-            // ClipboardData is consumed by the reader task; the offer/request
-            // negotiation is not used for text.
+            ClientMsg::Ping { t } => self.send(
+                ServerMsg::Pong {
+                    t,
+                    server_now_ms: now_ms(),
+                },
+                Vec::new(),
+                false,
+            )?,
+            // ClipboardData is consumed by the reader thread; the
+            // offer/request negotiation is not used for text.
             ClientMsg::ClipboardData { .. }
             | ClientMsg::ClipboardOffer { .. }
             | ClientMsg::ClipboardRequest { .. } => {}
@@ -445,14 +531,11 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         }
         self.output.scale = applied;
         self.inject(self.output.logical_extent());
-        send_stream_config(
-            &mut self.writer,
-            self.codec,
-            self.chroma,
-            &self.output,
-            self.stream,
+        self.send(
+            stream_config(self.codec, self.chroma, &self.output, self.stream),
+            Vec::new(),
+            false,
         )
-        .await
     }
 
     /// A mirrored screen keeps its size; when it is larger than the client's
@@ -487,14 +570,11 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                 self.stream = stream;
                 self.pending = None;
                 self.want_keyframe = true;
-                send_stream_config(
-                    &mut self.writer,
-                    self.codec,
-                    self.chroma,
-                    &self.output,
-                    self.stream,
+                self.send(
+                    stream_config(self.codec, self.chroma, &self.output, self.stream),
+                    Vec::new(),
+                    false,
                 )
-                .await
             }
             Err(e) => {
                 tracing::warn!(error = %e, "encoder rejected the fitted size; keeping the current one");
@@ -526,7 +606,7 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         seen.unwrap_or(scale)
     }
 
-    async fn send_clipboard(&mut self, text: String) -> Result<()> {
+    fn send_clipboard(&mut self, text: String) -> Result<()> {
         let bytes = text.into_bytes();
         let total = bytes.len() as u64;
         let msg = ServerMsg::ClipboardData {
@@ -535,10 +615,10 @@ impl<W: AsyncWrite + Unpin> Session<W> {
             total,
             data_len: bytes.len() as u32,
         };
-        Ok(self.writer.write_msg_with_payloads(&msg, &[&bytes]).await?)
+        self.send(msg, vec![bytes], false)
     }
 
-    async fn on_capture(&mut self, ev: Option<Incoming>) -> Result<ControlFlow<()>> {
+    fn on_capture(&mut self, ev: Option<Incoming>) -> Result<ControlFlow<()>> {
         match ev {
             Some(Incoming::Frame(image)) => {
                 self.pending = Some(image);
@@ -561,17 +641,19 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                     hot_y,
                     argb_len: argb.len() as u32,
                 };
-                self.writer.write_msg_with_payloads(&msg, &[&argb]).await?;
+                self.send(msg, vec![argb], false)?;
             }
             Some(Incoming::CursorPos { x, y, visible }) => {
-                self.writer
-                    .write_msg(&ServerMsg::CursorPos {
+                self.send(
+                    ServerMsg::CursorPos {
                         x,
                         y,
                         shape_id: self.cursor_shape_id,
                         visible,
-                    })
-                    .await?;
+                    },
+                    Vec::new(),
+                    false,
+                )?;
             }
             Some(Incoming::Stopped) => {
                 tracing::warn!("capture stopped");
@@ -586,15 +668,23 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         Ok(ControlFlow::Continue(()))
     }
 
-    /// Encode and send the pending frame if the client has ack capacity, then
-    /// ask the capture thread for the next one.
+    /// The client has ack capacity and the previous frame has left for the
+    /// wire, so encoding another now will not build a queue.
+    fn can_send(&self) -> bool {
+        self.in_flight < self.n_limit && self.queued_frames.load(Ordering::Acquire) == 0
+    }
+
+    /// Encode and send the pending frame if the link can take it, then ask
+    /// the capture thread for the next one. While the link cannot take a
+    /// frame, capture continues so the frame that eventually goes out is the
+    /// newest, not the one that was waiting.
     async fn pump_encoder(&mut self) -> Result<()> {
         // Count a blocked frame once, not once per event-loop pass.
-        if self.pending.is_some() && self.in_flight >= self.n_limit && !self.blocked_noted {
+        if self.pending.is_some() && !self.can_send() && !self.blocked_noted {
             self.bitrate_ctl.note_blocked();
             self.blocked_noted = true;
         }
-        if self.in_flight < self.n_limit {
+        if self.can_send() {
             if let Some(frame) = self.pending.take() {
                 // Ask for the next frame before this one encodes, so the
                 // compositor prepares it while the GPU is busy.
@@ -606,9 +696,7 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                 }
             }
         }
-        if self.pending.is_none() && self.in_flight < self.n_limit {
-            self.request_capture();
-        }
+        self.request_capture();
         Ok(())
     }
 
@@ -655,20 +743,18 @@ impl<W: AsyncWrite + Unpin> Session<W> {
             data_len: encoded.main.len() as u32,
             aux_len: aux.len() as u32,
         };
-        self.writer
-            .write_msg_with_payloads(&msg, &[&encoded.main, &aux])
-            .await?;
+        let bytes = encoded.main.len() + aux.len();
+        self.send(msg, vec![encoded.main, aux], true)?;
         tracing::debug!(
             frame_id = self.frame_id,
             key = encoded.keyframe,
-            main = encoded.main.len(),
-            aux = aux.len(),
+            bytes,
             enc_us,
             in_flight = self.in_flight,
             n_limit = self.n_limit,
             "sent frame"
         );
-        self.rtt.on_sent(self.frame_id, encoded.main.len() + aux.len());
+        self.rtt.on_sent(self.frame_id, bytes);
         self.bitrate_ctl.note_sent();
         self.note_encode_time(enc_us);
         self.frame_id += 1;
@@ -712,18 +798,17 @@ impl Drop for SessionOutput {
     }
 }
 
-async fn send_stream_config<W: AsyncWrite + Unpin>(
-    writer: &mut Framed<W>,
+fn stream_config(
     codec: Codec,
     chroma: ChromaMode,
     output: &SessionOutput,
     stream: (u32, u32),
-) -> Result<()> {
+) -> ServerMsg {
     // The scale the client divides stream pixels by to reach the remote's
     // logical space: the output scale times any downscale of the stream.
     let effective_scale = output.scale * stream.0 as f32 / output.width.max(1) as f32;
     // Parameter sets ride in-band on every keyframe, so extradata is empty.
-    let msg = ServerMsg::StreamConfig {
+    ServerMsg::StreamConfig {
         codec,
         chroma,
         width: stream.0,
@@ -731,8 +816,7 @@ async fn send_stream_config<W: AsyncWrite + Unpin>(
         scale_milli: (effective_scale * 1000.0).round() as u32,
         extradata: Vec::new(),
         aux_extradata: None,
-    };
-    Ok(writer.write_msg(&msg).await?)
+    }
 }
 
 /// The frame rate the stream is paced at, and the ceiling of the pace the
