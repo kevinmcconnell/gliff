@@ -1,5 +1,5 @@
-//! Length-prefixed framing over any tokio `AsyncRead + AsyncWrite`, plus ssh
-//! process spawning for the client.
+//! Length-prefixed framing over any tokio `AsyncRead + AsyncWrite`, the
+//! clipboard transfer engine, plus ssh process spawning for the client.
 //!
 //! Each frame is a postcard-encoded message (`ClientMsg`/`ServerMsg`) preceded
 //! by a `u32` little-endian length, optionally followed by raw payload bytes
@@ -7,6 +7,7 @@
 //! through postcard; the writer sends them with `write_vectored` and the reader
 //! returns them as a `Bytes` slice for the decoder.
 
+pub mod clipboard;
 mod ssh;
 
 use bytes::{Bytes, BytesMut};
