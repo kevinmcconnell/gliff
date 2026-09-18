@@ -562,6 +562,9 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         }
         if self.in_flight < self.n_limit {
             if let Some(frame) = self.pending.take() {
+                // Ask for the next frame before this one encodes, so the
+                // compositor prepares it while the GPU is busy.
+                self.request_capture();
                 // A frame captured before a resize took effect is stale.
                 let info = &frame.buffer.info;
                 if (info.width & !1, info.height & !1) == (self.output.width, self.output.height) {
@@ -569,11 +572,17 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                 }
             }
         }
-        if !self.capture_asked && self.pending.is_none() && self.in_flight < self.n_limit {
+        if self.pending.is_none() && self.in_flight < self.n_limit {
+            self.request_capture();
+        }
+        Ok(())
+    }
+
+    fn request_capture(&mut self) {
+        if !self.capture_asked {
             self.capturer.request_frame().ok();
             self.capture_asked = true;
         }
-        Ok(())
     }
 
     async fn encode_and_send(&mut self, frame: &CapturedFrame) -> Result<()> {

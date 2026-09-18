@@ -97,6 +97,25 @@ enum Cmd {
         #[arg(long, default_value_t = 30)]
         frames: usize,
     },
+    /// Stream from a running `gliff-server --listen` for a while and report
+    /// frame rate, interval jitter, end-to-end latency and bandwidth
+    StreamBench {
+        #[arg(long, default_value = "127.0.0.1:9000")]
+        connect: String,
+        #[arg(long, default_value_t = 10.0)]
+        seconds: f64,
+        /// Ask the server for this stream size (0 = leave it alone).
+        #[arg(long, default_value_t = 0)]
+        width: u32,
+        #[arg(long, default_value_t = 0)]
+        height: u32,
+        /// Ack frames without decoding them (server-side throughput only).
+        #[arg(long)]
+        no_decode: bool,
+        /// Write one CSV row per frame here.
+        #[arg(long)]
+        csv: Option<PathBuf>,
+    },
     /// Watch or set the compositor's text clipboard (ext-data-control)
     Clipboard {
         /// Set the selection to this text and hold it, instead of watching.
@@ -151,6 +170,14 @@ fn main() -> Result<()> {
         } => input(&target, output, &text, click)?,
         Cmd::Pipeline { output } => pipeline(&target, &node, output)?,
         Cmd::ServeTest { connect, frames } => serve_test(&node, &connect, frames)?,
+        Cmd::StreamBench {
+            connect,
+            seconds,
+            width,
+            height,
+            no_decode,
+            csv,
+        } => stream_bench(&node, &connect, seconds, (width, height), no_decode, csv.as_deref())?,
         Cmd::Clipboard { set, secs } => clipboard(&target, set, secs)?,
         Cmd::Bench { iters } => bench(iters)?,
         Cmd::All => {
@@ -489,6 +516,146 @@ fn serve_test(node: &std::path::Path, addr: &str, frames: usize) -> Result<()> {
             let what = if session.headless { "server applied the requested output scale" } else { "server scaled the mirrored screen down to the window" };
             status(scaled, what);
         }
+        Ok::<(), anyhow::Error>(())
+    })?;
+    Ok(())
+}
+
+fn percentile(sorted: &[f64], p: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let i = ((sorted.len() - 1) as f64 * p).round() as usize;
+    sorted[i.min(sorted.len() - 1)]
+}
+
+fn stats(label: &str, unit: &str, mut v: Vec<f64>) {
+    if v.is_empty() {
+        println!("  {label:<18} n/a");
+        return;
+    }
+    v.sort_by(|a, b| a.total_cmp(b));
+    let mean = v.iter().sum::<f64>() / v.len() as f64;
+    println!(
+        "  {label:<18} mean {mean:7.2} {unit}  p50 {:7.2}  p95 {:7.2}  max {:7.2}",
+        percentile(&v, 0.5),
+        percentile(&v, 0.95),
+        v[v.len() - 1]
+    );
+}
+
+fn stream_bench(
+    node: &std::path::Path,
+    addr: &str,
+    seconds: f64,
+    size: (u32, u32),
+    no_decode: bool,
+    csv: Option<&std::path::Path>,
+) -> Result<()> {
+    use gliff_proto::{ChromaMode, ClientCaps, ClientMsg, Codec, ServerMsg};
+    use gliff_transport::Framed;
+    use std::io::Write;
+    use std::time::Instant;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async move {
+        let stream = tokio::net::TcpStream::connect(addr).await.with_context(|| format!("connect {addr}"))?;
+        stream.set_nodelay(true)?;
+        let (rd, wr) = tokio::io::split(stream);
+        let mut reader = Framed::new(rd);
+        let mut writer = Framed::new(wr);
+        let caps = ClientCaps { codecs: vec![Codec::H264], max_width: 3840, max_height: 2160, chroma: vec![ChromaMode::Dual420, ChromaMode::Single420] };
+        writer.write_msg(&ClientMsg::Hello { version: gliff_proto::PROTOCOL_VERSION, keymap: String::new(), caps }).await?;
+        let ack = reader.read_msg::<ServerMsg>().await?;
+        let ServerMsg::HelloAck { session, .. } = ack else { bail!("expected HelloAck, got {ack:?}") };
+        let cfg = reader.read_msg::<ServerMsg>().await?;
+        let (mut w, mut h, mut chroma) = match cfg { ServerMsg::StreamConfig { width, height, chroma, .. } => (width, height, chroma), o => bail!("expected StreamConfig, got {o:?}") };
+        println!("  connected: headless={} output={} stream {w}x{h} {chroma:?}", session.headless, session.output);
+        if size.0 > 0 && size.1 > 0 {
+            writer.write_msg(&ClientMsg::Resize { width: size.0, height: size.1, scale: 1.0 }).await?;
+        }
+        let gpu = Gpu::open(Some(node))?;
+        let mut decoder = if no_decode { None } else { Some(Decoder::new(&gpu, chroma != ChromaMode::Single420, w, h)?) };
+        let mut csv_out = match csv { Some(p) => Some(std::io::BufWriter::new(std::fs::File::create(p)?)), None => None };
+        if let Some(c) = csv_out.as_mut() { writeln!(c, "t_ms,frame_id,key,bytes,latency_ms,decode_ms")?; }
+
+        let start = Instant::now();
+        let warmup = Duration::from_secs_f64(1.0);
+        let deadline = start + Duration::from_secs_f64(seconds);
+        let mut last_arrival: Option<Instant> = None;
+        let mut intervals = Vec::new();
+        let mut latency_recv = Vec::new();
+        let mut latency_done = Vec::new();
+        let mut decode_ms = Vec::new();
+        let mut sizes = Vec::new();
+        let mut frames = 0u64;
+        let mut keyframes = 0u64;
+        let mut bytes = 0u64;
+        let mut measured_from: Option<Instant> = None;
+        let mut reconfigs = 0u32;
+        while Instant::now() < deadline {
+            let msg = tokio::select! {
+                m = reader.read_msg::<ServerMsg>() => m?,
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => break,
+            };
+            match msg {
+                ServerMsg::VideoFrame { frame_id, keyframe, pts_us, data_len, aux_len, .. } => {
+                    let main = reader.read_payload(data_len).await?;
+                    let aux = if aux_len > 0 { reader.read_payload(aux_len).await?.to_vec() } else { Vec::new() };
+                    let arrived = Instant::now();
+                    let now_us = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_micros() as i64;
+                    let lat_recv = (now_us - pts_us as i64) as f64 / 1000.0;
+                    let t0 = Instant::now();
+                    let mut dec = 0.0;
+                    let mut got_picture = true;
+                    if let Some(d) = decoder.as_mut() {
+                        got_picture = d.decode(&main, &aux)?.is_some();
+                        dec = t0.elapsed().as_secs_f64() * 1000.0;
+                    }
+                    writer.write_msg(&ClientMsg::FrameAck { frame_id, decoded_at_ms: 0 }).await?;
+                    if !got_picture { continue; }
+                    let in_window = arrived.duration_since(start) >= warmup;
+                    if in_window {
+                        if measured_from.is_none() { measured_from = Some(arrived); }
+                        frames += 1;
+                        if keyframe { keyframes += 1; }
+                        bytes += (data_len + aux_len) as u64;
+                        sizes.push((data_len + aux_len) as f64 / 1024.0);
+                        if let Some(prev) = last_arrival { intervals.push(arrived.duration_since(prev).as_secs_f64() * 1000.0); }
+                        latency_recv.push(lat_recv);
+                        latency_done.push(lat_recv + dec);
+                        if decoder.is_some() { decode_ms.push(dec); }
+                    }
+                    last_arrival = Some(arrived);
+                    if let Some(c) = csv_out.as_mut() {
+                        writeln!(c, "{:.1},{frame_id},{},{},{lat_recv:.2},{dec:.2}", arrived.duration_since(start).as_secs_f64() * 1000.0, keyframe as u8, data_len + aux_len)?;
+                    }
+                }
+                ServerMsg::StreamConfig { width, height, chroma: c, scale_milli, .. } => {
+                    w = width; h = height; chroma = c; reconfigs += 1;
+                    println!("  reconfig to {w}x{h} {chroma:?} scale {scale_milli}");
+                    if decoder.is_some() { decoder = Some(Decoder::new(&gpu, chroma != ChromaMode::Single420, w, h)?); }
+                    last_arrival = None;
+                }
+                ServerMsg::CursorShape { argb_len, .. } => { let _ = reader.read_payload(argb_len).await?; }
+                ServerMsg::ClipboardData { data_len, .. } => { let _ = reader.read_payload(data_len).await?; }
+                _ => {}
+            }
+        }
+        writer.write_msg(&ClientMsg::Bye).await?;
+        let span = measured_from.map(|t| last_arrival.unwrap_or(t).duration_since(t).as_secs_f64()).unwrap_or(0.0).max(0.001);
+        let fps = frames as f64 / span;
+        let mbit = bytes as f64 * 8.0 / 1e6 / span;
+        println!("  {w}x{h} {chroma:?}: {frames} frames in {span:.1} s ({keyframes} keyframes, {reconfigs} reconfigs)");
+        println!("  fps {fps:.1}   {mbit:.1} Mbit/s   decode={}", !no_decode);
+        stats("interval", "ms", intervals);
+        stats("latency to recv", "ms", latency_recv);
+        stats("latency decoded", "ms", latency_done);
+        stats("decode", "ms", decode_ms);
+        stats("frame size", "KiB", sizes);
+        println!("RESULT fps={fps:.1} mbit={mbit:.1}");
         Ok::<(), anyhow::Error>(())
     })?;
     Ok(())
