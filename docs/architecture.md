@@ -37,11 +37,11 @@ video, cursor and pongs flow server→client.
 | Crate | Role | `unsafe` |
 |---|---|---|
 | `gliff-proto` | wire messages, framing header, CPU reference for colour and the AVC444 split/recombine | none |
-| `gliff-transport` | `Framed` length-prefixed IO with out-of-band payloads (`write_vectored`), ssh spawn | none |
+| `gliff-transport` | `Framed` length-prefixed IO with out-of-band payloads (`write_vectored`), the clipboard transfer engine and file spool, ssh spawn | none |
 | `hypr-ipc` | Hyprland control socket (instance discovery, outputs, options) | none |
 | `hypr-wl` | shared Wayland plumbing (connect, globals, output/seat tracking, calloop runner) | none |
 | `hypr-capture` | output + cursor capture into GBM dmabufs on a calloop thread | none |
-| `hypr-input` | virtual keyboard (xkb state) + virtual pointer + text clipboard on calloop threads | none |
+| `hypr-input` | virtual keyboard (xkb state) + virtual pointer + clipboard bridge (mime types and pipes) on calloop threads | none |
 | `gliff-vk` | Vulkan device, dmabuf import/export, split/recombine compute, H.264 encode/decode, header parser | **yes, isolated here** |
 | `gliff-server` | ties capture+input+encoder to the protocol; `--stdio`/`--listen` | none |
 | `gliff` | GTK4/libadwaita UI, decode worker | one block: hands GTK a dmabuf fd |
@@ -142,18 +142,32 @@ round-trip.
   never baked into the video. An image with no visible shape falls back to the
   default pointer (see `hardware-quirks.md` for why Hyprland sends those).
 
-- **Clipboard (text).** The server bridges the compositor's text selection with
-  `ext-data-control-v1` on its own thread; the client bridges `gdk::Clipboard`.
-  A loop guard on each side stops a value it just set from bouncing back. Images
-  and large non-text types are not carried.
+- **Clipboard.** Lazy, typed and chunked; `gliff_proto::clipboard` has the
+  rules and `gliff_transport::clipboard` the engine both peers run. A new
+  selection is announced as an `Offer` of mime types (plus a file list when it
+  holds a `text/uri-list`); the peer advertises the same on its own clipboard
+  and sends a `Request` only when an application there pastes. The item then
+  streams as `Data` chunks of 256 KiB with four chunks in flight per `Ack`, so
+  a large payload cannot stall video or buffer without bound; an in-memory
+  item is capped at 32 MiB and either side may `Abort`. The server bridges
+  `ext-data-control-v1` on its own thread, moving only mime lists and pipe fds;
+  the client bridges `gdk::Clipboard` with a lazy `ContentProvider` subclass,
+  chunks crossing to the network thread through bounded channels. Files are
+  never sent as URIs: the pasting side streams each one into a disk-backed
+  spool directory (removed when the offer is replaced or the session ends)
+  and hands its applications a URI list pointing there. A loop guard on each
+  side (mime-set match on the server, `is_local` on the client) stops a proxy
+  we set from being offered back.
 
 ## Testing
 
 - **Unit tests** cover the pure logic: AVC444 split/recombine losslessness,
   single-stream subsample/upsample, BGRA↔YUV444 colour round-trip, the H.264
   header parser against an x264 stream, framing with payloads and partial
-  writes, the ack-window bounds, keymap building, and Hyprland instance
-  discovery.
+  writes, the ack-window bounds, keymap building, Hyprland instance
+  discovery, and the clipboard rules and engine (mime filtering, URI lists,
+  safe paths, the send window and assembler, chunked transfers between two
+  engines, the size cap, and a spooled directory tree).
 - **`gliff-probe`** is the hardware integration harness: `protocols`,
   `outputs`, `vulkan`, `roundtrip` (synthetic BGRA → encode → decode → PSNR
   against the CPU reference), `capture`, `input`, `pipeline` (a captured
@@ -162,8 +176,9 @@ round-trip.
   touching `gliff-vk`.
 - **`scripts/e2e.sh`** boots a nested Hyprland and asserts PASS across the probe
   checks, the GPU pipeline, both Dual420 and Single420 server-plus-client
-  streams, and the clipboard. It needs a Hyprland session and a GPU with Vulkan
-  Video, so it is not a CI unit test; run it on a target machine.
+  streams, and the clipboard in both directions, as text and as a 1 MiB
+  binary item. It needs a Hyprland session and a GPU with Vulkan Video, so it
+  is not a CI unit test; run it on a target machine.
 
 ## Measurements
 
@@ -186,7 +201,8 @@ lowers quality rather than frame rate.
 
 Built and validated on AMD: capture, input, Vulkan H.264 encode/decode,
 Dual420 and Single420, the server loop, the GTK client, keymap upload, remote
-cursor, shortcut inhibit, reconnect, and the text clipboard bridge.
+cursor, shortcut inhibit, reconnect, and the clipboard bridge (any mime
+type and files, lazily streamed).
 
 Not yet built, roughly in priority order:
 
@@ -207,8 +223,9 @@ Not yet built, roughly in priority order:
    on some driver would also retire the split.
 3. **Verified ssh path** from a cold machine, including the `WAYLAND_DISPLAY` /
    `XDG_RUNTIME_DIR` environment setup, and a systemd user unit if wanted.
-4. **Polish**: multi-output selection UI, image clipboard, and `tc netem` tuning
-   of the adaptive ack window.
+4. **Polish**: multi-output selection UI, `tc netem` tuning of the adaptive
+   ack window, and clipboard progress feedback (a large file paste blocks the
+   pasting application until the spool is complete, with no UI).
 
 See `docs/hardware-quirks.md` for driver-specific behaviour and the low-severity
 items surfaced by code review.
