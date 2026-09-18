@@ -131,15 +131,18 @@ round-trip.
   selection is announced as an `Offer` of mime types (plus a file list when it
   holds a `text/uri-list`); the peer advertises the same on its own clipboard
   and sends a `Request` only when an application there pastes. The item then
-  streams as `Data` chunks of 256 KiB with four chunks in flight per `Ack`, so
-  a large payload cannot stall video or buffer without bound; an in-memory
-  item is capped at 32 MiB and either side may `Abort`. The server bridges
+  streams as `Data` chunks of at most 256 KiB with four chunks in flight per
+  `Ack`, so a large payload cannot stall video or buffer without bound; an
+  in-memory item is capped at 32 MiB, a file at its declared size, and either
+  side may `Abort`. The server bridges
   `ext-data-control-v1` on its own thread, moving only mime lists and pipe fds;
   the client bridges `gdk::Clipboard` with a lazy `ContentProvider` subclass,
   chunks crossing to the network thread through bounded channels. Files are
   never sent as URIs: the pasting side streams each one into a disk-backed
-  spool directory (removed when the offer is replaced or the session ends)
-  and hands its applications a URI list pointing there. A loop guard on each
+  spool directory and hands its applications a URI list pointing there. A
+  spool is removed five minutes after its offer is replaced, so an
+  application can still open what it was just handed, or when the session
+  ends. A loop guard on each
   side (mime-set match on the server, `is_local` on the client) stops a proxy
   we set from being offered back.
 
