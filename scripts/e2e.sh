@@ -7,6 +7,9 @@
 #   2. gliff-probe pipeline: capture one frame and run the whole GPU 4:4:4 path
 #   3. server --listen --headless  + serve-test client  (Dual420 4:4:4)
 #   4. server --listen --headless --low-bandwidth + serve-test (Single420)
+#   5. text clipboard in both directions
+#   6. a 1 MiB binary clipboard item in both directions (chunked)
+#   7. copied files (a directory tree) in both directions, via the spool
 #
 # Exits non-zero on the first failure.
 set -uo pipefail
@@ -87,6 +90,10 @@ run_server_test 9041 "Single420 stream" --low-bandwidth
 
 echo "== 5. clipboard both directions =="
 command -v wl-copy >/dev/null && command -v wl-paste >/dev/null || fail "wl-clipboard not installed"
+# The probe offers its item after a few frames and requests the compositor's
+# item on its own. Wait for both before pasting and killing anything.
+wait_type() { for i in $(seq 1 60); do wl-paste -l 2>/dev/null | grep -qx "$1" && return 0; sleep 0.25; done; return 1; }
+wait_recv() { for i in $(seq 1 60); do grep -q "$1" "$2" && return 0; sleep 0.25; done; return 1; }
 wl-copy "e2e-clip-in" 2>/dev/null
 "$SERVER" --listen 127.0.0.1:9042 --headless --instance "$NEST_SIG" >/tmp/gliff-e2e-server.log 2>&1 &
 csp=$!; PIDS+=("$csp"); sleep 2
@@ -94,12 +101,57 @@ damage & cdp=$!; PIDS+=("$cdp")
 clipf=$(mktemp)
 GLIFF_SEND_CLIP="e2e-clip-out" timeout 20 $PROBE serve-test --connect 127.0.0.1:9042 --frames 200 >"$clipf" 2>&1 &
 clipc=$!; PIDS+=("$clipc")
-sleep 5
+wait_type "text/plain;charset=utf-8" || fail "server never offered the client's text"
+wait_recv "CLIP-RECV:" "$clipf" || fail "client never received the compositor's text"
 pasted=$(wl-paste -n 2>/dev/null)
 kill "$clipc" "$cdp" "$csp" 2>/dev/null
 grep -q "CLIP-RECV: e2e-clip-in" "$clipf" || fail "compositor->client clipboard (got: $(grep CLIP-RECV "$clipf"))"
 [ "$pasted" = "e2e-clip-out" ] || fail "client->compositor clipboard (got: $pasted)"
 rm -f "$clipf"
 echo "   clipboard both directions PASS"
+
+echo "== 6. binary clipboard both directions (1 MiB, chunked) =="
+blob=$(mktemp); head -c 1048576 /dev/urandom >"$blob"
+recvf=$(mktemp); outf=$(mktemp)
+wl-copy --type application/octet-stream <"$blob" 2>/dev/null
+"$SERVER" --listen 127.0.0.1:9043 --headless --instance "$NEST_SIG" >/tmp/gliff-e2e-server.log 2>&1 &
+bsp=$!; PIDS+=("$bsp"); sleep 2
+damage & bdp=$!; PIDS+=("$bdp")
+clipf=$(mktemp)
+GLIFF_SEND_CLIP_FILE="$blob" GLIFF_RECV_CLIP_FILE="$recvf" timeout 20 $PROBE serve-test --connect 127.0.0.1:9043 --frames 200 >"$clipf" 2>&1 &
+bclipc=$!; PIDS+=("$bclipc")
+wait_type "application/octet-stream" || fail "server never offered the client's binary item"
+wait_recv "CLIP-RECV-FILE:" "$clipf" || fail "client never received the compositor's binary item"
+wl-paste --type application/octet-stream >"$outf" 2>/dev/null
+kill "$bclipc" "$bdp" "$bsp" 2>/dev/null
+grep -q "CLIP-RECV-FILE: 1048576 bytes" "$clipf" || fail "compositor->client binary clipboard (got: $(grep CLIP-RECV "$clipf"))"
+cmp -s "$blob" "$recvf" || fail "compositor->client binary clipboard differs"
+cmp -s "$blob" "$outf" || fail "client->compositor binary clipboard differs ($(stat -c %s "$outf") bytes)"
+rm -f "$clipf" "$blob" "$recvf" "$outf"
+echo "   binary clipboard both directions PASS"
+
+echo "== 7. copied files both directions (spooled) =="
+srcd=$(mktemp -d); mkdir -p "$srcd/photos/sub"
+head -c 300000 /dev/urandom >"$srcd/photos/a.bin"; echo "hello" >"$srcd/photos/sub/b.txt"; echo "solo" >"$srcd/solo.txt"
+recvd=$(mktemp -d)
+printf 'file://%s\r\nfile://%s\r\n' "$srcd/photos" "$srcd/solo.txt" | wl-copy --type text/uri-list 2>/dev/null
+"$SERVER" --listen 127.0.0.1:9044 --headless --instance "$NEST_SIG" >/tmp/gliff-e2e-server.log 2>&1 &
+fsp=$!; PIDS+=("$fsp"); sleep 2
+damage & fdp=$!; PIDS+=("$fdp")
+clipf=$(mktemp)
+GLIFF_SEND_CLIP_FILES="$srcd/photos:$srcd/solo.txt" GLIFF_RECV_CLIP_DIR="$recvd" timeout 20 $PROBE serve-test --connect 127.0.0.1:9044 --frames 200 >"$clipf" 2>&1 &
+fclipc=$!; PIDS+=("$fclipc")
+wait_type "text/uri-list" || fail "server never offered the client's files"
+wait_recv "CLIP-RECV-FILES:" "$clipf" || fail "client never received the compositor's files"
+pasted_uris=$(wl-paste --type text/uri-list 2>/dev/null | tr -d '\r')
+kill "$fclipc" "$fdp" "$fsp" 2>/dev/null
+grep -q "CLIP-RECV-FILES: 5 entries" "$clipf" || fail "compositor->client files (probe said: $(grep -iE 'clip|offer|serv|error|panick' "$clipf" | tail -8 | tr '\n' ' '); server said: $(grep -iE 'clip|warn' /tmp/gliff-e2e-server.log | tail -5 | tr '\n' ' '))"
+cmp -s "$srcd/photos/a.bin" "$recvd/photos/a.bin" && cmp -s "$srcd/photos/sub/b.txt" "$recvd/photos/sub/b.txt" && cmp -s "$srcd/solo.txt" "$recvd/solo.txt" || fail "compositor->client files differ"
+spool=$(echo "$pasted_uris" | head -1 | sed 's|^file://||; s|/photos$||')
+[ -n "$spool" ] && [ -d "$spool/photos" ] || fail "client->compositor files: no spool in URI list (got: $pasted_uris)"
+cmp -s "$srcd/photos/a.bin" "$spool/photos/a.bin" && cmp -s "$srcd/photos/sub/b.txt" "$spool/photos/sub/b.txt" && cmp -s "$srcd/solo.txt" "$spool/solo.txt" || fail "client->compositor files differ"
+rm -rf "$spool"
+rm -rf "$clipf" "$srcd" "$recvd"
+echo "   copied files both directions PASS"
 
 echo "E2E PASS: all checks passed"
