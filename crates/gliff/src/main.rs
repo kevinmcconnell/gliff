@@ -68,6 +68,7 @@ struct App {
     frame: paintable::FramePaintable,
     stats: gtk::Label,
     status: gtk::Label,
+    transfers: Rc<clipboard_ui::TransferBars>,
     /// Size of the stream the server is sending, from the last StreamConfig.
     stream_size: Cell<(u32, u32)>,
     /// The remote output's scale: pointer coordinates go in physical / scale.
@@ -151,9 +152,11 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
     picture.set_paintable(Some(&frame));
     let video: gtk::Widget = picture.clone().upcast();
 
+    let transfers = Rc::new(clipboard_ui::TransferBars::new());
     let overlay = gtk::Overlay::new();
     overlay.set_child(Some(&video));
     overlay.add_overlay(&stats);
+    overlay.add_overlay(transfers.widget());
 
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
     content.append(&header);
@@ -166,6 +169,7 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         frame,
         stats: stats.clone(),
         status: status.clone(),
+        transfers,
         stream_size: Cell::new((0, 0)),
         stream_scale: Cell::new(1.0),
         view_size: Cell::new((0, 0)),
@@ -394,7 +398,12 @@ fn poll_status(ui: Rc<App>, rx: Receiver<Status>) {
                     clipboard_ui::read_local(mime_type, reply)
                 }
                 Status::ClipboardTransfer { id, progress } => {
-                    tracing::debug!(id, ?progress, "clipboard paste");
+                    let cancel_via = ui.clone();
+                    ui.transfers.update(id, &progress, move |id| {
+                        if let Some(tx) = cancel_via.input_tx.borrow().clone() {
+                            let _ = tx.send(clipboard::ToWorker::CancelTransfer(id));
+                        }
+                    });
                 }
                 Status::Error(e) => {
                     tracing::error!(error = %e, "connection failed");

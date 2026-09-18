@@ -3,8 +3,10 @@
 //! requests one, and proxies the server's offer as a lazy content provider
 //! whose bytes are fetched only when an application pastes.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use gtk::gdk;
@@ -23,6 +25,7 @@ use gliff_proto::clipboard::{
 };
 use gliff_proto::ClipboardFile;
 use gliff_transport::clipboard::files::{list_files, LocalFiles};
+use gliff_transport::clipboard::progress::{describe, Progress, State};
 
 use crate::clipboard::ToWorker;
 
@@ -260,5 +263,110 @@ mod imp {
                 }
             })
         }
+    }
+}
+
+/// The transfer bars shown over the video while a paste from the server
+/// takes a while: one row per job, with a cancel button. Empty rows are
+/// removed, so the box is only visible while something is in flight.
+pub struct TransferBars {
+    list: gtk::Box,
+    rows: RefCell<HashMap<u32, Row>>,
+}
+
+struct Row {
+    root: gtk::Box,
+    text: gtk::Label,
+    bar: gtk::ProgressBar,
+}
+
+/// How long a failure stays on screen.
+const FAILURE_LINGER: Duration = Duration::from_secs(6);
+
+impl TransferBars {
+    pub fn new() -> Self {
+        let list = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(4)
+            .halign(gtk::Align::Fill)
+            .valign(gtk::Align::End)
+            .visible(false)
+            .css_classes(["transfers"])
+            .build();
+        Self {
+            list,
+            rows: RefCell::default(),
+        }
+    }
+
+    pub fn widget(&self) -> &gtk::Box {
+        &self.list
+    }
+
+    /// Show the state of job `id`; `cancel` is called with the id when the
+    /// user presses the row's button.
+    pub fn update(self: &Rc<Self>, id: u32, p: &Progress, cancel: impl Fn(u32) + 'static) {
+        match &p.state {
+            State::Running => {
+                let mut rows = self.rows.borrow_mut();
+                let row = rows.entry(id).or_insert_with(|| self.add_row(id, cancel));
+                row.text
+                    .set_text(&format!("Pasting {}: {}", p.label, describe(p)));
+                match p.percent() {
+                    Some(pct) => row.bar.set_fraction(pct as f64 / 100.0),
+                    None => row.bar.pulse(),
+                }
+            }
+            State::Done | State::Cancelled => self.remove(id),
+            State::Failed(e) => {
+                let mut rows = self.rows.borrow_mut();
+                let row = rows.entry(id).or_insert_with(|| self.add_row(id, cancel));
+                row.text
+                    .set_text(&format!("Paste of {} failed: {e}", p.label));
+                row.bar.set_visible(false);
+                drop(rows);
+                let this = self.clone();
+                glib::timeout_add_local_once(FAILURE_LINGER, move || this.remove(id));
+            }
+        }
+    }
+
+    fn add_row(&self, id: u32, cancel: impl Fn(u32) + 'static) -> Row {
+        let root = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(8)
+            .css_classes(["transfer"])
+            .build();
+        let column = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(2)
+            .hexpand(true)
+            .build();
+        let text = gtk::Label::builder()
+            .halign(gtk::Align::Start)
+            .ellipsize(gtk::pango::EllipsizeMode::Middle)
+            .build();
+        let bar = gtk::ProgressBar::new();
+        column.append(&text);
+        column.append(&bar);
+        let button = gtk::Button::builder()
+            .icon_name("process-stop-symbolic")
+            .tooltip_text("Cancel")
+            .valign(gtk::Align::Center)
+            .build();
+        button.connect_clicked(move |_| cancel(id));
+        root.append(&column);
+        root.append(&button);
+        self.list.append(&root);
+        self.list.set_visible(true);
+        Row { root, text, bar }
+    }
+
+    fn remove(&self, id: u32) {
+        let mut rows = self.rows.borrow_mut();
+        if let Some(row) = rows.remove(&id) {
+            self.list.remove(&row.root);
+        }
+        self.list.set_visible(!rows.is_empty());
     }
 }
