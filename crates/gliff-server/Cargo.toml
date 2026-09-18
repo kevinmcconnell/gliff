@@ -23,5 +23,4 @@ hypr-capture.workspace = true
 hypr-input.workspace = true
 hypr-ipc.workspace = true
 hypr-wl.workspace = true
-zbus = { version = "5", default-features = false, features = ["tokio"] }
-futures-util = { version = "0.3", default-features = false }
+dbus = "0.9"

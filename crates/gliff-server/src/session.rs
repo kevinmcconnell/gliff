@@ -138,11 +138,11 @@ where
     .map_err(|e| tracing::warn!(error = %e, "clipboard bridge unavailable"))
     .ok();
     let (clip_out_tx, mut clip_out_rx) = outbound_channel();
-    let (report_tx, report_rx) = mpsc::unbounded_channel();
+    let (report_tx, cancel_rx) = notify::start();
     let jobs = Jobs::new(move |id, progress| {
         let _ = report_tx.send((id, progress));
     });
-    notify::start(report_rx, jobs.clone());
+    notify::forward_cancels(cancel_rx, jobs.clone());
     let clipboard = Bridge::new(Transfers::new(clip_out_tx), jobs, compositor_clipboard);
 
     let bitrate_ctl = match cfg.bitrate {

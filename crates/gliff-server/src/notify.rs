@@ -2,91 +2,118 @@
 //! `org.freedesktop.Notifications` on the session bus. The remote side has no
 //! gliff window, so a notification is where progress and cancel live. Daemons
 //! such as mako, dunst and swaync draw the `value` hint as a bar.
+//!
+//! libdbus is blocking, so one thread owns the connection: it posts each
+//! report as it arrives and dispatches the daemon's signals in between.
 
 use std::collections::HashMap;
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use futures_util::StreamExt;
-use tokio::sync::mpsc;
-use zbus::zvariant::Value;
+use dbus::arg::{RefArg, Variant};
+use dbus::blocking::Connection;
+use dbus::message::MatchRule;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use gliff_transport::clipboard::progress::{describe, human_bytes, Jobs, Progress, State};
 
 const APP: &str = "gliff";
 const ICON: &str = "edit-paste-symbolic";
 const CANCEL: &str = "cancel";
+const BUS: &str = "org.freedesktop.Notifications";
+const PATH: &str = "/org/freedesktop/Notifications";
+const CALL_TIMEOUT: Duration = Duration::from_secs(2);
+const POLL: Duration = Duration::from_millis(100);
 
-#[zbus::proxy(
-    interface = "org.freedesktop.Notifications",
-    default_service = "org.freedesktop.Notifications",
-    default_path = "/org/freedesktop/Notifications"
-)]
-trait Notifications {
-    #[allow(clippy::too_many_arguments)]
-    fn notify(
-        &self,
-        app_name: &str,
-        replaces_id: u32,
-        app_icon: &str,
-        summary: &str,
-        body: &str,
-        actions: &[&str],
-        hints: HashMap<&str, Value<'_>>,
-        expire_timeout: i32,
-    ) -> zbus::Result<u32>;
-
-    #[zbus(signal)]
-    fn action_invoked(&self, id: u32, action_key: &str) -> zbus::Result<()>;
-
-    #[zbus(signal)]
-    fn notification_closed(&self, id: u32, reason: u32) -> zbus::Result<()>;
+/// Start the notification thread. Every report sent to the first sender
+/// becomes, or updates, one notification per job; a Cancel pressed on one
+/// arrives as the job's id on the receiver.
+pub fn start() -> (Sender<(u32, Progress)>, UnboundedReceiver<u32>) {
+    let (report_tx, report_rx) = std::sync::mpsc::channel();
+    let (cancel_tx, cancel_rx) = unbounded_channel();
+    let spawned = std::thread::Builder::new()
+        .name("gliff-notify".into())
+        .spawn(move || {
+            if let Err(e) = run(report_rx, cancel_tx) {
+                tracing::warn!(error = %e, "clipboard notifications unavailable");
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::warn!(error = %e, "clipboard notification thread");
+    }
+    (report_tx, cancel_rx)
 }
 
-/// Start the notification task on the current `LocalSet`. Every report from
-/// `reports` becomes, or updates, one notification per job; its Cancel
-/// action cancels the job in `jobs`.
-pub fn start(reports: mpsc::UnboundedReceiver<(u32, Progress)>, jobs: Jobs) {
+/// Cancel, on the current `LocalSet`, every job whose id arrives.
+pub fn forward_cancels(mut cancels: UnboundedReceiver<u32>, jobs: Jobs) {
     tokio::task::spawn_local(async move {
-        if let Err(e) = run(reports, jobs).await {
-            tracing::warn!(error = %e, "clipboard notifications unavailable");
+        while let Some(job) = cancels.recv().await {
+            jobs.cancel(job);
         }
     });
 }
 
-async fn run(mut rx: mpsc::UnboundedReceiver<(u32, Progress)>, jobs: Jobs) -> zbus::Result<()> {
-    let conn = zbus::Connection::session().await?;
-    let proxy = NotificationsProxy::new(&conn).await?;
-    let mut actions = proxy.receive_action_invoked().await?;
-    let mut closed = proxy.receive_notification_closed().await?;
-    let mut notes = Notes::default();
+fn run(reports: Receiver<(u32, Progress)>, cancels: UnboundedSender<u32>) -> dbus::Result<()> {
+    let conn = Connection::new_session()?;
+    let notes = Arc::new(Mutex::new(Notes::default()));
+    let on_action = notes.clone();
+    conn.add_match(
+        MatchRule::new_signal(BUS, "ActionInvoked"),
+        move |(id, key): (u32, String), _, _| {
+            if key == CANCEL {
+                if let Some(job) = on_action.lock().unwrap().job_of(id) {
+                    let _ = cancels.send(job);
+                }
+            }
+            true
+        },
+    )?;
+    let on_close = notes.clone();
+    conn.add_match(
+        MatchRule::new_signal(BUS, "NotificationClosed"),
+        move |(id, _reason): (u32, u32), _, _| {
+            on_close.lock().unwrap().dismissed(id);
+            true
+        },
+    )?;
+    let proxy = conn.with_proxy(BUS, PATH, CALL_TIMEOUT);
     loop {
-        tokio::select! {
-            report = rx.recv() => {
-                let Some((job, p)) = report else { return Ok(()) };
-                let Some(replaces) = notes.slot_for(job, &p) else { continue };
-                let note = render(&p);
-                match proxy
-                    .notify(APP, replaces, ICON, &note.summary, &note.body, &note.actions, note.hints, note.timeout)
-                    .await
-                {
-                    Ok(id) => notes.shown(job, id, p.is_final()),
-                    Err(e) => tracing::debug!(error = %e, "clipboard notification failed"),
-                }
-            }
-            Some(sig) = actions.next() => {
-                if let Ok(a) = sig.args() {
-                    if a.action_key == CANCEL {
-                        if let Some(job) = notes.job_of(a.id) {
-                            jobs.cancel(job);
-                        }
-                    }
-                }
-            }
-            Some(sig) = closed.next() => {
-                if let Ok(c) = sig.args() {
-                    notes.dismissed(c.id);
-                }
+        loop {
+            let (job, p) = match reports.try_recv() {
+                Ok(r) => r,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => return Ok(()),
+            };
+            let Some(replaces) = notes.lock().unwrap().slot_for(job, &p) else {
+                continue;
+            };
+            let note = render(&p);
+            let hints: HashMap<&str, Variant<Box<dyn RefArg>>> = note
+                .hints
+                .into_iter()
+                .map(|(k, v)| (k, Variant(v)))
+                .collect();
+            let sent: dbus::Result<(u32,)> = proxy.method_call(
+                BUS,
+                "Notify",
+                (
+                    APP,
+                    replaces,
+                    ICON,
+                    note.summary.as_str(),
+                    note.body.as_str(),
+                    note.actions,
+                    hints,
+                    note.timeout,
+                ),
+            );
+            match sent {
+                Ok((id,)) => notes.lock().unwrap().shown(job, id, p.is_final()),
+                Err(e) => tracing::debug!(error = %e, "clipboard notification failed"),
             }
         }
+        conn.process(POLL)?;
     }
 }
 
@@ -139,17 +166,17 @@ struct Note {
     summary: String,
     body: String,
     actions: Vec<&'static str>,
-    hints: HashMap<&'static str, Value<'static>>,
+    hints: Vec<(&'static str, Box<dyn RefArg>)>,
     /// Milliseconds; 0 never expires, -1 is the daemon's default.
     timeout: i32,
 }
 
 fn render(p: &Progress) -> Note {
-    let mut hints = HashMap::new();
+    let mut hints: Vec<(&'static str, Box<dyn RefArg>)> = Vec::new();
     match &p.state {
         State::Running => {
             if let Some(pct) = p.percent() {
-                hints.insert("value", Value::I32(pct as i32));
+                hints.push(("value", Box::new(pct as i32)));
             }
             Note {
                 summary: format!("Pasting {}", p.label),
@@ -174,7 +201,7 @@ fn render(p: &Progress) -> Note {
             timeout: -1,
         },
         State::Failed(e) => {
-            hints.insert("urgency", Value::U8(2));
+            hints.push(("urgency", Box::new(2u8)));
             Note {
                 summary: format!("Paste of {} failed", p.label),
                 body: e.clone(),
@@ -200,15 +227,23 @@ mod tests {
         }
     }
 
+    fn hint_i32(n: &Note, key: &str) -> Option<i32> {
+        n.hints
+            .iter()
+            .find(|(k, _)| *k == key)
+            .and_then(|(_, v)| v.as_i64())
+            .map(|v| v as i32)
+    }
+
     #[test]
     fn a_running_paste_has_a_bar_and_a_cancel_action() {
         let n = render(&running(Some(100)));
         assert_eq!(n.summary, "Pasting photos");
         assert_eq!(n.actions, vec!["cancel", "Cancel"]);
-        assert_eq!(n.hints.get("value"), Some(&Value::I32(25)));
+        assert_eq!(hint_i32(&n, "value"), Some(25));
         assert_eq!(n.timeout, 0);
         let unknown = render(&running(None));
-        assert!(!unknown.hints.contains_key("value"));
+        assert_eq!(hint_i32(&unknown, "value"), None);
     }
 
     #[test]
