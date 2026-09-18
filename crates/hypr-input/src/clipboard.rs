@@ -11,7 +11,8 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use calloop::channel::{self, Sender};
-use nix::unistd::pipe;
+use nix::fcntl::OFlag;
+use nix::unistd::pipe2;
 use wayland_client::globals::GlobalListContents;
 use wayland_client::protocol::wl_registry::WlRegistry;
 use wayland_client::protocol::wl_seat::{self, WlSeat};
@@ -239,7 +240,8 @@ impl State {
         if !advertised {
             return Err(Error::Input(format!("selection has no {mime}")));
         }
-        let (read_fd, write_fd) = pipe().map_err(|e| Error::Input(e.to_string()))?;
+        let (read_fd, write_fd) =
+            pipe2(OFlag::O_CLOEXEC).map_err(|e| Error::Input(e.to_string()))?;
         off.receive(mime.to_string(), write_fd.as_fd());
         drop(write_fd);
         let _ = self.conn.flush();
