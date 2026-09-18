@@ -24,7 +24,9 @@ use tokio::sync::{mpsc, oneshot, OnceCell};
 
 use gliff_proto::clipboard::{file_list_body, is_file_mime, MAX_ITEM};
 use gliff_proto::{ClientMsg, ClipboardFile, ClipboardItem, ClipboardMsg};
-use gliff_transport::clipboard::files::{fetch_files, open_source, write_body, LocalFiles, Spool};
+use gliff_transport::clipboard::files::{
+    fetch_files, open_source, retire, write_body, LocalFiles, Spool,
+};
 use gliff_transport::clipboard::{Event, Transfers};
 
 use crate::net::Status;
@@ -73,10 +75,16 @@ impl Bridge {
     pub fn on_peer_msg(&self, msg: ClipboardMsg, payload: Bytes) {
         match self.transfers.on_msg(msg, payload) {
             Some(Event::Offer { mime_types, files }) => {
-                *self.remote.borrow_mut() = RemoteOffer {
-                    files: files.clone(),
-                    ..RemoteOffer::default()
-                };
+                let previous = std::mem::replace(
+                    &mut *self.remote.borrow_mut(),
+                    RemoteOffer {
+                        files: files.clone(),
+                        ..RemoteOffer::default()
+                    },
+                );
+                if let Some(spool) = previous.spool {
+                    retire(spool);
+                }
                 let _ = self
                     .status
                     .send(Status::ClipboardOffer { mime_types, files });

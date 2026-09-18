@@ -3,6 +3,8 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::time::Duration;
 
 use gliff_proto::clipboard::{
     safe_relative_path, top_level, validate_files, FilesError, MAX_FILES_TOTAL, MAX_FILE_ENTRIES,
@@ -160,6 +162,19 @@ impl Spool {
     }
 }
 
+/// How long a replaced offer's spool stays on disk, so an application that
+/// was just handed a URI list into it can still open the files.
+pub const SPOOL_GRACE: Duration = Duration::from_secs(300);
+
+/// Keep a spool alive for [`SPOOL_GRACE`] after its offer is replaced. The
+/// end of the session drops the task, and with it the spool, earlier.
+pub fn retire(spool: Rc<Spool>) {
+    tokio::task::spawn_local(async move {
+        tokio::time::sleep(SPOOL_GRACE).await;
+        drop(spool);
+    });
+}
+
 impl Drop for Spool {
     fn drop(&mut self) {
         if let Err(e) = std::fs::remove_dir_all(&self.dir) {
@@ -227,7 +242,7 @@ pub async fn fetch_files(
         }
         let file = tokio::fs::File::create(&dest).await?;
         transfers
-            .fetch(ClipboardItem::File(i as u32), WriteSink(file), None)
+            .fetch(ClipboardItem::File(i as u32), WriteSink(file), Some(f.size))
             .await?;
     }
     Ok(top_level(files)
