@@ -38,6 +38,8 @@ The clipboard carries any mime type (text, images, application data) and
 copied files in both directions. Nothing moves until something pastes: the
 peer only learns what is offered, then streams the item in chunks when it is
 wanted. Files are spooled to `~/.cache/gliff/clipboard` on the pasting side.
+A paste that takes more than a second shows progress and a cancel button: a
+bar in the gliff window, or a desktop notification on the server.
 
 Not done yet: AV1 for outputs above 4096 wide (H.264 is scaled to fit today)
 and native single-stream 4:4:4; a verified ssh-from-cold-machine path; Intel
