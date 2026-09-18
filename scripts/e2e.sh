@@ -10,6 +10,9 @@
 #   4. server --listen --headless --low-bandwidth + serve-test (Single420, GPU)
 #   5. the CPU tier matrix: cpu<->cpu, gpu server -> cpu client, cpu server ->
 #      gpu client
+#   6. text clipboard in both directions
+#   7. mirrored output resize
+#   8. a 1 MiB binary clipboard item in both directions (chunked)
 #
 # Exits non-zero on the first failure.
 set -uo pipefail
@@ -119,7 +122,7 @@ if [ "$HAS_GPU" = 1 ]; then
     run_server_test 9046 "cpu server -> gpu client" gpu --video cpu
 fi
 
-echo "== 5. clipboard both directions =="
+echo "== 6. text clipboard both directions =="
 command -v wl-copy >/dev/null && command -v wl-paste >/dev/null || fail "wl-clipboard not installed"
 wl-copy "e2e-clip-in" 2>/dev/null
 "$SERVER" --listen 127.0.0.1:9042 --headless --instance "$NEST_SIG" >/tmp/gliff-e2e-server.log 2>&1 &
@@ -136,7 +139,7 @@ grep -q "CLIP-RECV: e2e-clip-in" "$clipf" || fail "compositor->client clipboard 
 rm -f "$clipf"
 echo "   clipboard both directions PASS"
 
-echo "== 6. mirrored output resize =="
+echo "== 7. mirrored output resize =="
 hyprctl output create headless e2emirror >/dev/null 2>&1
 sleep 1
 mirror=$(hyprctl monitors -j | python3 -c "import sys,json; print(next(m['name'] for m in json.load(sys.stdin) if 'e2emirror' in m['name']))")
@@ -168,5 +171,24 @@ grep -q '^FAIL' "$mirror_log" && fail "mirror resize: failed assertion (log: $mi
 kill "$mdp" "$msp" 2>/dev/null
 hyprctl output remove "$mirror" >/dev/null 2>&1
 echo "   mirrored output resize PASS"
+
+echo "== 8. binary clipboard both directions (1 MiB, chunked) =="
+blob=$(mktemp); head -c 1048576 /dev/urandom >"$blob"
+recvf=$(mktemp); outf=$(mktemp)
+wl-copy --type application/octet-stream <"$blob" 2>/dev/null
+"$SERVER" --listen 127.0.0.1:9047 --headless --instance "$NEST_SIG" >/tmp/gliff-e2e-server.log 2>&1 &
+bsp=$!; PIDS+=("$bsp"); sleep 2
+damage & bdp=$!; PIDS+=("$bdp")
+clipf=$(mktemp)
+GLIFF_SEND_CLIP_FILE="$blob" GLIFF_RECV_CLIP_FILE="$recvf" timeout 20 $PROBE --video "$CLIENT_VIDEO" serve-test --connect 127.0.0.1:9047 --frames 200 >"$clipf" 2>&1 &
+bclipc=$!; PIDS+=("$bclipc")
+sleep 5
+wl-paste --type application/octet-stream >"$outf" 2>/dev/null
+kill "$bclipc" "$bdp" "$bsp" 2>/dev/null
+grep -q "CLIP-RECV-FILE: 1048576 bytes" "$clipf" || fail "compositor->client binary clipboard (got: $(grep CLIP-RECV "$clipf"))"
+cmp -s "$blob" "$recvf" || fail "compositor->client binary clipboard differs"
+cmp -s "$blob" "$outf" || fail "client->compositor binary clipboard differs ($(stat -c %s "$outf") bytes)"
+rm -f "$clipf" "$blob" "$recvf" "$outf"
+echo "   binary clipboard both directions PASS"
 
 echo "E2E PASS: all checks passed"
