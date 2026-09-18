@@ -7,6 +7,8 @@
 #   2. gliff-probe pipeline: capture one frame and run the whole GPU 4:4:4 path
 #   3. server --listen --headless  + serve-test client  (Dual420 4:4:4)
 #   4. server --listen --headless --low-bandwidth + serve-test (Single420)
+#   5. text clipboard in both directions
+#   6. a 1 MiB binary clipboard item in both directions (chunked)
 #
 # Exits non-zero on the first failure.
 set -uo pipefail
@@ -101,5 +103,24 @@ grep -q "CLIP-RECV: e2e-clip-in" "$clipf" || fail "compositor->client clipboard 
 [ "$pasted" = "e2e-clip-out" ] || fail "client->compositor clipboard (got: $pasted)"
 rm -f "$clipf"
 echo "   clipboard both directions PASS"
+
+echo "== 6. binary clipboard both directions (1 MiB, chunked) =="
+blob=$(mktemp); head -c 1048576 /dev/urandom >"$blob"
+recvf=$(mktemp); outf=$(mktemp)
+wl-copy --type application/octet-stream <"$blob" 2>/dev/null
+"$SERVER" --listen 127.0.0.1:9043 --headless --instance "$NEST_SIG" >/tmp/gliff-e2e-server.log 2>&1 &
+bsp=$!; PIDS+=("$bsp"); sleep 2
+damage & bdp=$!; PIDS+=("$bdp")
+clipf=$(mktemp)
+GLIFF_SEND_CLIP_FILE="$blob" GLIFF_RECV_CLIP_FILE="$recvf" timeout 20 $PROBE serve-test --connect 127.0.0.1:9043 --frames 200 >"$clipf" 2>&1 &
+bclipc=$!; PIDS+=("$bclipc")
+sleep 5
+wl-paste --type application/octet-stream >"$outf" 2>/dev/null
+kill "$bclipc" "$bdp" "$bsp" 2>/dev/null
+grep -q "CLIP-RECV-FILE: 1048576 bytes" "$clipf" || fail "compositor->client binary clipboard (got: $(grep CLIP-RECV "$clipf"))"
+cmp -s "$blob" "$recvf" || fail "compositor->client binary clipboard differs"
+cmp -s "$blob" "$outf" || fail "client->compositor binary clipboard differs ($(stat -c %s "$outf") bytes)"
+rm -f "$clipf" "$blob" "$recvf" "$outf"
+echo "   binary clipboard both directions PASS"
 
 echo "E2E PASS: all checks passed"

@@ -448,8 +448,30 @@ fn serve_test(node: &std::path::Path, addr: &str, frames: usize) -> Result<()> {
         let mut got = 0usize;
         let mut keyframes = 0usize;
         let mut scaled = false;
+        // GLIFF_SEND_CLIP offers text; GLIFF_SEND_CLIP_FILE offers a file as
+        // application/octet-stream. GLIFF_RECV_CLIP_FILE stores a received
+        // octet-stream. Text received is printed as CLIP-RECV.
+        use gliff_proto::clipboard::{is_text_mime, CHUNK, TEXT_MIME, TEXT_MIMES, WINDOW};
+        const OCTET: &str = "application/octet-stream";
         let send_clip = std::env::var("GLIFF_SEND_CLIP").ok();
+        let send_file = std::env::var("GLIFF_SEND_CLIP_FILE").ok().map(|p| std::fs::read(&p).with_context(|| format!("read {p}"))).transpose()?;
+        let recv_file = std::env::var("GLIFF_RECV_CLIP_FILE").ok();
         let mut clip_recv: Vec<u8> = Vec::new();
+        let mut recv_mime = String::new();
+        // Outgoing transfer: (id, bytes, next offset); at most WINDOW chunks unacked.
+        let mut serving: Option<(u32, Vec<u8>, usize, u32)> = None;
+        async fn push_chunks<W: tokio::io::AsyncWrite + Unpin>(writer: &mut Framed<W>, serving: &mut Option<(u32, Vec<u8>, usize, u32)>) -> Result<()> {
+            let Some((id, bytes, offset, unacked)) = serving.as_mut() else { return Ok(()) };
+            while *unacked < WINDOW {
+                let end = (*offset + CHUNK).min(bytes.len());
+                let done = end == bytes.len();
+                writer.write_msg_with_payloads(&ClientMsg::ClipboardData { id: *id, offset: *offset as u64, data_len: (end - *offset) as u32, done }, &[&bytes[*offset..end]]).await?;
+                *offset = end;
+                *unacked += 1;
+                if done { *serving = None; return Ok(()); }
+            }
+            Ok(())
+        }
         while got < frames {
             let msg = reader.read_msg::<ServerMsg>().await?;
             match msg {
@@ -462,8 +484,10 @@ fn serve_test(node: &std::path::Path, addr: &str, frames: usize) -> Result<()> {
                     if got == 1 { eprintln!("  first decoded frame ok ({}x{}, main {} aux {} bytes, key {keyframe})", w, h, data_len, aux_len); }
                     writer.write_msg(&ClientMsg::FrameAck { frame_id, decoded_at_ms: 0 }).await?;
                     if got == 3 { writer.write_msg(&ClientMsg::Resize { width: 800, height: 600, scale: 2.0 }).await?; }
-                    if got == 4 && send_clip.is_some() {
-                        let mime_types = gliff_proto::clipboard::TEXT_MIMES.iter().map(|m| m.to_string()).collect();
+                    if got == 4 && (send_clip.is_some() || send_file.is_some()) {
+                        let mut mime_types: Vec<String> = Vec::new();
+                        if send_clip.is_some() { mime_types.extend(TEXT_MIMES.iter().map(|m| m.to_string())); }
+                        if send_file.is_some() { mime_types.push(OCTET.into()); }
                         writer.write_msg(&ClientMsg::ClipboardOffer { mime_types, files: Vec::new() }).await?;
                     }
                 }
@@ -474,26 +498,45 @@ fn serve_test(node: &std::path::Path, addr: &str, frames: usize) -> Result<()> {
                     decoder = Decoder::new(&gpu, chroma != ChromaMode::Single420, w as u32, h as u32)?;
                 }
                 ServerMsg::CursorShape { argb_len, .. } => { let _ = reader.read_payload(argb_len).await?; }
-                // The server offers its selection; ask for the text and print it once complete.
+                // The server offers its selection; ask for one item and keep it once complete.
                 ServerMsg::ClipboardOffer { mime_types, .. } => {
-                    if mime_types.iter().any(|m| gliff_proto::clipboard::is_text_mime(m)) {
+                    eprintln!("  server offers {mime_types:?}");
+                    let want = if recv_file.is_some() && mime_types.iter().any(|m| m == OCTET) { Some(OCTET) }
+                        else if mime_types.iter().any(|m| is_text_mime(m)) { Some(TEXT_MIME) } else { None };
+                    if let Some(mime) = want {
                         clip_recv.clear();
-                        writer.write_msg(&ClientMsg::ClipboardRequest { id: 1, item: gliff_proto::ClipboardItem::Mime(gliff_proto::clipboard::TEXT_MIME.into()) }).await?;
+                        recv_mime = mime.to_string();
+                        writer.write_msg(&ClientMsg::ClipboardRequest { id: 1, item: gliff_proto::ClipboardItem::Mime(mime.into()) }).await?;
                     }
                 }
                 ServerMsg::ClipboardData { id, data_len, done, .. } => {
                     let bytes = reader.read_payload(data_len).await?;
                     clip_recv.extend_from_slice(&bytes);
                     if done {
-                        if let Ok(t) = String::from_utf8(std::mem::take(&mut clip_recv)) { eprintln!("CLIP-RECV: {t}"); }
+                        let data = std::mem::take(&mut clip_recv);
+                        if recv_mime == OCTET {
+                            let path = recv_file.clone().unwrap_or_default();
+                            std::fs::write(&path, &data).with_context(|| format!("write {path}"))?;
+                            eprintln!("CLIP-RECV-FILE: {} bytes", data.len());
+                        } else if let Ok(t) = String::from_utf8(data) { eprintln!("CLIP-RECV: {t}"); }
                     } else {
                         writer.write_msg(&ClientMsg::ClipboardAck { id, received: clip_recv.len() as u64 }).await?;
                     }
                 }
-                // The server pastes our offered text: serve it in one chunk.
-                ServerMsg::ClipboardRequest { id, .. } => {
-                    let bytes = send_clip.clone().unwrap_or_default().into_bytes();
-                    writer.write_msg_with_payloads(&ClientMsg::ClipboardData { id, offset: 0, data_len: bytes.len() as u32, done: true }, &[&bytes]).await?;
+                // The server pastes something we offered: stream it within the window.
+                ServerMsg::ClipboardRequest { id, item } => {
+                    let bytes = match &item {
+                        gliff_proto::ClipboardItem::Mime(m) if m == OCTET => send_file.clone().unwrap_or_default(),
+                        gliff_proto::ClipboardItem::Mime(m) if is_text_mime(m) => send_clip.clone().unwrap_or_default().into_bytes(),
+                        _ => { writer.write_msg(&ClientMsg::ClipboardAbort { id }).await?; continue; }
+                    };
+                    eprintln!("  serving {} bytes for {item:?}", bytes.len());
+                    serving = Some((id, bytes, 0, 0));
+                    push_chunks(&mut writer, &mut serving).await?;
+                }
+                ServerMsg::ClipboardAck { .. } => {
+                    if let Some(s) = serving.as_mut() { s.3 = s.3.saturating_sub(1); }
+                    push_chunks(&mut writer, &mut serving).await?;
                 }
                 ServerMsg::CursorPos { .. } | ServerMsg::Pong { .. } | ServerMsg::Error { .. } => {}
                 _ => {}
