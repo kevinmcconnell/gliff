@@ -3,6 +3,7 @@
 //! requests one, and proxies the server's offer as a lazy content provider
 //! whose bytes are fetched only when an application pastes.
 
+use std::cell::Cell;
 use std::rc::Rc;
 
 use bytes::Bytes;
@@ -39,6 +40,8 @@ pub fn watch_local(sender: impl Fn() -> Option<UnboundedSender<ToWorker>> + 'sta
         return;
     };
     let sender = Rc::new(sender);
+    // Bumped per change so a slow file listing for a stale one is dropped.
+    let selection_gen = Rc::new(Cell::new(0u64));
     cb.connect_changed(move |cb| {
         if cb.is_local() {
             return;
@@ -46,6 +49,9 @@ pub fn watch_local(sender: impl Fn() -> Option<UnboundedSender<ToWorker>> + 'sta
         let Some(tx) = sender() else {
             return;
         };
+        let gen = selection_gen.get() + 1;
+        selection_gen.set(gen);
+        let selection_gen = selection_gen.clone();
         let mimes: Vec<String> = cb
             .formats()
             .mime_types()
@@ -59,6 +65,9 @@ pub fn watch_local(sender: impl Fn() -> Option<UnboundedSender<ToWorker>> + 'sta
             } else {
                 LocalFiles::default()
             };
+            if selection_gen.get() != gen {
+                return;
+            }
             let _ = tx.send(ToWorker::LocalOffer {
                 mime_types: forwardable_mimes(&mimes),
                 files,
