@@ -2,12 +2,9 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub use crate::clipboard::{ClipboardFile, ClipboardItem, ClipboardMsg};
 
-/// Chunk cap for clipboard payloads on the wire.
-pub const CLIPBOARD_CHUNK: usize = 256 * 1024;
-/// Total clipboard transfer cap.
-pub const CLIPBOARD_MAX: u64 = 32 * 1024 * 1024;
+pub const PROTOCOL_VERSION: u16 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Codec {
@@ -101,22 +98,33 @@ pub enum ClientMsg {
         decoded_at_ms: u64,
     },
     RequestKeyframe,
+    /// The local selection changed; see [`ClipboardMsg::Offer`].
     ClipboardOffer {
         mime_types: Vec<String>,
+        files: Vec<ClipboardFile>,
     },
     ClipboardRequest {
-        mime_type: String,
+        id: u32,
+        item: ClipboardItem,
     },
+    /// `data_len` payload bytes follow the header.
     ClipboardData {
-        mime_type: String,
+        id: u32,
         offset: u64,
-        total: u64,
         data_len: u32,
+        done: bool,
     },
     Ping {
         t: u64,
     },
     Bye,
+    ClipboardAck {
+        id: u32,
+        received: u64,
+    },
+    ClipboardAbort {
+        id: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -163,15 +171,17 @@ pub enum ServerMsg {
     },
     ClipboardOffer {
         mime_types: Vec<String>,
+        files: Vec<ClipboardFile>,
     },
     ClipboardRequest {
-        mime_type: String,
+        id: u32,
+        item: ClipboardItem,
     },
     ClipboardData {
-        mime_type: String,
+        id: u32,
         offset: u64,
-        total: u64,
         data_len: u32,
+        done: bool,
     },
     Pong {
         t: u64,
@@ -181,7 +191,73 @@ pub enum ServerMsg {
         code: u16,
         message: String,
     },
+    ClipboardAck {
+        id: u32,
+        received: u64,
+    },
+    ClipboardAbort {
+        id: u32,
+    },
 }
+
+/// The clipboard variants have the same shape in both directions so the
+/// transfer logic can be shared; these convert to and from [`ClipboardMsg`].
+macro_rules! clipboard_bridge {
+    ($msg:ident) => {
+        impl From<ClipboardMsg> for $msg {
+            fn from(m: ClipboardMsg) -> Self {
+                match m {
+                    ClipboardMsg::Offer { mime_types, files } => {
+                        $msg::ClipboardOffer { mime_types, files }
+                    }
+                    ClipboardMsg::Request { id, item } => $msg::ClipboardRequest { id, item },
+                    ClipboardMsg::Data {
+                        id,
+                        offset,
+                        data_len,
+                        done,
+                    } => $msg::ClipboardData {
+                        id,
+                        offset,
+                        data_len,
+                        done,
+                    },
+                    ClipboardMsg::Ack { id, received } => $msg::ClipboardAck { id, received },
+                    ClipboardMsg::Abort { id } => $msg::ClipboardAbort { id },
+                }
+            }
+        }
+
+        impl $msg {
+            /// Split off a clipboard message; any other message is handed back.
+            pub fn into_clipboard(self) -> Result<ClipboardMsg, Self> {
+                Ok(match self {
+                    $msg::ClipboardOffer { mime_types, files } => {
+                        ClipboardMsg::Offer { mime_types, files }
+                    }
+                    $msg::ClipboardRequest { id, item } => ClipboardMsg::Request { id, item },
+                    $msg::ClipboardData {
+                        id,
+                        offset,
+                        data_len,
+                        done,
+                    } => ClipboardMsg::Data {
+                        id,
+                        offset,
+                        data_len,
+                        done,
+                    },
+                    $msg::ClipboardAck { id, received } => ClipboardMsg::Ack { id, received },
+                    $msg::ClipboardAbort { id } => ClipboardMsg::Abort { id },
+                    other => return Err(other),
+                })
+            }
+        }
+    };
+}
+
+clipboard_bridge!(ClientMsg);
+clipboard_bridge!(ServerMsg);
 
 #[cfg(test)]
 mod tests {
@@ -235,5 +311,45 @@ mod tests {
         };
         let bytes = postcard::to_stdvec(&s).unwrap();
         assert_eq!(postcard::from_bytes::<ServerMsg>(&bytes).unwrap(), s);
+    }
+
+    #[test]
+    fn clipboard_messages_bridge_both_directions() {
+        let msgs = vec![
+            ClipboardMsg::Offer {
+                mime_types: vec!["image/png".into()],
+                files: vec![ClipboardFile {
+                    path: "a/b.txt".into(),
+                    size: 3,
+                    dir: false,
+                }],
+            },
+            ClipboardMsg::Request {
+                id: 7,
+                item: ClipboardItem::File(0),
+            },
+            ClipboardMsg::Data {
+                id: 7,
+                offset: 10,
+                data_len: 3,
+                done: true,
+            },
+            ClipboardMsg::Ack {
+                id: 7,
+                received: 13,
+            },
+            ClipboardMsg::Abort { id: 7 },
+        ];
+        for m in msgs {
+            let c = ClientMsg::from(m.clone());
+            let bytes = postcard::to_stdvec(&c).unwrap();
+            let back: ClientMsg = postcard::from_bytes(&bytes).unwrap();
+            assert_eq!(back.into_clipboard(), Ok(m.clone()));
+            let s = ServerMsg::from(m.clone());
+            let bytes = postcard::to_stdvec(&s).unwrap();
+            let back: ServerMsg = postcard::from_bytes(&bytes).unwrap();
+            assert_eq!(back.into_clipboard(), Ok(m));
+        }
+        assert_eq!(ClientMsg::Bye.into_clipboard(), Err(ClientMsg::Bye));
     }
 }
