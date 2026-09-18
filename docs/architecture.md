@@ -158,9 +158,14 @@ round-trip.
   spool directory and hands its applications a URI list pointing there. A
   spool is removed five minutes after its offer is replaced, so an
   application can still open what it was just handed, or when the session
-  ends. A loop guard on each
-  side (mime-set match on the server, `is_local` on the client) stops a proxy
-  we set from being offered back.
+  ends. A loop guard on each side (mime-set match on the server, `is_local`
+  on the client) stops a proxy we set from being offered back. A paste is a
+  job: one that outlasts a quiet second is reported every 250 ms with bytes
+  done, total and rate, until it ends. The client shows a bar with a cancel
+  button over the video; the server, which has no window, posts a desktop
+  notification with a progress bar and a Cancel action over
+  `org.freedesktop.Notifications`. Cancel drops the fetch, which sends
+  `Abort`. A failed paste is always reported, however short.
 
 ## Testing
 
@@ -227,8 +232,9 @@ Not yet built, roughly in priority order:
 3. **Verified ssh path** from a cold machine, including the `WAYLAND_DISPLAY` /
    `XDG_RUNTIME_DIR` environment setup, and a systemd user unit if wanted.
 4. **Polish**: multi-output selection UI, `tc netem` tuning of the adaptive
-   ack window, and clipboard progress feedback (a large file paste blocks the
-   pasting application until the spool is complete, with no UI).
+   ack window, and a lazy file spool (a FUSE mount the pasting application
+   reads through, so its own copy dialog shows progress, instead of spooling
+   every file before the URI list is handed over).
 
 See `docs/hardware-quirks.md` for driver-specific behaviour and the low-severity
 items surfaced by code review.
