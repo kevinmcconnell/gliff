@@ -16,6 +16,7 @@
 //!
 //! No I/O here; the state machines and string helpers are pure.
 
+use std::collections::VecDeque;
 use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -319,28 +320,33 @@ pub fn top_level(files: &[ClipboardFile]) -> impl Iterator<Item = &ClipboardFile
     files.iter().filter(|f| !f.path.contains('/'))
 }
 
-/// Sender-side flow control: bytes sent but not yet acked must stay under
-/// [`WINDOW`] chunks' worth.
+/// Sender-side flow control: at most [`WINDOW`] chunks may be sent but not
+/// yet acked, however small the chunks are, so the receiver's per-transfer
+/// queue never overflows.
 #[derive(Debug, Clone, Default)]
 pub struct SendWindow {
     pub offset: u64,
-    acked: u64,
+    /// End offset of every chunk sent but not yet acked, in order.
+    unacked: VecDeque<u64>,
 }
 
 impl SendWindow {
     pub fn may_send(&self) -> bool {
-        self.offset - self.acked < WINDOW as u64 * CHUNK as u64
+        self.unacked.len() < WINDOW as usize
     }
 
     pub fn on_sent(&mut self, len: usize) {
         self.offset += len as u64;
+        self.unacked.push_back(self.offset);
     }
 
     pub fn on_ack(&mut self, received: u64) -> Result<(), ChunkError> {
         if received > self.offset {
             return Err(ChunkError::BadAck { received });
         }
-        self.acked = self.acked.max(received);
+        while self.unacked.front().is_some_and(|&end| end <= received) {
+            self.unacked.pop_front();
+        }
         Ok(())
     }
 }
@@ -548,8 +554,26 @@ mod tests {
             })
         );
         w.on_ack(w.offset).unwrap();
+        assert!(w.may_send());
+    }
+
+    #[test]
+    fn send_window_counts_chunks_not_bytes() {
+        let mut w = SendWindow::default();
+        for _ in 0..WINDOW {
+            assert!(w.may_send());
+            w.on_sent(1);
+        }
+        assert!(!w.may_send());
         w.on_ack(1).unwrap();
         assert!(w.may_send());
+        w.on_sent(1);
+        assert!(!w.may_send());
+        w.on_ack(3).unwrap();
+        assert!(w.may_send());
+        w.on_sent(1);
+        w.on_sent(1);
+        assert!(!w.may_send());
     }
 
     #[test]
