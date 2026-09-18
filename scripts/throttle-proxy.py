@@ -14,42 +14,44 @@ import sys
 import time
 
 
-async def shape(reader, writer, mbit, delay_ms, queue_bytes):
-    rate = mbit * 1e6 / 8
-    tokens = 0.0
-    last = time.monotonic()
-    chunk = 4096
-    delay = delay_ms / 1000.0
-    pending = []
+async def delayed_writer(queue, writer):
     try:
         while True:
-            data = await reader.read(chunk)
-            if not data:
+            due, data = await queue.get()
+            if data is None:
                 break
             now = time.monotonic()
-            tokens = min(queue_bytes, tokens + (now - last) * rate)
-            last = now
-            if tokens < len(data):
-                wait = (len(data) - tokens) / rate
-                await asyncio.sleep(wait)
-                tokens = 0.0
-                last = time.monotonic()
-            else:
-                tokens -= len(data)
-            if delay > 0:
-                pending.append((time.monotonic() + delay, data))
-                while pending and pending[0][0] <= time.monotonic():
-                    writer.write(pending.pop(0)[1])
-                if pending:
-                    due, d = pending[0]
-                    await asyncio.sleep(max(0.0, due - time.monotonic()))
-                    writer.write(d)
-                    pending.pop(0)
-            else:
-                writer.write(data)
+            if due > now:
+                await asyncio.sleep(due - now)
+            writer.write(data)
             await writer.drain()
     finally:
         writer.close()
+
+
+async def shape(reader, writer, mbit, delay_ms, queue_bytes):
+    """Token-bucket shaping of one direction, then a fixed delay. The bucket
+    depth is the router queue: bytes beyond it wait, which stalls the sender."""
+    rate = mbit * 1e6 / 8
+    delay = delay_ms / 1000.0
+    queue = asyncio.Queue()
+    consumer = asyncio.create_task(delayed_writer(queue, writer))
+    next_free = time.monotonic()
+    try:
+        while True:
+            data = await reader.read(16384)
+            if not data:
+                break
+            now = time.monotonic()
+            next_free = max(next_free, now)
+            backlog = (next_free - now) * rate
+            if backlog > queue_bytes:
+                await asyncio.sleep((backlog - queue_bytes) / rate)
+            next_free += len(data) / rate
+            await queue.put((next_free + delay, data))
+    finally:
+        await queue.put((0, None))
+        await consumer
 
 
 async def pipe(reader, writer, delay_ms):

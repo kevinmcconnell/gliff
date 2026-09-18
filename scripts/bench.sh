@@ -19,6 +19,14 @@ echo "=== $LABEL ($BIN, ${W}x${H}, $* )"
 RUST_LOG=${SERVER_LOG:-info} "$BIN/gliff-server" --listen "127.0.0.1:$PORT" --instance "$NEST" --output "$MON" "$@" >"/tmp/gliff-bench-server-$LABEL.log" 2>&1 &
 SP=$!
 sleep 2
-target/release/gliff-probe stream-bench --connect "127.0.0.1:$PORT" --seconds "$SECS" --width "$W" --height "$H" ${BENCH_ARGS:-} 2>&1 | grep -v "^RESULT"
-kill $SP 2>/dev/null; wait $SP 2>/dev/null
-grep -c "adapting bitrate" "/tmp/gliff-bench-server-$LABEL.log" | sed "s/^/  bitrate adaptations: /"; true
+CPORT=$PORT
+if [ -n "${BENCH_MBIT:-}" ]; then
+    CPORT=$((PORT + 1))
+    python3 scripts/throttle-proxy.py "$CPORT" "$PORT" "$BENCH_MBIT" "${BENCH_DELAY_MS:-0}" "${BENCH_QUEUE_KB:-64}" &
+    PP=$!
+    sleep 0.5
+    echo "  link: $BENCH_MBIT Mbit/s, ${BENCH_DELAY_MS:-0} ms one-way, ${BENCH_QUEUE_KB:-64} KiB queue"
+fi
+target/release/gliff-probe stream-bench --connect "127.0.0.1:$CPORT" --seconds "$SECS" --width "$W" --height "$H" ${BENCH_ARGS:-} 2>&1 | grep -v "^RESULT"
+kill $SP ${PP:-} 2>/dev/null; wait $SP 2>/dev/null
+grep -c "adapting" "/tmp/gliff-bench-server-$LABEL.log" | sed "s/^/  bitrate adaptations: /"; true

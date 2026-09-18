@@ -42,8 +42,9 @@ struct Cli {
     /// Single 4:2:0 stream instead of 4:4:4 (lower bandwidth).
     #[arg(long)]
     low_bandwidth: bool,
-    /// Maximum bitrate in bits per second (default: derived from size). The
-    /// server adapts below it when the link shows queueing.
+    /// Cap on the total bits per second across the video streams (default:
+    /// none; the per-frame budget is bounded by size instead). The server
+    /// adapts below it when the link shows queueing.
     #[arg(long)]
     bitrate: Option<u32>,
 }

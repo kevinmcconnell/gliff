@@ -252,8 +252,9 @@ pub struct H264Encoder {
     idr_pic_id: u16,
     poc: i32,
     started: bool,
-    /// A bitrate change to apply with the next frame's rate-control update.
-    pending_bitrate: Option<u32>,
+    /// A bitrate and frame rate to apply with the next frame's rate-control
+    /// update.
+    pending_rate: Option<(u32, u32)>,
 }
 
 impl H264Encoder {
@@ -370,7 +371,7 @@ impl H264Encoder {
                 idr_pic_id: 0,
                 poc: 0,
                 started: false,
-                pending_bitrate: None,
+                pending_rate: None,
             };
             enc.sps = enc.encoded_parameters(true, false)?;
             enc.pps = enc.encoded_parameters(false, true)?;
@@ -390,8 +391,15 @@ impl H264Encoder {
     /// Change the CBR target from the next frame on, without resetting the
     /// session (no keyframe is forced).
     pub fn set_bitrate(&mut self, bitrate: u32) {
-        if bitrate != self.settings.bitrate {
-            self.pending_bitrate = Some(bitrate);
+        self.set_rate(bitrate, self.settings.framerate);
+    }
+
+    /// Change the CBR target and the frame rate it is spread over, from the
+    /// next frame on. The frame rate is the pace frames are actually
+    /// produced at, so the per-frame budget matches the bandwidth.
+    pub fn set_rate(&mut self, bitrate: u32, framerate: u32) {
+        if bitrate != self.settings.bitrate || framerate != self.settings.framerate {
+            self.pending_rate = Some((bitrate, framerate.max(1)));
         }
     }
 
@@ -468,7 +476,7 @@ impl H264Encoder {
         wait: Option<u64>,
         force_keyframe: bool,
     ) -> Result<PendingEncode> {
-        let bitrate_change = self.pending_bitrate.take();
+        let rate_change = self.pending_rate.take();
         let idr = force_keyframe || !self.started || self.current_ref.is_none();
         if idr {
             self.frame_num = 0;
@@ -654,8 +662,9 @@ impl H264Encoder {
             }
 
             let mut next_settings = self.settings.clone();
-            if let Some(b) = bitrate_change {
+            if let Some((b, f)) = rate_change {
                 next_settings.bitrate = b;
+                next_settings.framerate = f;
             }
             let settings = &next_settings;
             let started = self.started;
@@ -675,7 +684,7 @@ impl H264Encoder {
                         (video.cmd_begin_video_coding_khr)(cmd, &begin);
                         if !started {
                             record_rate_control(cmd, video, settings, true);
-                        } else if bitrate_change.is_some() {
+                        } else if rate_change.is_some() {
                             record_rate_control(cmd, video, settings, false);
                         }
                         dev.cmd_begin_query(cmd, query_pool, 0, vk::QueryControlFlags::empty());
@@ -691,9 +700,10 @@ impl H264Encoder {
             Ok::<(), Error>(())
         })?;
 
-        if let Some(b) = bitrate_change {
-            tracing::info!(bitrate = b, "encoder bitrate changed");
+        if let Some((b, f)) = rate_change {
+            tracing::info!(bitrate = b, framerate = f, "encoder rate changed");
             self.settings.bitrate = b;
+            self.settings.framerate = f;
         }
         // The DPB and counters describe the picture just recorded; the
         // bitstream itself is collected by `finish`.

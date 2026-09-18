@@ -112,11 +112,9 @@ where
     .ok();
 
     let gpu = Gpu::open(Some(&cfg.render_node)).context("open Vulkan device")?;
-    let bitrate_ctl = BitrateController::new(
-        cfg.bitrate
-            .unwrap_or_else(|| EncoderSettings::default_bitrate(output.width, output.height, 60)),
-    );
-    let settings = encoder_settings(stream.0, stream.1, bitrate_ctl.current());
+    let streams = if chroma == ChromaMode::Dual420 { 2 } else { 1 };
+    let bitrate_ctl = BitrateController::new(stream.0, stream.1, streams, cfg.bitrate);
+    let settings = encoder_settings(stream.0, stream.1, bitrate_ctl.bitrate(MAX_FPS));
     let encoder = Encoder::new(&gpu, settings.clone(), chroma == ChromaMode::Dual420)
         .context("create encoder")?;
 
@@ -146,6 +144,7 @@ where
         want_keyframe: true,
         rtt: RttEstimator::new(),
         cursor_shape_id: 0,
+        encode_us: 0.0,
     };
 
     loop {
@@ -280,7 +279,13 @@ struct Session<W> {
     want_keyframe: bool,
     rtt: RttEstimator,
     cursor_shape_id: u32,
+    /// Smoothed time to split and encode one frame, in microseconds.
+    encode_us: f64,
 }
+
+/// Slowest pace the rate control is told about; below this each frame would
+/// take too long to send.
+const MIN_RC_FPS: u32 = 5;
 
 impl<W: AsyncWrite + Unpin> Session<W> {
     async fn on_client_msg(&mut self, msg: ClientMsg) -> Result<ControlFlow<()>> {
@@ -291,11 +296,10 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                 decoded_at_ms,
             } => {
                 self.in_flight = self.in_flight.saturating_sub(1);
-                self.rtt.record(frame_id, decoded_at_ms);
+                let acked = self.rtt.record(frame_id, decoded_at_ms);
                 self.n_limit = self.rtt.window(self.settings.framerate);
-                if let Some(bitrate) = self.bitrate_ctl.on_ack(self.rtt.smoothed_ms) {
-                    self.settings.bitrate = bitrate;
-                    self.encoder.set_bitrate(bitrate);
+                if self.bitrate_ctl.on_ack(acked, &mut self.rtt, self.settings.framerate) {
+                    self.apply_rate();
                 }
             }
             ClientMsg::RequestKeyframe => self.want_keyframe = true,
@@ -347,6 +351,32 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         Ok(ControlFlow::Continue(()))
     }
 
+    /// Track how long frames take to encode and tell the rate control the
+    /// pace that gives, so the per-frame budget matches the bandwidth: an
+    /// encoder that sustains 25 fps at 4K should not spend a 60 fps budget.
+    fn note_encode_time(&mut self, enc_us: u128) {
+        let sample = enc_us as f64;
+        self.encode_us = if self.encode_us == 0.0 {
+            sample
+        } else {
+            0.8 * self.encode_us + 0.2 * sample
+        };
+        let sustainable = (1_000_000.0 / (self.encode_us * 1.1).max(1.0)) as u32;
+        let fps = sustainable.clamp(MIN_RC_FPS, MAX_FPS);
+        let current = self.settings.framerate;
+        if (fps as f64 - current as f64).abs() / current as f64 > 0.15 {
+            self.settings.framerate = fps;
+            self.apply_rate();
+        }
+    }
+
+    /// Program the encoder with the budget at the current pace.
+    fn apply_rate(&mut self) {
+        let fps = self.settings.framerate;
+        self.settings.bitrate = self.bitrate_ctl.bitrate(fps);
+        self.encoder.set_rate(self.settings.bitrate, fps);
+    }
+
     /// Forward an input event; a dead input thread ends the session elsewhere.
     fn inject(&self, cmd: InputCmd) {
         let _ = self.input.send(cmd);
@@ -383,7 +413,8 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         // so the logical size is whole; wait for it and use what it chose.
         let applied = self.wait_for_mode(width, height, scale).await;
         if !same_size {
-            let settings = encoder_settings(width, height, self.bitrate_ctl.current());
+            self.bitrate_ctl = BitrateController::new(width, height, self.bitrate_ctl.streams, self.bitrate_ctl.cap);
+            let settings = encoder_settings(width, height, self.bitrate_ctl.bitrate(MAX_FPS));
             match Encoder::new(
                 &self.gpu,
                 settings.clone(),
@@ -392,6 +423,7 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                 Ok(encoder) => {
                     self.encoder = encoder;
                     self.settings = settings;
+                    self.encode_us = 0.0;
                     self.output.width = width;
                     self.output.height = height;
                     self.stream = (width, height);
@@ -436,7 +468,8 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         if stream == self.stream {
             return Ok(());
         }
-        let settings = encoder_settings(stream.0, stream.1, self.bitrate_ctl.current());
+        self.bitrate_ctl = BitrateController::new(stream.0, stream.1, self.bitrate_ctl.streams, self.bitrate_ctl.cap);
+        let settings = encoder_settings(stream.0, stream.1, self.bitrate_ctl.bitrate(MAX_FPS));
         match Encoder::new(
             &self.gpu,
             settings.clone(),
@@ -450,6 +483,7 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                 );
                 self.encoder = encoder;
                 self.settings = settings;
+                self.encode_us = 0.0;
                 self.stream = stream;
                 self.pending = None;
                 self.want_keyframe = true;
@@ -634,8 +668,9 @@ impl<W: AsyncWrite + Unpin> Session<W> {
             n_limit = self.n_limit,
             "sent frame"
         );
-        self.rtt.on_sent(self.frame_id);
+        self.rtt.on_sent(self.frame_id, encoded.main.len() + aux.len());
         self.bitrate_ctl.note_sent();
+        self.note_encode_time(enc_us);
         self.frame_id += 1;
         self.in_flight += 1;
         Ok(())
@@ -700,12 +735,16 @@ async fn send_stream_config<W: AsyncWrite + Unpin>(
     Ok(writer.write_msg(&msg).await?)
 }
 
+/// The frame rate the stream is paced at, and the ceiling of the pace the
+/// rate control is told about.
+const MAX_FPS: u32 = 60;
+
 fn encoder_settings(width: u32, height: u32, bitrate: u32) -> EncoderSettings {
     EncoderSettings {
         width,
         height,
         bitrate,
-        framerate: 60,
+        framerate: MAX_FPS,
     }
 }
 
@@ -816,48 +855,82 @@ fn start_input(target: &Target, output: &str, keymap: &str) -> Result<Input> {
     Ok(Input::start(ic, Box::new(|_| {}))?)
 }
 
-/// Smoothed ack round-trip time, driving how many frames may be unacked.
+/// Ack round-trip time. The smoothed value tracks the path as it is; the
+/// base (its minimum) is the path without queueing. The difference is how
+/// much has queued up in front of the client.
 struct RttEstimator {
-    sent: VecDeque<(u64, Instant)>,
+    sent: VecDeque<(u64, Instant, usize)>,
     smoothed_ms: f64,
+    base_ms: f64,
+    /// Lowest sample since the controller last looked. A queue raises every
+    /// sample; decode jitter raises only some, so the minimum tells the two
+    /// apart.
+    window_min_ms: f64,
 }
 
-/// Adapts the CBR target to the path. The ack RTT is the signal: its
-/// minimum is the base delay, growth over the base is queueing; a queue or
-/// a starved send window cuts the rate, a quiet path grows it back slowly.
+/// Adapts the per-frame bit budget to the path. The encoder is CBR at
+/// `budget x pace`, so the budget is what each frame may cost and the pace
+/// converts it to a bandwidth. Growth of the ack RTT over its base is
+/// queueing; the rate the acks then arrive at is what the link delivers, so
+/// the budget drops to a fraction of that in one step. A quiet path grows
+/// the budget back: quickly at first (slow start), then gently.
 struct BitrateController {
+    /// Bits per frame per stream, bounded by the quality ceiling and floor.
     min: u32,
     max: u32,
     current: u32,
-    base_rtt_ms: f64,
+    /// Optional cap on total bits per second across the streams.
+    cap: Option<u32>,
+    streams: u32,
     last_eval: Instant,
     last_change: Instant,
     sent: u32,
     blocked: u32,
+    /// Acks in the current evaluation window: arrival time and the bytes
+    /// of the frame each covers.
+    acks: Vec<(Instant, usize)>,
+    /// Growth steps are large until the first cut.
+    slow_start: bool,
 }
 
 impl BitrateController {
-    const EVAL_EVERY: Duration = Duration::from_millis(500);
-    const GROW_AFTER: Duration = Duration::from_secs(2);
+    const EVAL_EVERY: Duration = Duration::from_millis(250);
+    const GROW_AFTER: Duration = Duration::from_millis(1500);
     const QUEUE_HIGH_MS: f64 = 50.0;
-    const QUEUE_LOW_MS: f64 = 15.0;
+    const QUEUE_LOW_MS: f64 = 10.0;
+    /// Bits per pixel per stream: the quality ceiling, and the floor below
+    /// which a frame is not worth sending.
+    const MAX_BPP: f64 = 0.1;
+    const MIN_BPP: f64 = 0.005;
 
-    fn new(max: u32) -> Self {
+    fn new(width: u32, height: u32, streams: u32, cap: Option<u32>) -> Self {
+        let pixels = width as f64 * height as f64;
+        let max = (pixels * Self::MAX_BPP) as u32;
+        let min = (pixels * Self::MIN_BPP) as u32;
         let now = Instant::now();
         Self {
-            min: (max / 8).max(1_000_000).min(max),
+            min,
             max,
-            current: max,
-            base_rtt_ms: f64::MAX,
+            current: (max / 4).max(min),
+            cap,
+            streams: streams.max(1),
             last_eval: now,
             last_change: now,
             sent: 0,
             blocked: 0,
+            acks: Vec::new(),
+            slow_start: true,
         }
     }
 
-    fn current(&self) -> u32 {
-        self.current
+    /// The CBR bitrate for one stream at `pace` frames per second.
+    fn bitrate(&self, pace: u32) -> u32 {
+        let by_budget = self.current as u64 * pace as u64;
+        let by_cap = self
+            .cap
+            .map(|c| c as u64 / self.streams as u64)
+            .unwrap_or(u64::MAX);
+        by_budget.min(by_cap).max(1) as u32
     }
 
     fn note_sent(&mut self) {
@@ -869,44 +942,77 @@ impl BitrateController {
         self.blocked += 1;
     }
 
-    /// Feed the smoothed ack RTT; returns a new target when it changes.
-    fn on_ack(&mut self, smoothed_ms: f64) -> Option<u32> {
-        self.base_rtt_ms = self.base_rtt_ms.min(smoothed_ms);
-        let now = Instant::now();
-        if now.duration_since(self.last_eval) < Self::EVAL_EVERY {
+    /// Bits per second the acks in the window arrived at. When the link is
+    /// saturated the acks are clocked by its transmission rate, so this is
+    /// close to the link capacity.
+    fn acked_rate(&self) -> Option<f64> {
+        let (first, rest) = self.acks.split_first()?;
+        if rest.len() < 2 {
             return None;
         }
+        let span = rest[rest.len() - 1].0.duration_since(first.0).as_secs_f64();
+        if span < 0.05 {
+            return None;
+        }
+        let bytes: usize = rest.iter().map(|(_, b)| b).sum();
+        Some(bytes as f64 * 8.0 / span)
+    }
+
+    /// Feed an ack: the bytes it covers, the RTT estimate and the current
+    /// pace. Returns true when the budget changed.
+    fn on_ack(&mut self, acked_bytes: usize, rtt: &mut RttEstimator, pace: u32) -> bool {
+        let now = Instant::now();
+        self.acks.push((now, acked_bytes));
+        if now.duration_since(self.last_eval) < Self::EVAL_EVERY {
+            return false;
+        }
         self.last_eval = now;
-        // Let the base drift up slowly so a path change is re-learned.
-        self.base_rtt_ms += 0.5;
-        let queueing = smoothed_ms - self.base_rtt_ms;
+        let queueing = rtt.take_queueing_ms();
         let starved = self.sent > 0 && self.blocked > self.sent;
         let (sent, blocked) = (self.sent, self.blocked);
+        let acked_rate = self.acked_rate();
         self.sent = 0;
         self.blocked = 0;
+        self.acks.clear();
         let next = if queueing > Self::QUEUE_HIGH_MS || starved {
-            (self.current / 4 * 3).max(self.min)
-        } else if queueing < Self::QUEUE_LOW_MS
-            && now.duration_since(self.last_change) >= Self::GROW_AFTER
-        {
-            (self.current / 10 * 11).min(self.max)
+            self.slow_start = false;
+            let per_frame = acked_rate
+                .map(|rate| 0.85 * rate / (self.streams as f64 * pace.max(1) as f64));
+            let target = match per_frame {
+                Some(bits) => bits as u32,
+                None => self.current / 4 * 3,
+            };
+            target.clamp(self.current / 2, self.current / 100 * 90).max(self.min)
+        } else if queueing < Self::QUEUE_LOW_MS {
+            let (step, after) = if self.slow_start {
+                (125, Duration::from_millis(500))
+            } else {
+                (105, Self::GROW_AFTER)
+            };
+            if now.duration_since(self.last_change) >= after {
+                (self.current as u64 * step / 100).min(self.max as u64) as u32
+            } else {
+                self.current
+            }
         } else {
             self.current
         };
         if next == self.current {
-            return None;
+            return false;
         }
         tracing::info!(
-            from = self.current,
-            to = next,
+            from_kbit = self.current / 1000,
+            to_kbit = next / 1000,
+            pace,
             queueing_ms = format!("{queueing:.1}"),
             sent,
             blocked,
-            "adapting bitrate"
+            acked_mbit = acked_rate.map(|r| format!("{:.1}", r / 1e6)),
+            "adapting frame budget"
         );
         self.current = next;
         self.last_change = now;
-        Some(next)
+        true
     }
 }
 
@@ -915,26 +1021,52 @@ impl RttEstimator {
         Self {
             sent: VecDeque::new(),
             smoothed_ms: 30.0,
+            base_ms: f64::MAX,
+            window_min_ms: f64::MAX,
         }
     }
 
-    fn on_sent(&mut self, frame_id: u64) {
-        self.sent.push_back((frame_id, Instant::now()));
+    /// Queueing delay seen over the window, then start a new window.
+    fn take_queueing_ms(&mut self) -> f64 {
+        let min = std::mem::replace(&mut self.window_min_ms, f64::MAX);
+        if min == f64::MAX || self.base_ms == f64::MAX {
+            0.0
+        } else {
+            min - self.base_ms
+        }
     }
 
-    fn record(&mut self, _frame_id: u64, _decoded_at_ms: u64) {
-        // We approximate RTT from when we noticed the ack, not the client clock,
-        // which avoids clock-skew: use the gap since the last ack as a proxy.
+    fn on_sent(&mut self, frame_id: u64, bytes: usize) {
+        self.sent.push_back((frame_id, Instant::now(), bytes));
+    }
+
+    /// Record an ack; returns the bytes of the frame it covers. Acks arrive
+    /// in order, so the oldest unacked frame is the one acked.
+    fn record(&mut self, _frame_id: u64, _decoded_at_ms: u64) -> usize {
         let now = Instant::now();
-        if let Some((_, t)) = self.sent.pop_front() {
-            let sample = now.duration_since(t).as_secs_f64() * 1000.0;
-            self.smoothed_ms = 0.875 * self.smoothed_ms + 0.125 * sample.min(1000.0);
-        }
+        let Some((_, t, bytes)) = self.sent.pop_front() else {
+            return 0;
+        };
+        let sample = now.duration_since(t).as_secs_f64() * 1000.0;
+        self.smoothed_ms = 0.875 * self.smoothed_ms + 0.125 * sample.min(1000.0);
+        self.window_min_ms = self.window_min_ms.min(sample);
+        // The base follows the minimum, drifting up slowly so a path change
+        // is re-learned.
+        self.base_ms = (self.base_ms + 0.2).min(sample);
+        bytes
     }
 
+    /// How many frames may be unacked: enough to keep the path busy across
+    /// its base RTT, but not more, so a queue cannot build behind a slow
+    /// link. Queueing delay does not widen the window.
     fn window(&self, framerate: u32) -> u32 {
         let interval_ms = 1000.0 / framerate.max(1) as f64;
-        let n = (self.smoothed_ms / interval_ms).ceil() as i64 + 1;
+        let base = if self.base_ms == f64::MAX {
+            self.smoothed_ms
+        } else {
+            self.base_ms
+        };
+        let n = (base / interval_ms).ceil() as i64 + 1;
         n.clamp(2, 8) as u32
     }
 }
@@ -942,6 +1074,14 @@ impl RttEstimator {
 #[cfg(test)]
 mod tests {
     use super::RttEstimator;
+
+    #[test]
+    fn queueing_does_not_widen_the_window() {
+        let mut rtt = RttEstimator::new();
+        rtt.base_ms = 20.0;
+        rtt.smoothed_ms = 400.0;
+        assert_eq!(rtt.window(60), 3);
+    }
 
     #[test]
     fn ack_window_stays_in_bounds() {
