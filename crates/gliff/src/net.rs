@@ -5,14 +5,23 @@
 //! The Vulkan objects live entirely on this worker thread; only dmabuf fds
 //! and plain values cross to the GTK thread.
 
+use std::rc::Rc;
 use std::sync::mpsc::{Sender as StdSender, SyncSender};
 use std::sync::Arc;
 
-use gliff_proto::{ChromaMode, ClientCaps, ClientMsg, Codec, ServerMsg, PROTOCOL_VERSION};
+use bytes::Bytes;
+use gliff_proto::clipboard::CHUNK;
+use gliff_proto::{
+    ChromaMode, ClientCaps, ClientMsg, ClipboardFile, ClipboardMsg, Codec, ServerMsg,
+    PROTOCOL_VERSION,
+};
+use gliff_transport::clipboard::{outbound_channel, Transfers};
 use gliff_transport::{spawn_ssh, Framed, SshTarget};
 use gliff_vk::{Decoder, DisplayFrame, Gpu};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
+use tokio::sync::mpsc::{self, unbounded_channel, UnboundedReceiver};
+
+use crate::clipboard::{Bridge, ToWorker};
 
 /// Status/telemetry the worker reports to the UI.
 pub enum Status {
@@ -34,8 +43,18 @@ pub enum Status {
         hot_y: i32,
         argb: Vec<u8>,
     },
-    /// The remote text selection, for the client to put on its local clipboard.
-    Clipboard(String),
+    /// The remote selection changed: put a proxy for these on the local
+    /// clipboard, or clear ours when both lists are empty.
+    ClipboardOffer {
+        mime_types: Vec<String>,
+        files: Vec<ClipboardFile>,
+    },
+    /// The server wants `mime_type` from the local clipboard: read it into
+    /// `reply` chunk by chunk and drop the sender at the end.
+    ClipboardRead {
+        mime_type: String,
+        reply: mpsc::Sender<std::io::Result<Bytes>>,
+    },
     Error(String),
     Closed,
 }
@@ -53,7 +72,7 @@ pub struct Worker {
     /// without limit; when full, the newest frame is dropped (latest-wins).
     pub frames: SyncSender<DisplayFrame>,
     pub status: StdSender<Status>,
-    pub input: UnboundedReceiver<(ClientMsg, Vec<u8>)>,
+    pub input: UnboundedReceiver<ToWorker>,
 }
 
 impl Worker {
@@ -112,7 +131,7 @@ async fn session<R, W>(
     wr: W,
     frames: SyncSender<DisplayFrame>,
     status: StdSender<Status>,
-    mut input: UnboundedReceiver<(ClientMsg, Vec<u8>)>,
+    mut input: UnboundedReceiver<ToWorker>,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin + 'static,
@@ -164,7 +183,7 @@ where
     // Writes run on their own task, fed by `out_tx`, so reads (draining video)
     // never block on a write and the two peers cannot deadlock. Both the reader
     // loop (acks, keyframe requests) and the UI thread (input) feed `out_tx`.
-    let (out_tx, mut out_rx) = unbounded_channel::<(ClientMsg, Vec<u8>)>();
+    let (out_tx, mut out_rx) = unbounded_channel::<(ClientMsg, Bytes)>();
     tokio::task::spawn_local(async move {
         while let Some((m, payload)) = out_rx.recv().await {
             let r = if payload.is_empty() {
@@ -177,13 +196,33 @@ where
             }
         }
     });
-    // Forward UI input into the same write channel.
+    // Clipboard transfers write through the same channel, in chunks.
+    let (clip_out_tx, mut clip_out_rx) = outbound_channel();
+    let clipboard = Rc::new(Bridge::new(Transfers::new(clip_out_tx), status.clone()));
     {
         let out_tx = out_tx.clone();
         tokio::task::spawn_local(async move {
-            while let Some(mp) = input.recv().await {
-                if out_tx.send(mp).is_err() {
+            while let Some((m, payload)) = clip_out_rx.recv().await {
+                if out_tx.send((ClientMsg::from(m), payload)).is_err() {
                     break;
+                }
+            }
+        });
+    }
+    // Forward UI input into the same write channel; clipboard commands from
+    // the UI go to the bridge.
+    {
+        let out_tx = out_tx.clone();
+        let clipboard = clipboard.clone();
+        tokio::task::spawn_local(async move {
+            while let Some(cmd) = input.recv().await {
+                match cmd {
+                    ToWorker::Send(m) => {
+                        if out_tx.send((m, Bytes::new())).is_err() {
+                            break;
+                        }
+                    }
+                    other => clipboard.on_ui(other),
                 }
             }
         });
@@ -224,7 +263,7 @@ where
                         frame_id,
                         decoded_at_ms: now_ms(),
                     },
-                    Vec::new(),
+                    Bytes::new(),
                 ));
                 match decoded {
                     Ok(Some(frame)) => {
@@ -240,7 +279,7 @@ where
                     Ok(None) => {}
                     Err(e) => {
                         tracing::warn!(error = %e, "decode error; requesting keyframe");
-                        let _ = out_tx.send((ClientMsg::RequestKeyframe, Vec::new()));
+                        let _ = out_tx.send((ClientMsg::RequestKeyframe, Bytes::new()));
                     }
                 }
             }
@@ -275,20 +314,25 @@ where
                     argb,
                 });
             }
-            ServerMsg::ClipboardData { data_len, .. } => {
-                if data_len as u64 > gliff_proto::CLIPBOARD_MAX {
-                    anyhow::bail!("clipboard payload of {data_len} bytes exceeds the limit");
-                }
-                let bytes = reader.read_payload(data_len).await?;
-                if let Ok(text) = String::from_utf8(bytes.to_vec()) {
-                    let _ = status.send(Status::Clipboard(text));
-                }
-            }
             ServerMsg::CursorPos { .. } | ServerMsg::Pong { .. } => {}
             ServerMsg::Error { code, message } => anyhow::bail!("server error {code}: {message}"),
-            ServerMsg::HelloAck { .. }
-            | ServerMsg::ClipboardOffer { .. }
-            | ServerMsg::ClipboardRequest { .. } => {}
+            ServerMsg::HelloAck { .. } => {}
+            other => {
+                if let Ok(clip) = other.into_clipboard() {
+                    let payload = match &clip {
+                        ClipboardMsg::Data { data_len, .. } => {
+                            if *data_len as usize > CHUNK {
+                                anyhow::bail!(
+                                    "clipboard chunk of {data_len} bytes exceeds the limit"
+                                );
+                            }
+                            reader.read_payload(*data_len).await?
+                        }
+                        _ => Bytes::new(),
+                    };
+                    clipboard.on_peer_msg(clip, payload);
+                }
+            }
         }
         if last_report.elapsed().as_secs_f32() >= 1.0 {
             let secs = last_report.elapsed().as_secs_f32();

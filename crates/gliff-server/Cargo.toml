@@ -14,6 +14,7 @@ clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tokio = { workspace = true }
+bytes.workspace = true
 gliff-proto.workspace = true
 gliff-transport.workspace = true
 gliff-vk.workspace = true

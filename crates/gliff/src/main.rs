@@ -5,6 +5,8 @@
 //! frames arrive as dmabufs, which GTK imports as textures, so the UI has no
 //! GPU code of its own; its one `unsafe` block hands GTK a dmabuf fd.
 
+mod clipboard;
+mod clipboard_ui;
 mod keymap;
 mod net;
 mod paintable;
@@ -29,7 +31,7 @@ use net::{Endpoint, Status, Worker};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
 /// A message plus optional trailing payload, sent from the UI to the worker.
-type OutSender = UnboundedSender<(ClientMsg, Vec<u8>)>;
+type OutSender = UnboundedSender<clipboard::ToWorker>;
 
 #[derive(Parser)]
 #[command(name = "gliff", about = "Remote-desktop a Hyprland session over ssh")]
@@ -78,8 +80,6 @@ struct App {
     /// Evdev codes currently held on the remote, so they can all be released
     /// when the keyboard is handed back to the local compositor.
     pressed_keys: RefCell<BTreeSet<u32>>,
-    /// Last text we set on the local clipboard from the remote, to avoid echo.
-    last_remote_clip: RefCell<Option<String>>,
     /// The last endpoint, kept so a dropped connection can be retried.
     endpoint: RefCell<Option<Endpoint>>,
     /// Consecutive failed connection attempts, reset on a successful connect.
@@ -174,7 +174,6 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         pressed_keys: RefCell::new(BTreeSet::new()),
         endpoint: RefCell::new(None),
         retries: Cell::new(0),
-        last_remote_clip: RefCell::new(None),
     });
 
     let hotkey = ReleaseHotkey::parse(&cli.release_hotkey).unwrap_or_else(|e| {
@@ -237,40 +236,11 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         );
     }
 
-    // Watch the local clipboard: when it changes to text we did not just
-    // receive from the remote, forward it to the server.
-    if let Some(display) = gdk::Display::default() {
-        let clipboard = display.clipboard();
+    // Offer every local clipboard change to the server; our own proxy for
+    // the server's selection does not count as a change.
+    {
         let ui = ui.clone();
-        clipboard.connect_changed(move |cb| {
-            let ui = ui.clone();
-            cb.read_text_async(gtk::gio::Cancellable::NONE, move |res| {
-                if let Ok(Some(text)) = res {
-                    let text = text.to_string();
-                    // One-shot echo guard: suppress only the value we just set
-                    // from the remote, so a later genuine local re-copy is sent.
-                    if ui.last_remote_clip.borrow().as_deref() == Some(text.as_str()) {
-                        ui.last_remote_clip.borrow_mut().take();
-                        return;
-                    }
-                    if text.len() as u64 > gliff_proto::CLIPBOARD_MAX {
-                        return;
-                    }
-                    let bytes = text.into_bytes();
-                    let total = bytes.len() as u64;
-                    send_payload(
-                        &ui,
-                        ClientMsg::ClipboardData {
-                            mime_type: "text/plain;charset=utf-8".into(),
-                            offset: 0,
-                            total,
-                            data_len: bytes.len() as u32,
-                        },
-                        bytes,
-                    );
-                }
-            });
-        });
+        clipboard_ui::watch_local(move || ui.input_tx.borrow().clone());
     }
 
     window.present();
@@ -284,7 +254,7 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
 fn start_session(ui: Rc<App>, endpoint: Endpoint) {
     let (frame_tx, frame_rx) = sync_channel::<DisplayFrame>(2);
     let (status_tx, status_rx) = channel::<Status>();
-    let (input_tx, input_rx) = unbounded_channel::<(ClientMsg, Vec<u8>)>();
+    let (input_tx, input_rx) = unbounded_channel::<clipboard::ToWorker>();
     *ui.input_tx.borrow_mut() = Some(input_tx);
     *ui.endpoint.borrow_mut() = Some(endpoint.clone());
     ui.status.set_text("Connecting…");
@@ -411,11 +381,13 @@ fn poll_status(ui: Rc<App>, rx: Receiver<Status>) {
                     hot_y,
                     argb,
                 } => set_remote_cursor(&ui, width, height, hot_x, hot_y, &argb),
-                Status::Clipboard(text) => {
-                    *ui.last_remote_clip.borrow_mut() = Some(text.clone());
-                    if let Some(display) = gdk::Display::default() {
-                        display.clipboard().set_text(&text);
+                Status::ClipboardOffer { mime_types, files } => {
+                    if let Some(tx) = ui.input_tx.borrow().clone() {
+                        clipboard_ui::set_remote_offer(tx, mime_types, files);
                     }
+                }
+                Status::ClipboardRead { mime_type, reply } => {
+                    clipboard_ui::read_local(mime_type, reply)
                 }
                 Status::Error(e) => {
                     tracing::error!(error = %e, "connection failed");
@@ -494,14 +466,7 @@ fn to_remote(ui: &App, x: f64, y: f64) -> (f64, f64) {
 
 fn send(ui: &App, msg: ClientMsg) {
     if let Some(tx) = ui.input_tx.borrow().as_ref() {
-        let _ = tx.send((msg, Vec::new()));
-    }
-}
-
-/// Send a message with a trailing payload (used for clipboard text).
-fn send_payload(ui: &App, msg: ClientMsg, payload: Vec<u8>) {
-    if let Some(tx) = ui.input_tx.borrow().as_ref() {
-        let _ = tx.send((msg, payload));
+        let _ = tx.send(clipboard::ToWorker::Send(msg));
     }
 }
 

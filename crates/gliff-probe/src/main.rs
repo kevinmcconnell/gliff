@@ -448,6 +448,8 @@ fn serve_test(node: &std::path::Path, addr: &str, frames: usize) -> Result<()> {
         let mut got = 0usize;
         let mut keyframes = 0usize;
         let mut scaled = false;
+        let send_clip = std::env::var("GLIFF_SEND_CLIP").ok();
+        let mut clip_recv: Vec<u8> = Vec::new();
         while got < frames {
             let msg = reader.read_msg::<ServerMsg>().await?;
             match msg {
@@ -460,11 +462,9 @@ fn serve_test(node: &std::path::Path, addr: &str, frames: usize) -> Result<()> {
                     if got == 1 { eprintln!("  first decoded frame ok ({}x{}, main {} aux {} bytes, key {keyframe})", w, h, data_len, aux_len); }
                     writer.write_msg(&ClientMsg::FrameAck { frame_id, decoded_at_ms: 0 }).await?;
                     if got == 3 { writer.write_msg(&ClientMsg::Resize { width: 800, height: 600, scale: 2.0 }).await?; }
-                    if got == 4 {
-                        if let Ok(text) = std::env::var("GLIFF_SEND_CLIP") {
-                            let bytes = text.into_bytes();
-                            writer.write_msg_with_payloads(&ClientMsg::ClipboardData { mime_type: "text/plain;charset=utf-8".into(), offset: 0, total: bytes.len() as u64, data_len: bytes.len() as u32 }, &[&bytes]).await?;
-                        }
+                    if got == 4 && send_clip.is_some() {
+                        let mime_types = gliff_proto::clipboard::TEXT_MIMES.iter().map(|m| m.to_string()).collect();
+                        writer.write_msg(&ClientMsg::ClipboardOffer { mime_types, files: Vec::new() }).await?;
                     }
                 }
                 ServerMsg::StreamConfig { width, height, chroma, scale_milli, .. } => {
@@ -474,9 +474,26 @@ fn serve_test(node: &std::path::Path, addr: &str, frames: usize) -> Result<()> {
                     decoder = Decoder::new(&gpu, chroma != ChromaMode::Single420, w as u32, h as u32)?;
                 }
                 ServerMsg::CursorShape { argb_len, .. } => { let _ = reader.read_payload(argb_len).await?; }
-                ServerMsg::ClipboardData { data_len, .. } => {
+                // The server offers its selection; ask for the text and print it once complete.
+                ServerMsg::ClipboardOffer { mime_types, .. } => {
+                    if mime_types.iter().any(|m| gliff_proto::clipboard::is_text_mime(m)) {
+                        clip_recv.clear();
+                        writer.write_msg(&ClientMsg::ClipboardRequest { id: 1, item: gliff_proto::ClipboardItem::Mime(gliff_proto::clipboard::TEXT_MIME.into()) }).await?;
+                    }
+                }
+                ServerMsg::ClipboardData { id, data_len, done, .. } => {
                     let bytes = reader.read_payload(data_len).await?;
-                    if let Ok(t) = String::from_utf8(bytes.to_vec()) { eprintln!("CLIP-RECV: {t}"); }
+                    clip_recv.extend_from_slice(&bytes);
+                    if done {
+                        if let Ok(t) = String::from_utf8(std::mem::take(&mut clip_recv)) { eprintln!("CLIP-RECV: {t}"); }
+                    } else {
+                        writer.write_msg(&ClientMsg::ClipboardAck { id, received: clip_recv.len() as u64 }).await?;
+                    }
+                }
+                // The server pastes our offered text: serve it in one chunk.
+                ServerMsg::ClipboardRequest { id, .. } => {
+                    let bytes = send_clip.clone().unwrap_or_default().into_bytes();
+                    writer.write_msg_with_payloads(&ClientMsg::ClipboardData { id, offset: 0, data_len: bytes.len() as u32, done: true }, &[&bytes]).await?;
                 }
                 ServerMsg::CursorPos { .. } | ServerMsg::Pong { .. } | ServerMsg::Error { .. } => {}
                 _ => {}
@@ -495,7 +512,9 @@ fn serve_test(node: &std::path::Path, addr: &str, frames: usize) -> Result<()> {
 }
 
 fn clipboard(target: &Target, set: Option<String>, secs: u64) -> Result<()> {
+    use gliff_proto::clipboard::{is_text_mime, TEXT_MIMES};
     use hypr_input::{Clipboard, ClipboardEvent};
+    use std::io::{Read, Write};
     use std::sync::mpsc;
     let (tx, rx) = mpsc::channel();
     let clip = Clipboard::start(
@@ -504,21 +523,37 @@ fn clipboard(target: &Target, set: Option<String>, secs: u64) -> Result<()> {
             let _ = tx.send(ev);
         }),
     )?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
     if let Some(text) = set {
-        clip.set_text(text.clone());
-        println!("  set selection to {text:?}; holding {secs}s");
-        std::thread::sleep(std::time::Duration::from_secs(secs));
-        status(true, "clipboard set");
-    } else {
-        println!("  watching selection for {secs}s");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
-        let mut got = false;
+        clip.offer(TEXT_MIMES.iter().map(|m| m.to_string()).collect());
+        println!("  offering {text:?} as text; holding {secs}s");
+        let mut pastes = 0;
         while std::time::Instant::now() < deadline {
-            if let Ok(ClipboardEvent::Text(t)) =
+            if let Ok(ClipboardEvent::Paste { mime_type, fd }) =
                 rx.recv_timeout(std::time::Duration::from_millis(200))
             {
-                println!("  selection: {t:?}");
+                let mut f = std::fs::File::from(fd);
+                let _ = f.write_all(text.as_bytes());
+                println!("  served a paste of {mime_type}");
+                pastes += 1;
+            }
+        }
+        status(true, &format!("clipboard offered ({pastes} pastes served)"));
+    } else {
+        println!("  watching selection for {secs}s");
+        let mut got = false;
+        while std::time::Instant::now() < deadline {
+            if let Ok(ClipboardEvent::Selection { mime_types }) =
+                rx.recv_timeout(std::time::Duration::from_millis(200))
+            {
+                println!("  selection offers {mime_types:?}");
                 got = true;
+                if let Some(m) = mime_types.iter().find(|m| is_text_mime(m)) {
+                    let fd = clip.receive(m.clone())?;
+                    let mut text = String::new();
+                    std::fs::File::from(fd).read_to_string(&mut text)?;
+                    println!("  text: {text:?}");
+                }
             }
         }
         status(got, "observed a clipboard selection");
