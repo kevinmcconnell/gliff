@@ -1,13 +1,14 @@
-//! Text clipboard bridge via `ext-data-control-v1`, on its own thread and
-//! Wayland connection. It reports the compositor's current text selection and
-//! can set the selection from remote data. A loop guard stops a selection we
-//! set from bouncing back.
+//! Clipboard bridge via `ext-data-control-v1`, on its own thread and Wayland
+//! connection. It moves no data itself: it reports which mime types the
+//! compositor's selection offers and hands out a pipe to read one of them; in
+//! the other direction it advertises a set of mime types on behalf of the
+//! remote and hands the owner the pipe of every application that pastes.
+//! A loop guard stops a selection we set from being reported back as new.
 
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{Read, Write};
 use std::os::fd::{AsFd, OwnedFd};
 use std::sync::mpsc;
+use std::time::Duration;
 
 use calloop::channel::{self, Sender};
 use nix::unistd::pipe;
@@ -29,25 +30,24 @@ use wayland_protocols::ext::data_control::v1::client::ext_data_control_source_v1
 use crate::{Error, Result};
 use hypr_wl::{LoopState, Outputs, Seat, Target};
 
-/// Text mime types we offer and accept, best first.
-const TEXT_MIMES: &[&str] = &[
-    "text/plain;charset=utf-8",
-    "text/plain",
-    "UTF8_STRING",
-    "STRING",
-];
-
 #[derive(Debug)]
 pub enum ClipboardEvent {
-    /// The compositor's text selection changed to this value.
-    Text(String),
+    /// The compositor's selection changed and offers these mime types (empty
+    /// when it was cleared). Read one with [`Clipboard::receive`].
+    Selection { mime_types: Vec<String> },
+    /// An application pastes from the selection set with [`Clipboard::offer`]:
+    /// write the item in `mime_type` to `fd` and close it.
+    Paste { mime_type: String, fd: OwnedFd },
 }
 
 pub type ClipboardSink = Box<dyn FnMut(ClipboardEvent) + Send>;
 
 enum Cmd {
-    SetText(String),
-    Received(String),
+    Offer(Vec<String>),
+    Receive {
+        mime_type: String,
+        reply: mpsc::Sender<Result<OwnedFd>>,
+    },
     Stop,
 }
 
@@ -71,9 +71,22 @@ impl Clipboard {
         }
     }
 
-    /// Set the compositor's text selection.
-    pub fn set_text(&self, text: String) {
-        let _ = self.cmd.send(Cmd::SetText(text));
+    /// Become the compositor's selection, offering `mime_types`; each paste
+    /// arrives as [`ClipboardEvent::Paste`]. An empty list withdraws our
+    /// selection if we still hold it.
+    pub fn offer(&self, mime_types: Vec<String>) {
+        let _ = self.cmd.send(Cmd::Offer(mime_types));
+    }
+
+    /// Ask the current selection's owner for `mime_type`; the returned pipe
+    /// yields the bytes and then EOF.
+    pub fn receive(&self, mime_type: String) -> Result<OwnedFd> {
+        let (reply, rx) = mpsc::channel();
+        self.cmd
+            .send(Cmd::Receive { mime_type, reply })
+            .map_err(|_| Error::ThreadGone)?;
+        rx.recv_timeout(Duration::from_secs(2))
+            .map_err(|_| Error::ThreadGone)?
     }
 }
 
@@ -96,11 +109,13 @@ struct State {
     device: Option<ExtDataControlDeviceV1>,
     /// mimes advertised by each live incoming offer.
     offers: HashMap<ExtDataControlOfferV1, Vec<String>>,
-    /// our outgoing source and the text it serves.
-    our_source: Option<(ExtDataControlSourceV1, String)>,
-    /// last text we set, to guard against forwarding it back.
-    last_set: Option<String>,
-    cmd_tx: Sender<Cmd>,
+    /// the selection's current offer, kept until the selection changes.
+    current: Option<ExtDataControlOfferV1>,
+    /// our outgoing source and the mimes it advertises.
+    our_source: Option<(ExtDataControlSourceV1, Vec<String>)>,
+    /// set after we take or drop the selection: the next selection event that
+    /// matches is the compositor reporting our own change back to us.
+    expect_echo: bool,
     quit: bool,
 }
 
@@ -110,12 +125,11 @@ fn spawn(
     ready_tx: mpsc::Sender<Result<()>>,
 ) -> Result<(Sender<Cmd>, std::thread::JoinHandle<()>)> {
     let (tx, rx) = channel::channel::<Cmd>();
-    let tx2 = tx.clone();
     let join = std::thread::Builder::new()
         .name("hypr-clip".into())
         .spawn(move || {
             let mut sink = sink;
-            if let Err(e) = run(target, &mut sink, tx2, rx, ready_tx.clone()) {
+            if let Err(e) = run(target, &mut sink, rx, ready_tx.clone()) {
                 let _ = ready_tx.send(Err(Error::Input(e.to_string())));
             }
         })?;
@@ -125,7 +139,6 @@ fn spawn(
 fn run(
     target: Target,
     sink: &mut ClipboardSink,
-    cmd_tx: Sender<Cmd>,
     rx: channel::Channel<Cmd>,
     ready_tx: mpsc::Sender<Result<()>>,
 ) -> Result<()> {
@@ -146,9 +159,9 @@ fn run(
         manager,
         device: None,
         offers: HashMap::new(),
+        current: None,
         our_source: None,
-        last_set: None,
-        cmd_tx,
+        expect_echo: false,
         quit: false,
     };
     std::mem::swap(&mut state.sink, sink);
@@ -169,15 +182,10 @@ impl LoopState for State {
 
     fn on_cmd(&mut self, cmd: Cmd) {
         match cmd {
-            Cmd::SetText(text) => self.set_selection(text),
-            Cmd::Received(text) => {
-                // One-shot guard: swallow the echo of the value we set, then
-                // let a later genuine copy of the same text through.
-                if self.last_set.as_deref() == Some(text.as_str()) {
-                    self.last_set = None;
-                } else {
-                    (self.sink)(ClipboardEvent::Text(text));
-                }
+            Cmd::Offer(mimes) if mimes.is_empty() => self.withdraw(),
+            Cmd::Offer(mimes) => self.set_selection(mimes),
+            Cmd::Receive { mime_type, reply } => {
+                let _ = reply.send(self.receive(&mime_type));
             }
             Cmd::Stop => self.stop(),
         }
@@ -194,109 +202,94 @@ impl LoopState for State {
 }
 
 impl State {
-    fn set_selection(&mut self, text: String) {
+    fn set_selection(&mut self, mimes: Vec<String>) {
         if let Some((old, _)) = self.our_source.take() {
             old.destroy();
         }
         let src = self.manager.create_data_source(&self.qh, ());
-        for m in TEXT_MIMES {
-            src.offer((*m).to_string());
+        for m in &mimes {
+            src.offer(m.clone());
         }
         if let Some(device) = &self.device {
             device.set_selection(Some(&src));
         }
-        self.last_set = Some(text.clone());
-        self.our_source = Some((src, text));
+        self.expect_echo = true;
+        self.our_source = Some((src, mimes));
     }
 
-    fn receive_offer(&mut self, off: &ExtDataControlOfferV1) {
-        let mimes = self.offers.get(off).cloned().unwrap_or_default();
-        let Some(mime) = TEXT_MIMES
-            .iter()
-            .find(|m| mimes.iter().any(|a| a == *m))
-            .map(|m| m.to_string())
-        else {
-            return; // no text mime offered
-        };
-        let (read_fd, write_fd) = match pipe() {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!(error = %e, "clipboard pipe failed");
-                return;
+    fn withdraw(&mut self) {
+        if let Some((old, _)) = self.our_source.take() {
+            if let Some(device) = &self.device {
+                device.set_selection(None);
             }
-        };
-        off.receive(mime, write_fd.as_fd());
+            old.destroy();
+            self.expect_echo = true;
+        }
+    }
+
+    fn receive(&mut self, mime: &str) -> Result<OwnedFd> {
+        let off = self
+            .current
+            .as_ref()
+            .ok_or_else(|| Error::Input("no selection".into()))?;
+        let advertised = self
+            .offers
+            .get(off)
+            .is_some_and(|m| m.iter().any(|a| a == mime));
+        if !advertised {
+            return Err(Error::Input(format!("selection has no {mime}")));
+        }
+        let (read_fd, write_fd) = pipe().map_err(|e| Error::Input(e.to_string()))?;
+        off.receive(mime.to_string(), write_fd.as_fd());
         drop(write_fd);
         let _ = self.conn.flush();
-        // Read the sender's bytes off the Wayland thread so a slow provider
-        // cannot stall dispatch. Bounded by a poll timeout and a size cap so a
-        // dead provider that never writes cannot leak the thread and fd.
-        let tx = self.cmd_tx.clone();
-        std::thread::spawn(move || {
-            if let Some(text) = read_selection(read_fd) {
-                let _ = tx.send(Cmd::Received(text));
-            }
-        });
+        Ok(read_fd)
     }
 
-    /// Destroy and forget every tracked offer (called when the selection
-    /// changes or clears, so offer proxies and map entries do not accumulate).
+    fn on_selection(&mut self, id: Option<ExtDataControlOfferV1>) {
+        // Every offer but the new selection's is stale; destroy them so offer
+        // proxies and map entries do not accumulate.
+        let stale: Vec<_> = self
+            .offers
+            .keys()
+            .filter(|o| Some(*o) != id.as_ref())
+            .cloned()
+            .collect();
+        for off in stale {
+            self.offers.remove(&off);
+            off.destroy();
+        }
+        self.current = id.clone();
+        let mimes = id
+            .as_ref()
+            .and_then(|o| self.offers.get(o))
+            .cloned()
+            .unwrap_or_default();
+        let echo = std::mem::take(&mut self.expect_echo) && self.is_our_echo(&mimes);
+        if !echo {
+            (self.sink)(ClipboardEvent::Selection { mime_types: mimes });
+        }
+    }
+
+    /// The compositor reports our own source back to us as a selection whose
+    /// offer lists exactly the mimes we gave it; a withdrawal echoes as none.
+    fn is_our_echo(&self, mimes: &[String]) -> bool {
+        match &self.our_source {
+            Some((_, ours)) => same_set(ours, mimes),
+            None => mimes.is_empty(),
+        }
+    }
+
     fn clear_offers(&mut self) {
         for (off, _) in self.offers.drain() {
             off.destroy();
         }
+        self.current = None;
     }
 }
 
-/// Write our selection to a paste target's pipe, giving up if the target
-/// stops draining it for a second, so a stuck target cannot pin a thread.
-fn write_selection(fd: OwnedFd, mut data: &[u8]) {
-    use nix::poll::{PollFd, PollFlags, PollTimeout};
-    let mut file = File::from(fd);
-    while !data.is_empty() {
-        {
-            let borrowed = file.as_fd();
-            let mut fds = [PollFd::new(borrowed, PollFlags::POLLOUT)];
-            match nix::poll::poll(&mut fds, PollTimeout::from(1000u16)) {
-                Ok(0) | Err(_) => return,
-                Ok(_) => {}
-            }
-        }
-        match file.write(data) {
-            Ok(0) | Err(_) => return,
-            Ok(n) => data = &data[n..],
-        }
-    }
-}
-
-/// Read a clipboard selection from a pipe with a bounded wait and size cap.
-fn read_selection(read_fd: OwnedFd) -> Option<String> {
-    use nix::poll::{PollFd, PollFlags, PollTimeout};
-    let mut file = File::from(read_fd);
-    let mut buf = Vec::new();
-    let max = 32 * 1024 * 1024;
-    loop {
-        {
-            let borrowed = file.as_fd();
-            let mut fds = [PollFd::new(borrowed, PollFlags::POLLIN)];
-            match nix::poll::poll(&mut fds, PollTimeout::from(1000u16)) {
-                Ok(0) | Err(_) => return None, // timed out or errored: give up
-                Ok(_) => {}
-            }
-        }
-        let mut chunk = [0u8; 64 * 1024];
-        match file.read(&mut chunk) {
-            Ok(0) => break, // EOF
-            Ok(n) => {
-                buf.extend_from_slice(&chunk[..n]);
-                if buf.len() > max {
-                    return None;
-                }
-            }
-            Err(_) => return None,
-        }
-    }
-    String::from_utf8(buf).ok()
+fn same_set(a: &[String], b: &[String]) -> bool {
+    a.len() == b.len() && a.iter().all(|m| b.contains(m)) && b.iter().all(|m| a.contains(m))
 }
 
 impl Dispatch<WlRegistry, GlobalListContents> for State {
@@ -350,14 +343,7 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for State {
             device::Event::DataOffer { id } => {
                 s.offers.insert(id, Vec::new());
             }
-            device::Event::Selection { id } => {
-                if let Some(off) = &id {
-                    s.receive_offer(off);
-                }
-                // The current offer has been received (or there is none); all
-                // tracked offers are now stale, so destroy them.
-                s.clear_offers();
-            }
+            device::Event::Selection { id } => s.on_selection(id),
             device::Event::Finished => {
                 s.clear_offers();
                 s.quit = true;
@@ -395,22 +381,13 @@ impl Dispatch<ExtDataControlSourceV1, ()> for State {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+        let ours = s.our_source.as_ref().is_some_and(|(c, _)| c == src);
         match e {
-            source::Event::Send { mime_type: _, fd } => {
-                if let Some((cur, text)) = &s.our_source {
-                    if cur == src {
-                        // Write off the Wayland thread: a paste target that
-                        // reads slowly would otherwise stall dispatch once the
-                        // pipe buffer fills.
-                        let text = text.clone();
-                        std::thread::spawn(move || write_selection(fd, text.as_bytes()));
-                    }
-                }
+            source::Event::Send { mime_type, fd } if ours => {
+                (s.sink)(ClipboardEvent::Paste { mime_type, fd });
             }
-
-            source::Event::Cancelled if s.our_source.as_ref().is_some_and(|(c, _)| c == src) => {
+            source::Event::Cancelled if ours => {
                 s.our_source = None;
-                s.last_set = None;
             }
             _ => {}
         }
@@ -418,3 +395,21 @@ impl Dispatch<ExtDataControlSourceV1, ()> for State {
 }
 
 delegate_noop!(State: ExtDataControlManagerV1);
+
+#[cfg(test)]
+mod tests {
+    use super::same_set;
+
+    #[test]
+    fn same_set_ignores_order_and_catches_extras() {
+        let a = vec!["text/plain".to_string(), "image/png".to_string()];
+        let b = vec!["image/png".to_string(), "text/plain".to_string()];
+        assert!(same_set(&a, &b));
+        assert!(!same_set(&a, &b[..1]));
+        assert!(!same_set(
+            &a,
+            &["image/png".to_string(), "text/html".to_string()]
+        ));
+        assert!(same_set(&[], &[]));
+    }
+}
