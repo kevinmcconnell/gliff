@@ -755,6 +755,22 @@ mod tests {
     }
 
     #[test]
+    fn a_new_spool_sweeps_those_of_dead_processes() {
+        let base = tempfile::tempdir().unwrap();
+        let dead = base.path().join("4294967295-0");
+        let foreign = base.path().join("not-a-spool");
+        std::fs::create_dir_all(dead.join("x")).unwrap();
+        std::fs::create_dir(&foreign).unwrap();
+        let ours = Spool::create_in(base.path()).unwrap();
+        let ours_dir = ours.dir().to_path_buf();
+        let second = Spool::create_in(base.path()).unwrap();
+        assert!(!dead.exists());
+        assert!(foreign.exists());
+        assert!(ours_dir.exists());
+        assert_ne!(ours_dir, second.dir());
+    }
+
+    #[test]
     fn spooling_rejects_unsafe_paths() {
         run(async {
             let (a, _b, _ae, _be) = pair();

@@ -142,6 +142,7 @@ impl Spool {
 
     pub fn create_in(base: &Path) -> io::Result<Self> {
         std::fs::create_dir_all(base)?;
+        sweep_stale(base);
         let pid = std::process::id();
         for n in 0u32.. {
             let dir = base.join(format!("{pid}-{n}"));
@@ -167,6 +168,31 @@ impl Drop for Spool {
             }
         }
     }
+}
+
+/// Remove spools left by processes that no longer exist (a killed session
+/// never runs its `Drop`). Directory names are `<pid>-<n>`.
+fn sweep_stale(base: &Path) {
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|n| n.split('-').next())
+            .and_then(|p| p.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid != std::process::id() && !process_alive(pid) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+fn process_alive(pid: u32) -> bool {
+    Path::new("/proc").join(pid.to_string()).exists()
 }
 
 fn default_base() -> PathBuf {
