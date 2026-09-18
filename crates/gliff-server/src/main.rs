@@ -2,6 +2,7 @@
 //! serves it to one client over the gliff protocol. `--stdio` (spawned by ssh)
 //! or `--listen` (dev, localhost).
 
+mod clipboard;
 mod session;
 mod writer;
 

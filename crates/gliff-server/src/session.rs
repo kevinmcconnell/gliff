@@ -11,11 +11,14 @@ use anyhow::{Context, Result};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
+use bytes::Bytes;
+use gliff_proto::clipboard::CHUNK;
 use gliff_proto::{
-    ChromaMode, ClientCaps, ClientMsg, Codec, OutputInfo as ProtoOutput, Rect, ServerMsg,
-    SessionInfo, VideoPipeline, PROTOCOL_VERSION,
+    ChromaMode, ClientCaps, ClientMsg, ClipboardMsg, Codec, OutputInfo as ProtoOutput, Rect,
+    ServerMsg, SessionInfo, VideoPipeline, PROTOCOL_VERSION,
 };
 use gliff_sw::VideoMode;
+use gliff_transport::clipboard::{outbound_channel, Transfers};
 use gliff_transport::Framed;
 use gliff_vk::{DmabufPlane, EncodedFrame, Encoder, EncoderSettings, Gpu};
 
@@ -23,6 +26,8 @@ use crate::writer::Writer;
 use hypr_capture::{CaptureConfig, CaptureEvent, CapturedFrame, Capturer};
 use hypr_input::{Axis as InAxis, Clipboard, ClipboardEvent, Input, InputCmd, InputConfig};
 use hypr_wl::Target;
+
+use crate::clipboard::Bridge;
 
 pub struct Config {
     pub target: Target,
@@ -34,8 +39,6 @@ pub struct Config {
     /// Dual-stream 4:4:4 on the CPU tier too (it defaults to Single420).
     pub full_chroma: bool,
 }
-
-const TEXT_MIME: &str = "text/plain;charset=utf-8";
 
 /// Events from the capture thread.
 enum Incoming {
@@ -153,15 +156,17 @@ where
             .ok();
     }
 
-    let (clip_out_tx, mut clip_out_rx) = mpsc::unbounded_channel::<String>();
-    let clipboard = Clipboard::start(
+    let (clip_ev_tx, mut clip_ev_rx) = mpsc::unbounded_channel::<ClipboardEvent>();
+    let compositor_clipboard = Clipboard::start(
         cfg.target.clone(),
-        Box::new(move |ClipboardEvent::Text(t)| {
-            let _ = clip_out_tx.send(t);
+        Box::new(move |ev| {
+            let _ = clip_ev_tx.send(ev);
         }),
     )
     .map_err(|e| tracing::warn!(error = %e, "clipboard bridge unavailable"))
     .ok();
+    let (clip_out_tx, mut clip_out_rx) = outbound_channel();
+    let clipboard = Bridge::new(Transfers::new(clip_out_tx), compositor_clipboard);
 
     let bitrate_ctl = match cfg.bitrate {
         Some(fixed) => BitrateController::new(fixed, true),
@@ -174,7 +179,7 @@ where
     let encoder = VideoEncoder::new(&video, &settings, chroma == ChromaMode::Dual420)
         .context("create encoder")?;
 
-    let (mut msg_rx, mut clip_in_rx) = spawn_reader(reader);
+    let mut msg_rx = spawn_reader(reader);
     let (writer, mut write_reports) = Writer::spawn(writer);
 
     capturer.request_frame().ok();
@@ -208,21 +213,25 @@ where
     loop {
         let flow = tokio::select! {
             msg = msg_rx.recv() => match msg {
-                Some(msg) => session.on_client_msg(msg).await?,
+                Some(Inbound::Msg(msg)) => session.on_client_msg(msg).await?,
+                Some(Inbound::Clipboard(msg, payload)) => {
+                    clipboard.on_peer_msg(msg, payload);
+                    ControlFlow::Continue(())
+                }
                 None => {
                     tracing::info!("client disconnected");
                     ControlFlow::Break(())
                 }
             },
-            text = clip_out_rx.recv() => {
-                if let Some(text) = text {
-                    session.send_clipboard(text);
+            out = clip_out_rx.recv() => {
+                if let Some((msg, payload)) = out {
+                    session.writer.send(ServerMsg::from(msg), vec![payload.to_vec()]);
                 }
                 ControlFlow::Continue(())
             }
-            text = clip_in_rx.recv() => {
-                if let (Some(text), Some(clip)) = (text, &clipboard) {
-                    clip.set_text(text);
+            ev = clip_ev_rx.recv() => {
+                if let Some(ev) = ev {
+                    clipboard.on_compositor_event(ev);
                 }
                 ControlFlow::Continue(())
             }
@@ -284,43 +293,49 @@ where
     }
 }
 
+/// What the reader task hands the session.
+enum Inbound {
+    Msg(ClientMsg),
+    /// A clipboard message with the chunk that followed it (empty otherwise).
+    Clipboard(ClipboardMsg, Bytes),
+}
+
 /// Drain the socket on its own task so a burst of input (a mouse drag) can
 /// never starve frame capture and a blocked write can never block reads.
-/// Clipboard payloads are consumed inline and delivered as text.
-fn spawn_reader<R>(
-    mut reader: Framed<R>,
-) -> (UnboundedReceiver<ClientMsg>, UnboundedReceiver<String>)
+/// Clipboard chunks are read here so the socket stays framed.
+fn spawn_reader<R>(mut reader: Framed<R>) -> UnboundedReceiver<Inbound>
 where
     R: AsyncRead + Unpin + 'static,
 {
     let (msg_tx, msg_rx) = mpsc::unbounded_channel();
-    let (clip_tx, clip_rx) = mpsc::unbounded_channel();
     tokio::task::spawn_local(async move {
         loop {
-            match reader.read_msg::<ClientMsg>().await {
-                Ok(ClientMsg::ClipboardData { data_len, .. }) => {
-                    if data_len as u64 > gliff_proto::CLIPBOARD_MAX {
-                        break;
-                    }
-                    match reader.read_payload(data_len).await {
-                        Ok(bytes) => {
-                            if let Ok(text) = String::from_utf8(bytes.to_vec()) {
-                                let _ = clip_tx.send(text);
+            let msg = match reader.read_msg::<ClientMsg>().await {
+                Ok(m) => m,
+                Err(_) => break,
+            };
+            let inbound = match msg.into_clipboard() {
+                Err(msg) => Inbound::Msg(msg),
+                Ok(clip) => {
+                    let payload = match &clip {
+                        ClipboardMsg::Data { data_len, .. } if *data_len as usize <= CHUNK => {
+                            match reader.read_payload(*data_len).await {
+                                Ok(b) => b,
+                                Err(_) => break,
                             }
                         }
-                        Err(_) => break,
-                    }
+                        ClipboardMsg::Data { .. } => break,
+                        _ => Bytes::new(),
+                    };
+                    Inbound::Clipboard(clip, payload)
                 }
-                Ok(msg) => {
-                    if msg_tx.send(msg).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
+            };
+            if msg_tx.send(inbound).is_err() {
+                break;
             }
         }
     });
-    (msg_rx, clip_rx)
+    msg_rx
 }
 
 struct Session {
@@ -422,11 +437,12 @@ impl Session {
                 },
                 Vec::new(),
             ),
-            // ClipboardData is consumed by the reader task; the offer/request
-            // negotiation is not used for text.
+            // The reader task routes clipboard messages to the Bridge.
             ClientMsg::ClipboardData { .. }
             | ClientMsg::ClipboardOffer { .. }
-            | ClientMsg::ClipboardRequest { .. } => {}
+            | ClientMsg::ClipboardRequest { .. }
+            | ClientMsg::ClipboardAck { .. }
+            | ClientMsg::ClipboardAbort { .. } => {}
             ClientMsg::Hello { .. } => anyhow::bail!("unexpected second Hello"),
         }
         Ok(ControlFlow::Continue(()))
@@ -591,18 +607,6 @@ impl Session {
             }
         }
         seen.unwrap_or(scale)
-    }
-
-    fn send_clipboard(&mut self, text: String) {
-        let bytes = text.into_bytes();
-        let total = bytes.len() as u64;
-        let msg = ServerMsg::ClipboardData {
-            mime_type: TEXT_MIME.into(),
-            offset: 0,
-            total,
-            data_len: bytes.len() as u32,
-        };
-        self.writer.send(msg, vec![bytes]);
     }
 
     fn on_capture(&mut self, ev: Option<Incoming>) -> Result<ControlFlow<()>> {
