@@ -17,7 +17,8 @@ use tokio::sync::mpsc::{Sender, UnboundedSender};
 use tokio::sync::oneshot;
 
 use gliff_proto::clipboard::{
-    forwardable_mimes, local_mimes_for_offer, offers_files, parse_uri_list, CHUNK, URI_LIST_MIME,
+    forwardable_mimes, local_mimes_for_offer, offers_files, parse_uri_list, resolve_mime, CHUNK,
+    URI_LIST_MIME,
 };
 use gliff_proto::ClipboardFile;
 use gliff_transport::clipboard::files::{list_files, LocalFiles};
@@ -108,7 +109,20 @@ pub fn read_local(mime_type: String, reply: Sender<std::io::Result<Bytes>>) {
         let Some(cb) = clipboard() else {
             return;
         };
-        let stream = match cb.read_future(&[&mime_type], glib::Priority::DEFAULT).await {
+        // A text request may name a flavour the local source does not
+        // advertise; any text flavour it does have will do.
+        let available: Vec<String> = cb
+            .formats()
+            .mime_types()
+            .iter()
+            .map(|m| m.to_string())
+            .collect();
+        let Some(actual) = resolve_mime(&mime_type, &available) else {
+            let error = std::io::Error::other(format!("clipboard has no {mime_type}"));
+            let _ = reply.send(Err(error)).await;
+            return;
+        };
+        let stream = match cb.read_future(&[actual], glib::Priority::DEFAULT).await {
             Ok((stream, _)) => stream,
             Err(e) => {
                 let _ = reply.send(Err(std::io::Error::other(e.to_string()))).await;
