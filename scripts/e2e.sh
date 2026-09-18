@@ -90,6 +90,10 @@ run_server_test 9041 "Single420 stream" --low-bandwidth
 
 echo "== 5. clipboard both directions =="
 command -v wl-copy >/dev/null && command -v wl-paste >/dev/null || fail "wl-clipboard not installed"
+# The probe offers its item after a few frames and requests the compositor's
+# item on its own. Wait for both before pasting and killing anything.
+wait_type() { for i in $(seq 1 60); do wl-paste -l 2>/dev/null | grep -qx "$1" && return 0; sleep 0.25; done; return 1; }
+wait_recv() { for i in $(seq 1 60); do grep -q "$1" "$2" && return 0; sleep 0.25; done; return 1; }
 wl-copy "e2e-clip-in" 2>/dev/null
 "$SERVER" --listen 127.0.0.1:9042 --headless --instance "$NEST_SIG" >/tmp/gliff-e2e-server.log 2>&1 &
 csp=$!; PIDS+=("$csp"); sleep 2
@@ -97,7 +101,8 @@ damage & cdp=$!; PIDS+=("$cdp")
 clipf=$(mktemp)
 GLIFF_SEND_CLIP="e2e-clip-out" timeout 20 $PROBE serve-test --connect 127.0.0.1:9042 --frames 200 >"$clipf" 2>&1 &
 clipc=$!; PIDS+=("$clipc")
-sleep 5
+wait_type "text/plain;charset=utf-8" || fail "server never offered the client's text"
+wait_recv "CLIP-RECV:" "$clipf" || fail "client never received the compositor's text"
 pasted=$(wl-paste -n 2>/dev/null)
 kill "$clipc" "$cdp" "$csp" 2>/dev/null
 grep -q "CLIP-RECV: e2e-clip-in" "$clipf" || fail "compositor->client clipboard (got: $(grep CLIP-RECV "$clipf"))"
@@ -115,7 +120,8 @@ damage & bdp=$!; PIDS+=("$bdp")
 clipf=$(mktemp)
 GLIFF_SEND_CLIP_FILE="$blob" GLIFF_RECV_CLIP_FILE="$recvf" timeout 20 $PROBE serve-test --connect 127.0.0.1:9043 --frames 200 >"$clipf" 2>&1 &
 bclipc=$!; PIDS+=("$bclipc")
-sleep 5
+wait_type "application/octet-stream" || fail "server never offered the client's binary item"
+wait_recv "CLIP-RECV-FILE:" "$clipf" || fail "client never received the compositor's binary item"
 wl-paste --type application/octet-stream >"$outf" 2>/dev/null
 kill "$bclipc" "$bdp" "$bsp" 2>/dev/null
 grep -q "CLIP-RECV-FILE: 1048576 bytes" "$clipf" || fail "compositor->client binary clipboard (got: $(grep CLIP-RECV "$clipf"))"
@@ -135,7 +141,8 @@ damage & fdp=$!; PIDS+=("$fdp")
 clipf=$(mktemp)
 GLIFF_SEND_CLIP_FILES="$srcd/photos:$srcd/solo.txt" GLIFF_RECV_CLIP_DIR="$recvd" timeout 20 $PROBE serve-test --connect 127.0.0.1:9044 --frames 200 >"$clipf" 2>&1 &
 fclipc=$!; PIDS+=("$fclipc")
-sleep 5
+wait_type "text/uri-list" || fail "server never offered the client's files"
+wait_recv "CLIP-RECV-FILES:" "$clipf" || fail "client never received the compositor's files"
 pasted_uris=$(wl-paste --type text/uri-list 2>/dev/null | tr -d '\r')
 kill "$fclipc" "$fdp" "$fsp" 2>/dev/null
 grep -q "CLIP-RECV-FILES: 5 entries" "$clipf" || fail "compositor->client files (probe said: $(grep -iE 'clip|offer|serv|error|panick' "$clipf" | tail -8 | tr '\n' ' '); server said: $(grep -iE 'clip|warn' /tmp/gliff-e2e-server.log | tail -5 | tr '\n' ' '))"
