@@ -430,9 +430,12 @@ impl<S: ChunkSource> Chunked<S> {
     async fn next(&mut self) -> io::Result<Option<Bytes>> {
         let mut b = match self.rest.take() {
             Some(b) => b,
-            None => match self.source.next().await? {
-                Some(b) if !b.is_empty() => b,
-                _ => return Ok(None),
+            None => loop {
+                match self.source.next().await? {
+                    Some(b) if b.is_empty() => continue,
+                    Some(b) => break b,
+                    None => return Ok(None),
+                }
             },
         };
         if b.len() > CHUNK {
@@ -768,6 +771,50 @@ mod tests {
         assert!(foreign.exists());
         assert!(ours_dir.exists());
         assert_ne!(ours_dir, second.dir());
+    }
+
+    #[test]
+    fn a_file_longer_than_declared_is_refused() {
+        run(async {
+            let (a, b, _ae, be) = pair();
+            let b2 = b.clone();
+            tokio::task::spawn_local(async move {
+                loop {
+                    if let Some(Event::Request { id, .. }) = be.borrow_mut().pop() {
+                        b2.serve(id, ReadSource(&b"more than one byte"[..]));
+                    }
+                    tokio::task::yield_now().await;
+                }
+            });
+            let base = tempfile::tempdir().unwrap();
+            let spool = Spool::create_in(base.path()).unwrap();
+            let files = vec![ClipboardFile {
+                path: "short".into(),
+                size: 1,
+                dir: false,
+            }];
+            let r = fetch_files(&a, &files, &spool).await;
+            assert!(
+                matches!(r, Err(TransferError::Chunk(ChunkError::OverCap(1)))),
+                "{r:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_retired_spool_lives_for_the_grace_period() {
+        run(async {
+            tokio::time::pause();
+            let base = tempfile::tempdir().unwrap();
+            let spool = Rc::new(Spool::create_in(base.path()).unwrap());
+            let dir = spool.dir().to_path_buf();
+            files::retire(spool);
+            tokio::time::sleep(files::SPOOL_GRACE / 2).await;
+            assert!(dir.exists());
+            tokio::time::sleep(files::SPOOL_GRACE).await;
+            tokio::task::yield_now().await;
+            assert!(!dir.exists());
+        });
     }
 
     #[test]

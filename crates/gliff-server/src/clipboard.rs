@@ -27,7 +27,7 @@ use gliff_proto::clipboard::{
 };
 use gliff_proto::{ClipboardFile, ClipboardItem, ClipboardMsg};
 use gliff_transport::clipboard::files::{
-    fetch_files, list_files, open_source, write_body, LocalFiles, Spool,
+    fetch_files, list_files, open_source, retire, write_body, LocalFiles, Spool,
 };
 use gliff_transport::clipboard::{Event, ReadSource, Transfers, WriteSink};
 use hypr_input::{Clipboard, ClipboardEvent};
@@ -89,12 +89,16 @@ impl Bridge {
 
     fn on_remote_offer(&self, mime_types: Vec<String>, files: Vec<ClipboardFile>) {
         let advertise = local_mimes_for_offer(&mime_types, !files.is_empty());
-        let mut remote = self.remote.borrow_mut();
-        // Dropping the previous spool removes its files.
-        *remote = RemoteOffer {
-            files,
-            ..RemoteOffer::default()
-        };
+        let previous = std::mem::replace(
+            &mut *self.remote.borrow_mut(),
+            RemoteOffer {
+                files,
+                ..RemoteOffer::default()
+            },
+        );
+        if let Some(spool) = previous.spool {
+            retire(spool);
+        }
         if let Some(c) = &self.compositor {
             c.offer(advertise);
         }
