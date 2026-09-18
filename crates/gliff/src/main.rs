@@ -227,7 +227,11 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
     }
 
     let css = gtk::CssProvider::new();
-    css.load_from_string(".stats { background: rgba(0,0,0,0.6); color: #fff; padding: 6px; margin: 6px; border-radius: 6px; font-family: monospace; }");
+    css.load_from_string(concat!(
+        ".stats { background: rgba(0,0,0,0.6); color: #fff; padding: 6px; margin: 6px; border-radius: 6px; font-family: monospace; }",
+        ".transfers { margin: 6px; }",
+        ".transfer { background: rgba(0,0,0,0.7); color: #fff; padding: 6px 8px; border-radius: 6px; }",
+    ));
     if let Some(display) = gdk::Display::default() {
         gtk::style_context_add_provider_for_display(
             &display,
@@ -388,6 +392,9 @@ fn poll_status(ui: Rc<App>, rx: Receiver<Status>) {
                 }
                 Status::ClipboardRead { mime_type, reply } => {
                     clipboard_ui::read_local(mime_type, reply)
+                }
+                Status::ClipboardTransfer { id, progress } => {
+                    tracing::debug!(id, ?progress, "clipboard paste");
                 }
                 Status::Error(e) => {
                     tracing::error!(error = %e, "connection failed");

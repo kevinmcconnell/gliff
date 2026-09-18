@@ -10,6 +10,7 @@
 //! tokio `LocalSet`; the engine's own tasks are spawned locally.
 
 pub mod files;
+pub mod progress;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -477,6 +478,7 @@ impl Drop for FetchGuard {
 #[cfg(test)]
 mod tests {
     use super::files::{fetch_files, list_files, open_source, Spool};
+    use super::progress::Meter;
     use super::*;
     use std::io::Cursor;
     use tokio::task::LocalSet;
@@ -733,7 +735,9 @@ mod tests {
             });
             let base = tempfile::tempdir().unwrap();
             let spool = Spool::create_in(base.path()).unwrap();
-            let tops = fetch_files(&a, &local.entries, &spool).await.unwrap();
+            let tops = fetch_files(&a, &local.entries, &spool, &Meter::default())
+                .await
+                .unwrap();
             assert_eq!(
                 tops,
                 vec![spool.dir().join("photos"), spool.dir().join("solo.md")]
@@ -793,7 +797,7 @@ mod tests {
                 size: 1,
                 dir: false,
             }];
-            let r = fetch_files(&a, &files, &spool).await;
+            let r = fetch_files(&a, &files, &spool, &Meter::default()).await;
             assert!(
                 matches!(r, Err(TransferError::Chunk(ChunkError::OverCap(1)))),
                 "{r:?}"
@@ -828,7 +832,7 @@ mod tests {
                 size: 1,
                 dir: false,
             }];
-            let r = fetch_files(&a, &files, &spool).await;
+            let r = fetch_files(&a, &files, &spool, &Meter::default()).await;
             assert!(matches!(r, Err(TransferError::Io(_))), "{r:?}");
             assert!(!base.path().join("escape").exists());
         });
