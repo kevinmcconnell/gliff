@@ -177,7 +177,14 @@ fn main() -> Result<()> {
             height,
             no_decode,
             csv,
-        } => stream_bench(&node, &connect, seconds, (width, height), no_decode, csv.as_deref())?,
+        } => stream_bench(
+            &node,
+            &connect,
+            seconds,
+            (width, height),
+            no_decode,
+            csv.as_deref(),
+        )?,
         Cmd::Clipboard { set, secs } => clipboard(&target, set, secs)?,
         Cmd::Bench { iters } => bench(iters)?,
         Cmd::All => {

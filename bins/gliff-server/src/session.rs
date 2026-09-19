@@ -412,7 +412,10 @@ impl Session {
                 self.in_flight = self.in_flight.saturating_sub(1);
                 let acked = self.rtt.record(frame_id, decoded_at_ms);
                 self.n_limit = self.rtt.window(self.settings.framerate);
-                if self.bitrate_ctl.on_ack(acked, &mut self.rtt, self.settings.framerate) {
+                if self
+                    .bitrate_ctl
+                    .on_ack(acked, &mut self.rtt, self.settings.framerate)
+                {
                     self.apply_rate();
                 }
             }
@@ -509,8 +512,18 @@ impl Session {
         // so the logical size is whole; wait for it and use what it chose.
         let applied = self.wait_for_mode(width, height, scale).await;
         if !same_size {
-            self.bitrate_ctl = BitrateController::new(width, height, self.bitrate_ctl.streams, self.bitrate_ctl.cap);
-            let settings = encoder_settings(width, height, self.bitrate_ctl.bitrate(self.max_fps), self.max_fps);
+            self.bitrate_ctl = BitrateController::new(
+                width,
+                height,
+                self.bitrate_ctl.streams,
+                self.bitrate_ctl.cap,
+            );
+            let settings = encoder_settings(
+                width,
+                height,
+                self.bitrate_ctl.bitrate(self.max_fps),
+                self.max_fps,
+            );
             match Encoder::new(
                 &self.gpu,
                 settings.clone(),
@@ -561,8 +574,18 @@ impl Session {
         if stream == self.stream {
             return Ok(());
         }
-        self.bitrate_ctl = BitrateController::new(stream.0, stream.1, self.bitrate_ctl.streams, self.bitrate_ctl.cap);
-        let settings = encoder_settings(stream.0, stream.1, self.bitrate_ctl.bitrate(self.max_fps), self.max_fps);
+        self.bitrate_ctl = BitrateController::new(
+            stream.0,
+            stream.1,
+            self.bitrate_ctl.streams,
+            self.bitrate_ctl.cap,
+        );
+        let settings = encoder_settings(
+            stream.0,
+            stream.1,
+            self.bitrate_ctl.bitrate(self.max_fps),
+            self.max_fps,
+        );
         match Encoder::new(
             &self.gpu,
             settings.clone(),
@@ -748,7 +771,11 @@ impl Session {
         let interval = Duration::from_secs_f64(1.0 / self.max_fps as f64);
         let t0 = Instant::now();
         let from_slot = self.next_send_at + interval;
-        self.next_send_at = if from_slot > t0 { from_slot } else { t0 + interval };
+        self.next_send_at = if from_slot > t0 {
+            from_slot
+        } else {
+            t0 + interval
+        };
         let encoded = self.encoder.encode_dmabuf(buffer_key, &plane, key)?;
         let enc_us = t0.elapsed().as_micros();
         let aux = encoded.aux.unwrap_or_default();
@@ -1078,13 +1105,15 @@ impl BitrateController {
         self.acks.clear();
         let next = if queueing > Self::QUEUE_HIGH_MS || starved {
             self.slow_start = false;
-            let per_frame = acked_rate
-                .map(|rate| 0.85 * rate / (self.streams as f64 * pace.max(1) as f64));
+            let per_frame =
+                acked_rate.map(|rate| 0.85 * rate / (self.streams as f64 * pace.max(1) as f64));
             let target = match per_frame {
                 Some(bits) => bits as u32,
                 None => self.current / 4 * 3,
             };
-            target.clamp(self.current / 2, self.current / 100 * 90).max(self.min)
+            target
+                .clamp(self.current / 2, self.current / 100 * 90)
+                .max(self.min)
         } else if queueing < Self::QUEUE_LOW_MS {
             let (step, after) = if self.slow_start {
                 (125, Duration::from_millis(500))

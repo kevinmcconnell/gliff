@@ -91,6 +91,11 @@ cargo fmt --all --check    # formatting (rustfmt defaults)
 ./scripts/e2e.sh           # full stack against a nested Hyprland (needs a GPU)
 ```
 
+`gliff-probe stream-bench` connects to a running server and reports frame
+rate, interval jitter, capture-to-decode latency and bandwidth;
+`scripts/bench.sh` drives it against a nested Hyprland, optionally through
+`scripts/throttle-proxy.py` to stand in for a slow link.
+
 `scripts/e2e.sh` must run inside a Hyprland session; it boots a nested Hyprland
 and asserts the probe checks, the 4:4:4 capture pipeline, and both Dual420 and
 Single420 server-plus-client streams.
