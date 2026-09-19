@@ -8,6 +8,7 @@
 mod keymap;
 mod net;
 mod paintable;
+mod theme;
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
@@ -85,6 +86,8 @@ struct App {
     endpoint: RefCell<Option<Endpoint>>,
     /// Consecutive failed connection attempts, reset on a successful connect.
     retries: Cell<u32>,
+    /// Watches the Omarchy theme directory; dropping it stops theme updates.
+    _theme_monitor: Option<gtk::gio::FileMonitor>,
 }
 
 fn main() -> glib::ExitCode {
@@ -120,15 +123,23 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
     let fullscreen_btn = gtk::ToggleButton::builder()
         .icon_name("view-fullscreen-symbolic")
         .build();
+    let stats_btn = gtk::ToggleButton::builder()
+        .icon_name("utilities-system-monitor-symbolic")
+        .tooltip_text("Show stats")
+        .build();
     header.pack_start(&host_entry);
     header.pack_start(&connect_btn);
     header.pack_end(&fullscreen_btn);
+    header.pack_end(&stats_btn);
 
     let stats = gtk::Label::builder()
         .halign(gtk::Align::Start)
         .valign(gtk::Align::Start)
         .css_classes(["stats"])
-        .visible(false)
+        .build();
+    stats_btn
+        .bind_property("active", &stats, "visible")
+        .sync_create()
         .build();
     let status = gtk::Label::builder().label("Not connected").build();
 
@@ -168,6 +179,7 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         endpoint: RefCell::new(None),
         retries: Cell::new(0),
         last_remote_clip: RefCell::new(None),
+        _theme_monitor: theme::follow_omarchy_theme(),
     });
 
     let hotkey = ReleaseHotkey::parse(&cli.release_hotkey).unwrap_or_else(|e| {
@@ -382,7 +394,6 @@ fn poll_status(ui: Rc<App>, rx: Receiver<Status>) {
                     mbit,
                     decode_ms,
                 } => {
-                    ui.stats.set_visible(true);
                     ui.stats.set_text(&format!(
                         "{fps:.0} fps  {mbit:.1} Mbit/s  decode {decode_ms:.1} ms"
                     ));
@@ -401,6 +412,7 @@ fn poll_status(ui: Rc<App>, rx: Receiver<Status>) {
                     }
                 }
                 Status::Error(e) => {
+                    tracing::error!(error = %e, "connection failed");
                     ui.status.set_text(&format!("Error: {e}"));
                     schedule_reconnect(ui.clone());
                     return glib::ControlFlow::Break;
@@ -417,17 +429,16 @@ fn poll_status(ui: Rc<App>, rx: Receiver<Status>) {
 
 /// Show the remote cursor as the video widget's own cursor, so the local
 /// compositor draws it at the real pointer position with no added latency.
+/// An image with no visible shape (fully transparent, or one flat colour as
+/// Hyprland sends when it has no cursor image to share) falls back to the
+/// default pointer so the user is never left without one.
 fn set_remote_cursor(ui: &App, width: u32, height: u32, hot_x: i32, hot_y: i32, argb: &[u8]) {
     let needed = width as u64 * height as u64 * 4;
     if width == 0 || height == 0 || width > 1024 || height > 1024 || (argb.len() as u64) < needed {
         return;
     }
-    let opaque = argb.chunks_exact(4).any(|p| p[3] != 0);
-    if !opaque {
-        // Fully transparent: hide the pointer over the video.
-        if let Some(cursor) = gdk::Cursor::from_name("none", None) {
-            ui.video.set_cursor(Some(&cursor));
-        }
+    if !has_visible_shape(argb) {
+        ui.video.set_cursor(None);
         return;
     }
     let bytes = glib::Bytes::from(argb);
@@ -440,6 +451,16 @@ fn set_remote_cursor(ui: &App, width: u32, height: u32, hot_x: i32, hot_y: i32, 
     );
     let cursor = gdk::Cursor::from_texture(&texture, hot_x, hot_y, None);
     ui.video.set_cursor(Some(&cursor));
+}
+
+fn has_visible_shape(argb: &[u8]) -> bool {
+    let mut pixels = argb.chunks_exact(4);
+    let Some(first) = pixels.next() else {
+        return false;
+    };
+    let opaque = first[3] != 0 || pixels.clone().any(|p| p[3] != 0);
+    let uniform = pixels.all(|p| p == first);
+    opaque && !uniform
 }
 
 /// Map a widget-space point to the remote output's logical coordinates:
@@ -684,6 +705,7 @@ fn install_input_handlers(
                 return glib::Propagation::Stop;
             }
             let code = keycode.saturating_sub(8);
+            tracing::debug!(code, "key pressed");
             if track_key(&ui, code, true) {
                 send(
                     &ui,
@@ -798,6 +820,7 @@ fn install_input_handlers(
             hk => Some(format!("Shortcuts captured — {} to release", hk.describe())),
         };
         focus.connect_enter(move |_| {
+            tracing::debug!("video focused; inhibiting system shortcuts");
             if let Some(toplevel) = window.surface().and_downcast::<gdk::Toplevel>() {
                 toplevel.inhibit_system_shortcuts(None::<&gdk::Event>);
             }
@@ -810,6 +833,7 @@ fn install_input_handlers(
         let window = window.clone();
         let ui = ui.clone();
         focus.connect_leave(move |_| {
+            tracing::debug!("video unfocused; restoring system shortcuts");
             release_pressed_keys(&ui);
             if let Some(toplevel) = window.surface().and_downcast::<gdk::Toplevel>() {
                 toplevel.restore_system_shortcuts();
@@ -879,6 +903,17 @@ fn evdev_button(n: u32) -> u32 {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[test]
+    fn visible_shape_needs_alpha_and_contrast() {
+        let transparent = [0u8; 16];
+        let black = [0, 0, 0, 255].repeat(4);
+        let mut arrow = [0u8; 16];
+        arrow[3] = 255;
+        assert!(!has_visible_shape(&transparent));
+        assert!(!has_visible_shape(&black));
+        assert!(has_visible_shape(&arrow));
+    }
 
     #[test]
     fn parse_chord_and_double_and_none() {

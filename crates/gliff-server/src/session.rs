@@ -91,11 +91,20 @@ where
                 name: output.name.clone(),
                 width: output.width,
                 height: output.height,
-                scale_milli: 1000,
+                scale_milli: (output.scale * 1000.0).round() as u32,
             }],
         })
         .await?;
-    let stream = (output.width, output.height);
+    let gpu = Gpu::open(Some(&cfg.render_node)).context("open Vulkan device")?;
+    let encoder_max = Encoder::max_size(&gpu).context("query encoder limits")?;
+    let stream = EncoderSettings::fit_extent(output.width, output.height, encoder_max);
+    if stream != (output.width, output.height) {
+        tracing::info!(
+            width = stream.0,
+            height = stream.1,
+            "scaling the stream to the encoder maximum"
+        );
+    }
     writer
         .write_msg(&stream_config(codec, chroma, &output, stream))
         .await?;
@@ -105,6 +114,19 @@ where
 
     let input = Arc::new(start_input(&cfg.target, &output.name, &keymap)?);
     input.send(output.logical_extent()).ok();
+    if output.is_headless() {
+        // Focus follows the pointer, so put it on the new screen right away:
+        // otherwise the first launched window lands on the remote's own screen.
+        let InputCmd::SetExtent { width, height } = output.logical_extent() else {
+            unreachable!()
+        };
+        input
+            .send(InputCmd::Motion {
+                x: width as f64 / 2.0,
+                y: height as f64 / 2.0,
+            })
+            .ok();
+    }
 
     let (clip_out_tx, mut clip_out_rx) = mpsc::unbounded_channel::<String>();
     let clipboard = Clipboard::start(
@@ -116,7 +138,6 @@ where
     .map_err(|e| tracing::warn!(error = %e, "clipboard bridge unavailable"))
     .ok();
 
-    let gpu = Gpu::open(Some(&cfg.render_node)).context("open Vulkan device")?;
     let streams = if chroma == ChromaMode::Dual420 { 2 } else { 1 };
     let bitrate_ctl = BitrateController::new(stream.0, stream.1, streams, cfg.bitrate);
     let max_fps = cfg.max_fps.clamp(MIN_RC_FPS, 240);
@@ -130,7 +151,7 @@ where
     let encoder = Encoder::new(&gpu, settings.clone(), chroma == ChromaMode::Dual420)
         .context("create encoder")?;
 
-    let (mut msg_rx, mut clip_in_rx) = spawn_reader(reader, input.clone());
+    let (mut msg_rx, mut clip_in_rx) = spawn_reader(reader, Arc::downgrade(&input));
     let (out, queued_frames) = spawn_writer(writer);
 
     capturer.request_frame().ok();
@@ -144,6 +165,7 @@ where
         fit: stream,
         base_chroma: chroma,
         ladder: Ladder::new(),
+        encoder_max,
         caps,
         bitrate_ctl,
         codec,
@@ -202,7 +224,18 @@ where
     }
 
     session.inject(InputCmd::ReleaseAll);
-    // Dropping the session removes a created headless output.
+    let Session {
+        capturer,
+        input,
+        output,
+        ..
+    } = session;
+    // Hyprland 0.56 aborts if a cursor capture session is still alive when
+    // its monitor is removed, so end the capture and input threads before
+    // dropping the output.
+    drop(capturer);
+    drop(input);
+    drop(output);
     Ok(())
 }
 
@@ -242,7 +275,7 @@ where
 /// payloads are consumed inline and delivered as text.
 fn spawn_reader<R>(
     mut reader: Framed<R>,
-    input: Arc<Input>,
+    input: std::sync::Weak<Input>,
 ) -> (UnboundedReceiver<ClientMsg>, UnboundedReceiver<String>)
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -276,6 +309,11 @@ where
                         }
                         Ok(msg) => {
                             if let Some(cmd) = input_cmd(&msg) {
+                                // The session owns the input thread; once it
+                                // has dropped it, there is nothing to inject into.
+                                let Some(input) = input.upgrade() else {
+                                    break;
+                                };
                                 if input.send(cmd).is_err() {
                                     break;
                                 }
@@ -367,6 +405,8 @@ struct Session {
     /// The chroma mode the session was set up with; the ladder may drop below.
     base_chroma: ChromaMode,
     ladder: Ladder,
+    /// The largest size the encoder accepts.
+    encoder_max: (u32, u32),
     caps: ClientCaps,
     bitrate_ctl: BitrateController,
     codec: Codec,
@@ -425,7 +465,15 @@ impl Session {
             } => {
                 self.in_flight = self.in_flight.saturating_sub(1);
                 let acked = self.rtt.record(frame_id, decoded_at_ms);
-                self.n_limit = self.rtt.window(self.settings.framerate);
+                let n_limit = self.rtt.window(self.settings.framerate);
+                if n_limit != self.n_limit {
+                    tracing::debug!(
+                        rtt_ms = format!("{:.1}", self.rtt.smoothed_ms),
+                        n_limit,
+                        "ack window changed"
+                    );
+                    self.n_limit = n_limit;
+                }
                 if let Some(changed) =
                     self.bitrate_ctl
                         .on_ack(acked, &mut self.rtt, self.settings.framerate)
@@ -524,9 +572,13 @@ impl Session {
             return Ok(());
         }
         tracing::info!(width, height, scale, "resizing headless output");
-        self.instance
+        if let Err(e) = self
+            .instance
             .set_monitor_mode(&self.output.name, width, height, 60, scale)
-            .ok();
+        {
+            tracing::warn!(error = %e, "could not resize the headless output");
+            return Ok(());
+        }
         // Hyprland applies the mode asynchronously and may round the scale
         // so the logical size is whole; wait for it and use what it chose.
         let applied = self.wait_for_mode(width, height, scale).await;
@@ -570,7 +622,8 @@ impl Session {
     /// level, carry the link estimate over, and tell the client. Returns
     /// false, with nothing changed, when the encoder rejects the size.
     fn rebuild_encoder(&mut self, fit: (u32, u32)) -> bool {
-        let stream = self.ladder.scale(fit);
+        let scaled = self.ladder.scale(fit);
+        let stream = EncoderSettings::fit_extent(scaled.0, scaled.1, self.encoder_max);
         let chroma = self.ladder.chroma(self.base_chroma);
         let streams = if chroma == ChromaMode::Dual420 { 2 } else { 1 };
         let pace = self.settings.framerate.min(self.pace_cap());
@@ -1073,12 +1126,29 @@ fn setup_output(
         .find(|m| !before.contains(&m.name))
         .context("headless output did not appear")?;
     output.name = m.name.clone();
-    output.width = caps.max_width.clamp(320, 1920) & !1;
-    output.height = caps.max_height.clamp(240, 1080) & !1;
-    instance
-        .set_monitor_mode(&output.name, output.width, output.height, 60, 1.0)
-        .ok();
-    std::thread::sleep(Duration::from_millis(150));
+    let width = caps.max_width.clamp(320, 1920) & !1;
+    let height = caps.max_height.clamp(240, 1080) & !1;
+    if let Err(e) = instance.set_monitor_mode(&output.name, width, height, 60, 1.0) {
+        tracing::warn!(error = %e, "could not set the headless output mode");
+    }
+    // Hyprland applies the mode asynchronously; stream whatever it settled
+    // on rather than the size we asked for.
+    let mut applied = None;
+    for _ in 0..10 {
+        std::thread::sleep(Duration::from_millis(50));
+        let mons = instance.monitors()?;
+        let Some(m) = mons.iter().find(|m| m.name == output.name) else {
+            continue;
+        };
+        applied = Some((m.width, m.height, m.scale));
+        if m.width == width && m.height == height {
+            break;
+        }
+    }
+    let (w, h, scale) = applied.context("headless output vanished")?;
+    output.width = w & !1;
+    output.height = h & !1;
+    output.scale = scale;
     Ok(output)
 }
 

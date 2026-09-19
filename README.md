@@ -1,5 +1,7 @@
 # gliff
 
+[![CI](https://github.com/kevinmcconnell/gliff/actions/workflows/ci.yml/badge.svg)](https://github.com/kevinmcconnell/gliff/actions/workflows/ci.yml)
+
 Remote-desktop a Hyprland session from another Hyprland machine, over SSH only.
 Custom wire protocol, Vulkan Video hardware encode and decode, full-resolution
 4:4:4 colour by the RDP AVC444 technique (two 4:2:0 H.264 streams recombined on
@@ -23,15 +25,32 @@ Working and validated on AMD (Ryzen Granite Ridge, Mesa RADV):
   inhibits system shortcuts (release with `Shift+Esc`, set by
   `--release-hotkey`), and auto-reconnects. Validated over localhost against a
   nested Hyprland: connect, stream, resize, ack pacing, both chroma modes.
+- The client follows the Omarchy theme: it maps the palette in
+  `~/.local/state/omarchy/current/theme/colors.toml` onto the libadwaita
+  colour variables, picks the matching light or dark scheme, and re-applies on
+  `omarchy theme set`. Without Omarchy it is stock Adwaita and follows the
+  desktop dark/light preference.
+
+On Intel (Mesa ANV) the client has been tested and works, but we have not
+started server support yet. The client needs
+`ANV_DEBUG=video-decode,video-encode` set; `docs/hardware-quirks.md` explains
+why.
 
 Design and the full picture are in `docs/architecture.md`; driver-specific
 behaviour and test gaps are in `docs/hardware-quirks.md`.
 
-Not done yet: image/binary clipboard (text works both ways); native
-single-stream 4:4:4 and AV1/HEVC; a verified ssh-from-cold-machine path; and
-testing on Intel and NVIDIA Vulkan drivers.
+Not done yet: image/binary clipboard (text works both ways); AV1 for outputs
+above 4096 wide (H.264 is scaled to fit today) and native single-stream
+4:4:4; a verified ssh-from-cold-machine path; Intel server support; and
+testing on NVIDIA Vulkan drivers.
 
 ## Build
+
+Prebuilt x86_64 binaries are on the [releases
+page](https://github.com/kevinmcconnell/gliff/releases): every push to `main`
+updates the `latest` pre-release, and `v*` tags make permanent releases.
+
+To build from source:
 
 ```
 cargo build --release
@@ -116,4 +135,4 @@ Single420 server-plus-client streams.
 - `crates/gliff-vk` the Vulkan media pipeline: device, dmabuf import/export,
   split and recombine compute shaders, H.264 encode/decode, header parser.
   The only crate with `unsafe`.
-- `bins/gliff-server`, `bins/gliff`, `tools/gliff-probe`.
+- `crates/gliff` the GTK client, `crates/gliff-server`, `crates/gliff-probe`.

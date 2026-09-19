@@ -45,15 +45,14 @@ impl Instance {
         let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
             .ok_or(Error::NoRuntimeDir)?;
-        Self::discover_in(&runtime_dir, explicit)
+        let from_env = std::env::var("HYPRLAND_INSTANCE_SIGNATURE").ok();
+        Self::discover_in(&runtime_dir, explicit.or(from_env.as_deref()))
     }
 
+    /// Like [`discover`](Self::discover), but reads nothing from the environment.
     pub fn discover_in(runtime_dir: &Path, explicit: Option<&str>) -> Result<Self> {
         let hypr_dir = runtime_dir.join("hypr");
-        let explicit = explicit
-            .map(str::to_owned)
-            .or_else(|| std::env::var("HYPRLAND_INSTANCE_SIGNATURE").ok());
-        if let Some(sig) = explicit {
+        if let Some(sig) = explicit.map(str::to_owned) {
             let dir = hypr_dir.join(&sig);
             if !dir.join(".socket.sock").exists() {
                 return Err(Error::UnknownInstance(sig));
@@ -147,7 +146,9 @@ impl Instance {
         self.dispatch(&format!("output remove {name}"))
     }
 
-    /// Apply a monitor rule: `name,WxH@hz,position,scale`.
+    /// Apply a monitor rule for `name`. A legacy (hyprlang) config takes the
+    /// `monitor` keyword; a Lua config rejects keywords and takes the same
+    /// rule through `eval hl.monitor`.
     pub fn set_monitor_mode(
         &self,
         name: &str,
@@ -156,9 +157,15 @@ impl Instance {
         hz: u32,
         scale: f32,
     ) -> Result<()> {
-        self.dispatch(&format!(
-            "keyword monitor {name},{width}x{height}@{hz},auto,{scale}"
-        ))
+        let keyword = format!("keyword monitor {name},{width}x{height}@{hz},auto,{scale}");
+        match self.dispatch(&keyword) {
+            Err(Error::Command { response, .. }) if response.contains("non-legacy") => {
+                self.dispatch(&format!(
+                    "eval hl.monitor({{ output = \"{name}\", mode = \"{width}x{height}@{hz}\", position = \"auto\", scale = {scale} }})"
+                ))
+            }
+            other => other,
+        }
     }
 }
 

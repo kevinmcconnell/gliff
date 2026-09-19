@@ -1,0 +1,118 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+        with:
+          cache: "false"
+      - run: cargo fmt --all --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+      - run: mbx clippy --workspace --all-targets --locked -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+      - run: mbx test --workspace --locked
+
+  release:
+    needs: [fmt, clippy, test]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    permissions:
+      contents: write
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+        with:
+          cache: "false"
+          extra-packages: github-cli
+
+      - run: cargo build --release --locked
+
+      - name: Package
+        id: package
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            version="$GITHUB_REF_NAME"
+          else
+            version="main-${GITHUB_SHA::7}"
+          fi
+          name="gliff-$version-x86_64-linux"
+          mkdir -p "dist/$name"
+          cp target/release/gliff target/release/gliff-server target/release/gliff-probe "dist/$name/"
+          cp README.md LICENSE docs/hardware-quirks.md "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "archive=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Write release notes
+        run: |
+          cat > notes.md <<'NOTES'
+          Prebuilt x86_64 Linux binaries: `gliff` (client), `gliff-server`, `gliff-probe`.
+
+          The binaries are dynamically linked. Runtime requirements:
+
+          - `gliff`: GTK >= 4.14, libadwaita >= 1.0, glibc >= 2.39, plus a Vulkan loader.
+          - `gliff-server`, `gliff-probe`: glibc >= 2.34, libxkbcommon, libgbm, libdrm,
+            plus a Vulkan loader and a driver with Vulkan Video.
+
+          To build from source or make an Arch package, use the `PKGBUILD` in the repo.
+          NOTES
+
+      - name: Publish tagged release
+        if: github.ref_type == 'tag'
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            --notes-file notes.md \
+            "${{ steps.package.outputs.archive }}" \
+            "${{ steps.package.outputs.archive }}.sha256"
+
+      - name: Publish rolling latest pre-release
+        if: github.ref_type == 'branch'
+        run: |
+          gh release delete latest --cleanup-tag --yes || true
+          printf 'Automated build of `main` at %s.\n\n' "$GITHUB_SHA" > latest-notes.md
+          cat notes.md >> latest-notes.md
+          gh release create latest \
+            --target "$GITHUB_SHA" \
+            --prerelease \
+            --title "Latest build (main)" \
+            --notes-file latest-notes.md \
+            "${{ steps.package.outputs.archive }}" \
+            "${{ steps.package.outputs.archive }}.sha256"
