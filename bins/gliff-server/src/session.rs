@@ -681,9 +681,13 @@ impl Session {
     /// The client has ack capacity and the previous frame has left for the
     /// wire, so encoding another now will not build a queue.
     fn can_send(&self) -> bool {
-        self.in_flight < self.n_limit
-            && self.queued_frames.load(Ordering::Acquire) == 0
-            && Instant::now() >= self.next_send_at
+        self.link_has_room() && Instant::now() >= self.next_send_at
+    }
+
+    /// The link side of `can_send`: waiting for a pace slot is not
+    /// congestion, so only this part counts as a blocked frame.
+    fn link_has_room(&self) -> bool {
+        self.in_flight < self.n_limit && self.queued_frames.load(Ordering::Acquire) == 0
     }
 
     /// Encode and send the pending frame if the link can take it, then ask
@@ -692,7 +696,7 @@ impl Session {
     /// newest, not the one that was waiting.
     async fn pump_encoder(&mut self) -> Result<()> {
         // Count a blocked frame once, not once per event-loop pass.
-        if self.pending.is_some() && !self.can_send() && !self.blocked_noted {
+        if self.pending.is_some() && !self.link_has_room() && !self.blocked_noted {
             self.bitrate_ctl.note_blocked();
             self.blocked_noted = true;
         }
@@ -738,7 +742,13 @@ impl Session {
         // the ring is reallocated (resize), so old imports are never reused.
         let buffer_key = (frame.buffer.generation << 32) | frame.buffer.index as u64;
         let key = std::mem::take(&mut self.want_keyframe);
+        // The pace counts from the start of the encode, so an encode that
+        // takes longer than the interval never adds a wait of its own. When
+        // we keep up, the next slot follows this one, so the cadence is even.
+        let interval = Duration::from_secs_f64(1.0 / self.max_fps as f64);
         let t0 = Instant::now();
+        let from_slot = self.next_send_at + interval;
+        self.next_send_at = if from_slot > t0 { from_slot } else { t0 + interval };
         let encoded = self.encoder.encode_dmabuf(buffer_key, &plane, key)?;
         let enc_us = t0.elapsed().as_micros();
         let aux = encoded.aux.unwrap_or_default();
@@ -769,12 +779,6 @@ impl Session {
         self.rtt.on_sent(self.frame_id, bytes);
         self.bitrate_ctl.note_sent();
         self.note_encode_time(enc_us);
-        // Pace from the previous slot when we are keeping up, so the cadence
-        // is even; otherwise from now.
-        let interval = Duration::from_secs_f64(1.0 / self.max_fps as f64);
-        let now = Instant::now();
-        let from_slot = self.next_send_at + interval;
-        self.next_send_at = if from_slot > now { from_slot } else { now + interval };
         self.frame_id += 1;
         self.in_flight += 1;
         Ok(())
