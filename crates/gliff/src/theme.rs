@@ -99,12 +99,14 @@ pub enum Mode {
 pub struct Rgb(pub u8, pub u8, pub u8);
 
 impl Rgb {
+    /// Accepts `#rrggbb` only, the form Omarchy's own colour maths requires.
     fn parse(s: &str) -> Option<Rgb> {
-        let hex = s.strip_prefix('#')?;
-        if hex.len() != 6 && hex.len() != 8 {
+        let hex = s.strip_prefix('#')?.as_bytes();
+        if hex.len() != 6 || !hex.iter().all(u8::is_ascii_hexdigit) {
             return None;
         }
-        let byte = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
+        let byte =
+            |i: usize| u8::from_str_radix(std::str::from_utf8(&hex[i..i + 2]).ok()?, 16).ok();
         Some(Rgb(byte(0)?, byte(2)?, byte(4)?))
     }
 
@@ -135,10 +137,17 @@ impl Rgb {
         0.2126 * lin(self.0) + 0.7152 * lin(self.1) + 0.0722 * lin(self.2)
     }
 
-    /// Text colour that reads on top of this colour, as Adwaita picks it:
-    /// white on dark accents, near-black on light ones.
+    /// WCAG contrast ratio against `other`, from 1 (equal) to 21.
+    fn contrast(self, other: Rgb) -> f32 {
+        let (a, b) = (self.luminance() + 0.05, other.luminance() + 0.05);
+        a.max(b) / a.min(b)
+    }
+
+    /// Text colour that reads best on top of this colour, from the two
+    /// Adwaita uses on filled buttons: white, or near-black at 80%.
     fn contrasting_fg(self) -> &'static str {
-        if self.luminance() > 0.4 {
+        let near_black = self.mix(Rgb(0, 0, 6), 0.8);
+        if self.contrast(near_black) > self.contrast(WHITE) {
             "rgb(0 0 6 / 80%)"
         } else {
             "#ffffff"
@@ -415,8 +424,20 @@ blue = "#89b4fa"
     }
 
     #[test]
-    fn dark_accents_get_white_text() {
+    fn text_colour_maximises_contrast() {
         assert_eq!(Rgb(0x64, 0x4a, 0xc9).contrasting_fg(), "#ffffff");
         assert_eq!(Rgb(0xf9, 0xe2, 0xaf).contrasting_fg(), "rgb(0 0 6 / 80%)");
+        assert_eq!(Rgb(0x7a, 0xa2, 0xf7).contrasting_fg(), "rgb(0 0 6 / 80%)");
+        assert_eq!(Rgb(0x99, 0x99, 0x99).contrasting_fg(), "rgb(0 0 6 / 80%)");
+    }
+
+    #[test]
+    fn rejects_malformed_colours_without_panicking() {
+        assert_eq!(Rgb::parse("#a\u{e9}xxx"), None);
+        assert_eq!(Rgb::parse("#1e1e2e80"), None);
+        assert_eq!(Rgb::parse("#fff"), None);
+        assert_eq!(Rgb::parse("1e1e2e"), None);
+        assert_eq!(Rgb::parse("#1E1e2E"), Some(Rgb(0x1e, 0x1e, 0x2e)));
+        assert!(Palette::from_colors_toml("background = \"#a\u{e9}xxx\"\n", false).is_none());
     }
 }
