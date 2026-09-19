@@ -120,7 +120,13 @@ where
     let streams = if chroma == ChromaMode::Dual420 { 2 } else { 1 };
     let bitrate_ctl = BitrateController::new(stream.0, stream.1, streams, cfg.bitrate);
     let max_fps = cfg.max_fps.clamp(MIN_RC_FPS, 240);
-    let settings = encoder_settings(stream.0, stream.1, bitrate_ctl.bitrate(max_fps), max_fps);
+    let settings = encoder_settings(
+        stream.0,
+        stream.1,
+        bitrate_ctl.bitrate(max_fps),
+        max_fps,
+        bitrate_ctl.vbv_ms(),
+    );
     let encoder = Encoder::new(&gpu, settings.clone(), chroma == ChromaMode::Dual420)
         .context("create encoder")?;
 
@@ -135,6 +141,9 @@ where
         instance,
         output,
         stream,
+        fit: stream,
+        base_chroma: chroma,
+        ladder: Ladder::new(),
         caps,
         bitrate_ctl,
         codec,
@@ -350,9 +359,14 @@ struct Session {
     gpu: Arc<Gpu>,
     instance: hypr_ipc::Instance,
     output: SessionOutput,
-    /// Encoded size. Equals the output size, except for a mirrored screen
-    /// larger than the client's window, which is scaled down to fit.
+    /// Encoded size: the fitted size, scaled down further by the ladder.
     stream: (u32, u32),
+    /// The size the stream would have at full quality: the output size, or a
+    /// mirrored screen scaled down to the client's window.
+    fit: (u32, u32),
+    /// The chroma mode the session was set up with; the ladder may drop below.
+    base_chroma: ChromaMode,
+    ladder: Ladder,
     caps: ClientCaps,
     bitrate_ctl: BitrateController,
     codec: Codec,
@@ -412,11 +426,14 @@ impl Session {
                 self.in_flight = self.in_flight.saturating_sub(1);
                 let acked = self.rtt.record(frame_id, decoded_at_ms);
                 self.n_limit = self.rtt.window(self.settings.framerate);
-                if self
-                    .bitrate_ctl
-                    .on_ack(acked, &mut self.rtt, self.settings.framerate)
+                if let Some(changed) =
+                    self.bitrate_ctl
+                        .on_ack(acked, &mut self.rtt, self.settings.framerate)
                 {
-                    self.apply_rate();
+                    if changed {
+                        self.apply_rate();
+                    }
+                    self.consider_ladder()?;
                 }
             }
             ClientMsg::RequestKeyframe => self.want_keyframe = true,
@@ -461,7 +478,7 @@ impl Session {
             0.8 * self.encode_us + 0.2 * sample
         };
         let sustainable = (1_000_000.0 / (self.encode_us * 1.1).max(1.0)) as u32;
-        let fps = sustainable.clamp(MIN_RC_FPS, self.max_fps);
+        let fps = sustainable.clamp(MIN_RC_FPS, self.pace_cap());
         let current = self.settings.framerate;
         if (fps as f64 - current as f64).abs() / current as f64 > 0.15 {
             self.settings.framerate = fps;
@@ -473,7 +490,9 @@ impl Session {
     fn apply_rate(&mut self) {
         let fps = self.settings.framerate;
         self.settings.bitrate = self.bitrate_ctl.bitrate(fps);
-        self.encoder.set_rate(self.settings.bitrate, fps);
+        self.settings.vbv_ms = self.bitrate_ctl.vbv_ms();
+        self.encoder
+            .set_rate(self.settings.bitrate, fps, self.settings.vbv_ms);
     }
 
     /// Forward an input event; a dead input thread ends the session elsewhere.
@@ -512,44 +531,25 @@ impl Session {
         // so the logical size is whole; wait for it and use what it chose.
         let applied = self.wait_for_mode(width, height, scale).await;
         if !same_size {
-            self.bitrate_ctl = BitrateController::new(
-                width,
-                height,
-                self.bitrate_ctl.streams,
-                self.bitrate_ctl.cap,
-            );
-            let settings = encoder_settings(
-                width,
-                height,
-                self.bitrate_ctl.bitrate(self.max_fps),
-                self.max_fps,
-            );
-            match Encoder::new(
-                &self.gpu,
-                settings.clone(),
-                self.chroma == ChromaMode::Dual420,
-            ) {
-                Ok(encoder) => {
-                    self.encoder = encoder;
-                    self.settings = settings;
-                    self.encode_us = 0.0;
-                    self.output.width = width;
-                    self.output.height = height;
-                    self.stream = (width, height);
-                    self.pending = None;
-                    self.want_keyframe = true;
-                }
-                Err(e) => {
-                    // Keep streaming at the old size rather than end the session.
-                    tracing::warn!(error = %e, width, height, "encoder rejected the new size; keeping the old one");
-                    let (w, h, s) = (self.output.width, self.output.height, self.output.scale);
-                    self.instance
-                        .set_monitor_mode(&self.output.name, w, h, 60, s)
-                        .ok();
-                    self.wait_for_mode(w, h, s).await;
-                    self.inject(self.output.logical_extent());
-                    return Ok(());
-                }
+            let (old_w, old_h) = (self.output.width, self.output.height);
+            self.output.width = width;
+            self.output.height = height;
+            if !self.rebuild_encoder((width, height)) {
+                // Keep streaming at the old size rather than end the session.
+                tracing::warn!(
+                    width,
+                    height,
+                    "encoder rejected the new size; keeping the old one"
+                );
+                self.output.width = old_w;
+                self.output.height = old_h;
+                let s = self.output.scale;
+                self.instance
+                    .set_monitor_mode(&self.output.name, old_w, old_h, 60, s)
+                    .ok();
+                self.wait_for_mode(old_w, old_h, s).await;
+                self.inject(self.output.logical_extent());
+                return Ok(());
             }
         }
         self.output.scale = applied;
@@ -561,58 +561,117 @@ impl Session {
         )
     }
 
+    /// The most frames per second the stream may run at now.
+    fn pace_cap(&self) -> u32 {
+        self.ladder.fps_cap(self.max_fps)
+    }
+
+    /// Replace the encoder for a new full-quality size or a new ladder
+    /// level, carry the link estimate over, and tell the client. Returns
+    /// false, with nothing changed, when the encoder rejects the size.
+    fn rebuild_encoder(&mut self, fit: (u32, u32)) -> bool {
+        let stream = self.ladder.scale(fit);
+        let chroma = self.ladder.chroma(self.base_chroma);
+        let streams = if chroma == ChromaMode::Dual420 { 2 } else { 1 };
+        let pace = self.settings.framerate.min(self.pace_cap());
+        let mut ctl = self.bitrate_ctl.clone();
+        ctl.reconfigure(stream.0, stream.1, streams, pace, self.settings.framerate);
+        let settings = encoder_settings(stream.0, stream.1, ctl.bitrate(pace), pace, ctl.vbv_ms());
+        match Encoder::new(&self.gpu, settings.clone(), chroma == ChromaMode::Dual420) {
+            Ok(encoder) => {
+                tracing::info!(
+                    width = stream.0,
+                    height = stream.1,
+                    ?chroma,
+                    fps_cap = self.pace_cap(),
+                    level = self.ladder.level,
+                    "stream reconfigured"
+                );
+                self.encoder = encoder;
+                self.settings = settings;
+                self.bitrate_ctl = ctl;
+                self.chroma = chroma;
+                self.encode_us = 0.0;
+                self.fit = fit;
+                self.stream = stream;
+                self.pending = None;
+                self.want_keyframe = true;
+                true
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, width = stream.0, height = stream.1, "encoder rejected the size");
+                false
+            }
+        }
+    }
+
+    /// Step the ladder down when the link cannot pay for the quality floor
+    /// at this level, and back up when the budget has sat at its ceiling
+    /// for a while.
+    fn consider_ladder(&mut self) -> Result<()> {
+        let now = Instant::now();
+        let ctl = &self.bitrate_ctl;
+        let since_change = now.duration_since(self.ladder.changed_at);
+        let step = if !ctl.slow_start
+            && ctl.current <= ctl.floor
+            && since_change >= Ladder::HOLD_DOWN
+            && self.ladder.step_down(self.settings.framerate)
+        {
+            self.ladder.at_ceiling_since = None;
+            self.ladder.note_step_down(now);
+            true
+        } else if ctl.current >= ctl.max && self.ladder.level > 0 {
+            let at_ceiling = *self.ladder.at_ceiling_since.get_or_insert(now);
+            let hold = self.ladder.hold_up;
+            if now.duration_since(at_ceiling) >= hold && since_change >= hold {
+                self.ladder.level -= 1;
+                self.ladder.at_ceiling_since = None;
+                self.ladder.note_step_up(now);
+                true
+            } else {
+                false
+            }
+        } else {
+            self.ladder.at_ceiling_since = None;
+            false
+        };
+        if !step {
+            return Ok(());
+        }
+        self.ladder.changed_at = now;
+        tracing::info!(level = self.ladder.level, "ladder step");
+        let fit = self.fit;
+        if self.rebuild_encoder(fit) {
+            self.send(
+                stream_config(self.codec, self.chroma, &self.output, self.stream),
+                Vec::new(),
+                false,
+            )?;
+        }
+        Ok(())
+    }
+
     /// A mirrored screen keeps its size; when it is larger than the client's
     /// window the stream is scaled down to fit (never up), so the link and
     /// the decoder carry only what the window can show.
     async fn fit_mirror(&mut self, win_w: u32, win_h: u32) -> Result<()> {
         let (ow, oh) = (self.output.width as f64, self.output.height as f64);
         let fit = (win_w as f64 / ow).min(win_h as f64 / oh).min(1.0);
-        let stream = (
+        let fit = (
             ((ow * fit).round() as u32).max(2) & !1,
             ((oh * fit).round() as u32).max(2) & !1,
         );
-        if stream == self.stream {
+        if fit == self.fit {
             return Ok(());
         }
-        self.bitrate_ctl = BitrateController::new(
-            stream.0,
-            stream.1,
-            self.bitrate_ctl.streams,
-            self.bitrate_ctl.cap,
-        );
-        let settings = encoder_settings(
-            stream.0,
-            stream.1,
-            self.bitrate_ctl.bitrate(self.max_fps),
-            self.max_fps,
-        );
-        match Encoder::new(
-            &self.gpu,
-            settings.clone(),
-            self.chroma == ChromaMode::Dual420,
-        ) {
-            Ok(encoder) => {
-                tracing::info!(
-                    width = stream.0,
-                    height = stream.1,
-                    "scaling the mirrored screen to the window"
-                );
-                self.encoder = encoder;
-                self.settings = settings;
-                self.encode_us = 0.0;
-                self.stream = stream;
-                self.pending = None;
-                self.want_keyframe = true;
-                self.send(
-                    stream_config(self.codec, self.chroma, &self.output, self.stream),
-                    Vec::new(),
-                    false,
-                )
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "encoder rejected the fitted size; keeping the current one");
-                Ok(())
-            }
+        if self.rebuild_encoder(fit) {
+            self.send(
+                stream_config(self.codec, self.chroma, &self.output, self.stream),
+                Vec::new(),
+                false,
+            )
+        } else {
+            Ok(())
         }
     }
 
@@ -768,7 +827,7 @@ impl Session {
         // The pace counts from the start of the encode, so an encode that
         // takes longer than the interval never adds a wait of its own. When
         // we keep up, the next slot follows this one, so the cadence is even.
-        let interval = Duration::from_secs_f64(1.0 / self.max_fps as f64);
+        let interval = Duration::from_secs_f64(1.0 / self.pace_cap() as f64);
         let t0 = Instant::now();
         let from_slot = self.next_send_at + interval;
         self.next_send_at = if from_slot > t0 {
@@ -809,6 +868,94 @@ impl Session {
         self.frame_id += 1;
         self.in_flight += 1;
         Ok(())
+    }
+}
+
+/// What to give up, in order, when the link cannot pay for the quality
+/// floor: frame rate first (least visible on a desktop), then the aux
+/// chroma stream, then resolution. Each step costs a keyframe, so steps are
+/// held for a while in both directions.
+struct Ladder {
+    level: u8,
+    changed_at: Instant,
+    at_ceiling_since: Option<Instant>,
+    /// How long the budget must sit at its ceiling before a step up. Doubles
+    /// when a step up is followed by a step down, so a link that cannot
+    /// carry the next level is probed less and less often.
+    hold_up: Duration,
+    last_step_up: Option<Instant>,
+}
+
+impl Ladder {
+    const LEVELS: [(u32, bool, f32); 5] = [
+        // (fps cap, aux stream kept, scale)
+        (u32::MAX, true, 1.0),
+        (30, true, 1.0),
+        (15, true, 1.0),
+        (15, false, 1.0),
+        (15, false, 0.5),
+    ];
+    const HOLD_DOWN: Duration = Duration::from_secs(2);
+    const HOLD_UP: Duration = Duration::from_secs(8);
+    const MAX_HOLD_UP: Duration = Duration::from_secs(300);
+
+    fn new() -> Self {
+        Self {
+            level: 0,
+            changed_at: Instant::now(),
+            at_ceiling_since: None,
+            hold_up: Self::HOLD_UP,
+            last_step_up: None,
+        }
+    }
+
+    fn note_step_down(&mut self, now: Instant) {
+        if let Some(up) = self.last_step_up {
+            if now.duration_since(up) < self.hold_up * 2 {
+                self.hold_up = (self.hold_up * 2).min(Self::MAX_HOLD_UP);
+            } else {
+                self.hold_up = Self::HOLD_UP;
+            }
+        }
+    }
+
+    fn note_step_up(&mut self, now: Instant) {
+        self.last_step_up = Some(now);
+    }
+
+    fn fps_cap(&self, max_fps: u32) -> u32 {
+        Self::LEVELS[self.level as usize].0.min(max_fps)
+    }
+
+    fn chroma(&self, base: ChromaMode) -> ChromaMode {
+        if Self::LEVELS[self.level as usize].1 {
+            base
+        } else {
+            ChromaMode::Single420
+        }
+    }
+
+    fn scale(&self, fit: (u32, u32)) -> (u32, u32) {
+        let s = Self::LEVELS[self.level as usize].2;
+        (
+            ((fit.0 as f32 * s) as u32).max(2) & !1,
+            ((fit.1 as f32 * s) as u32).max(2) & !1,
+        )
+    }
+
+    /// Move to the next level that changes something; a frame rate cap
+    /// above the pace we already run at would not. False at the bottom.
+    fn step_down(&mut self, pace: u32) -> bool {
+        let cur = Self::LEVELS[self.level as usize];
+        let mut next = self.level as usize + 1;
+        while let Some(l) = Self::LEVELS.get(next) {
+            if l.1 != cur.1 || l.2 != cur.2 || l.0 < pace {
+                self.level = next as u8;
+                return true;
+            }
+            next += 1;
+        }
+        false
     }
 }
 
@@ -868,12 +1015,19 @@ fn stream_config(
     }
 }
 
-fn encoder_settings(width: u32, height: u32, bitrate: u32, framerate: u32) -> EncoderSettings {
+fn encoder_settings(
+    width: u32,
+    height: u32,
+    bitrate: u32,
+    framerate: u32,
+    vbv_ms: u32,
+) -> EncoderSettings {
     EncoderSettings {
         width,
         height,
         bitrate,
         framerate,
+        vbv_ms,
     }
 }
 
@@ -1003,11 +1157,16 @@ struct RttEstimator {
 /// queueing; the rate the acks then arrive at is what the link delivers, so
 /// the budget drops to a fraction of that in one step. A quiet path grows
 /// the budget back: quickly at first (slow start), then gently.
+#[derive(Clone)]
 struct BitrateController {
     /// Bits per frame per stream, bounded by the quality ceiling and floor.
     min: u32,
     max: u32,
     current: u32,
+    /// Below this the picture is not worth its frame rate; the ladder steps.
+    floor: u32,
+    /// The last change was a cut.
+    last_was_cut: bool,
     /// Optional cap on total bits per second across the streams.
     cap: Option<u32>,
     streams: u32,
@@ -1031,6 +1190,7 @@ impl BitrateController {
     /// which a frame is not worth sending.
     const MAX_BPP: f64 = 0.1;
     const MIN_BPP: f64 = 0.005;
+    const FLOOR_BPP: f64 = 0.03;
 
     fn new(width: u32, height: u32, streams: u32, cap: Option<u32>) -> Self {
         let pixels = width as f64 * height as f64;
@@ -1041,6 +1201,8 @@ impl BitrateController {
             min,
             max,
             current: (max / 4).max(min),
+            floor: (pixels * Self::FLOOR_BPP) as u32,
+            last_was_cut: false,
             cap,
             streams: streams.max(1),
             last_eval: now,
@@ -1049,6 +1211,32 @@ impl BitrateController {
             blocked: 0,
             acks: Vec::new(),
             slow_start: true,
+        }
+    }
+
+    /// Keep the link estimate across a change of size, stream count or
+    /// pace: the same bits per second, spread over the new frames.
+    fn reconfigure(&mut self, width: u32, height: u32, streams: u32, pace: u32, old_pace: u32) {
+        let bits_per_second = self.current as f64 * self.streams as f64 * old_pace.max(1) as f64;
+        let pixels = width as f64 * height as f64;
+        self.max = (pixels * Self::MAX_BPP) as u32;
+        self.min = (pixels * Self::MIN_BPP) as u32;
+        self.floor = (pixels * Self::FLOOR_BPP) as u32;
+        self.streams = streams.max(1);
+        let per_frame = bits_per_second / (self.streams as f64 * pace.max(1) as f64);
+        self.current = (per_frame as u32).clamp(self.min, self.max);
+        self.last_was_cut = false;
+        self.acks.clear();
+    }
+
+    /// How far a frame may overshoot the average. Generous when the budget
+    /// is comfortable (quality on a good link); tight when it is low, so a
+    /// keyframe on a slow link cannot stall it for a second.
+    fn vbv_ms(&self) -> u32 {
+        if self.current >= self.floor * 2 {
+            EncoderSettings::DEFAULT_VBV_MS
+        } else {
+            100
         }
     }
 
@@ -1088,12 +1276,13 @@ impl BitrateController {
     }
 
     /// Feed an ack: the bytes it covers, the RTT estimate and the current
-    /// pace. Returns true when the budget changed.
-    fn on_ack(&mut self, acked_bytes: usize, rtt: &mut RttEstimator, pace: u32) -> bool {
+    /// pace. `None` between evaluations; otherwise whether the budget
+    /// changed.
+    fn on_ack(&mut self, acked_bytes: usize, rtt: &mut RttEstimator, pace: u32) -> Option<bool> {
         let now = Instant::now();
         self.acks.push((now, acked_bytes));
         if now.duration_since(self.last_eval) < Self::EVAL_EVERY {
-            return false;
+            return None;
         }
         self.last_eval = now;
         let queueing = rtt.take_queueing_ms();
@@ -1129,8 +1318,9 @@ impl BitrateController {
             self.current
         };
         if next == self.current {
-            return false;
+            return Some(false);
         }
+        self.last_was_cut = next < self.current;
         tracing::info!(
             from_kbit = self.current / 1000,
             to_kbit = next / 1000,
@@ -1143,7 +1333,7 @@ impl BitrateController {
         );
         self.current = next;
         self.last_change = now;
-        true
+        Some(true)
     }
 }
 

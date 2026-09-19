@@ -809,6 +809,7 @@ fn roundtrip(
         height,
         bitrate,
         framerate: 60,
+        vbv_ms: EncoderSettings::DEFAULT_VBV_MS,
     };
     let mut encoder = Encoder::new(&gpu, settings, dual).context("vulkan encoder")?;
     let mut decoder = Decoder::new(&gpu, dual, width, height).context("vulkan decoder")?;
@@ -962,6 +963,7 @@ fn pipeline(target: &Target, node: &std::path::Path, output: Option<String>) -> 
         height: h,
         bitrate: EncoderSettings::default_bitrate(w, h, 60),
         framerate: 60,
+        vbv_ms: EncoderSettings::DEFAULT_VBV_MS,
     };
     let mut encoder = Encoder::new(&gpu, settings, true).context("encoder")?;
     let mut decoder = Decoder::new(&gpu, true, w, h).context("decoder")?;

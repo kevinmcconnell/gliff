@@ -21,6 +21,13 @@ pub struct EncoderSettings {
     /// Target bitrate in bits per second (CBR).
     pub bitrate: u32,
     pub framerate: u32,
+    /// Rate control buffer: how far one frame may overshoot the average.
+    /// Small on a slow link so a keyframe cannot stall it.
+    pub vbv_ms: u32,
+}
+
+impl EncoderSettings {
+    pub const DEFAULT_VBV_MS: u32 = 500;
 }
 
 impl EncoderSettings {
@@ -254,7 +261,7 @@ pub struct H264Encoder {
     started: bool,
     /// A bitrate and frame rate to apply with the next frame's rate-control
     /// update.
-    pending_rate: Option<(u32, u32)>,
+    pending_rate: Option<(u32, u32, u32)>,
 }
 
 impl H264Encoder {
@@ -391,15 +398,18 @@ impl H264Encoder {
     /// Change the CBR target from the next frame on, without resetting the
     /// session (no keyframe is forced).
     pub fn set_bitrate(&mut self, bitrate: u32) {
-        self.set_rate(bitrate, self.settings.framerate);
+        self.set_rate(bitrate, self.settings.framerate, self.settings.vbv_ms);
     }
 
     /// Change the CBR target and the frame rate it is spread over, from the
     /// next frame on. The frame rate is the pace frames are actually
     /// produced at, so the per-frame budget matches the bandwidth.
-    pub fn set_rate(&mut self, bitrate: u32, framerate: u32) {
-        if bitrate != self.settings.bitrate || framerate != self.settings.framerate {
-            self.pending_rate = Some((bitrate, framerate.max(1)));
+    pub fn set_rate(&mut self, bitrate: u32, framerate: u32, vbv_ms: u32) {
+        if bitrate != self.settings.bitrate
+            || framerate != self.settings.framerate
+            || vbv_ms != self.settings.vbv_ms
+        {
+            self.pending_rate = Some((bitrate, framerate.max(1), vbv_ms.max(20)));
         }
     }
 
@@ -662,9 +672,10 @@ impl H264Encoder {
             }
 
             let mut next_settings = self.settings.clone();
-            if let Some((b, f)) = rate_change {
+            if let Some((b, f, v)) = rate_change {
                 next_settings.bitrate = b;
                 next_settings.framerate = f;
+                next_settings.vbv_ms = v;
             }
             let settings = &next_settings;
             let started = self.started;
@@ -700,10 +711,16 @@ impl H264Encoder {
             Ok::<(), Error>(())
         })?;
 
-        if let Some((b, f)) = rate_change {
-            tracing::info!(bitrate = b, framerate = f, "encoder rate changed");
+        if let Some((b, f, v)) = rate_change {
+            tracing::info!(
+                bitrate = b,
+                framerate = f,
+                vbv_ms = v,
+                "encoder rate changed"
+            );
             self.settings.bitrate = b;
             self.settings.framerate = f;
+            self.settings.vbv_ms = v;
         }
         // The DPB and counters describe the picture just recorded; the
         // bitstream itself is collected by `finish`.
@@ -796,6 +813,7 @@ unsafe fn record_rate_control(
 struct RateControl {
     h264_layer: vk::VideoEncodeH264RateControlLayerInfoKHR<'static>,
     layers: [vk::VideoEncodeRateControlLayerInfoKHR<'static>; 1],
+    vbv_ms: u32,
 }
 
 impl RateControl {
@@ -806,7 +824,11 @@ impl RateControl {
             .max_bitrate(s.bitrate as u64)
             .frame_rate_numerator(s.framerate)
             .frame_rate_denominator(1)];
-        Self { h264_layer, layers }
+        Self {
+            h264_layer,
+            layers,
+            vbv_ms: s.vbv_ms.max(20),
+        }
     }
 
     /// The two structs to chain onto a control or begin info. Both borrow
@@ -822,8 +844,8 @@ impl RateControl {
         let rc = vk::VideoEncodeRateControlInfoKHR::default()
             .rate_control_mode(vk::VideoEncodeRateControlModeFlagsKHR::CBR)
             .layers(&self.layers)
-            .virtual_buffer_size_in_ms(500)
-            .initial_virtual_buffer_size_in_ms(250);
+            .virtual_buffer_size_in_ms(self.vbv_ms)
+            .initial_virtual_buffer_size_in_ms(self.vbv_ms / 2);
         let h264 = vk::VideoEncodeH264RateControlInfoKHR::default()
             .flags(
                 vk::VideoEncodeH264RateControlFlagsKHR::REGULAR_GOP

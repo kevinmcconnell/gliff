@@ -102,6 +102,18 @@ round-trip.
   it back, fast at first. Frames are captured on demand, so a static screen
   costs nothing.
 
+- **Step-down ladder.** When the link cannot pay for a quality floor of
+  0.03 bits per pixel per stream, the session gives things up in the order
+  that hurts a desktop least: the frame rate (cap 30, then 15), then the aux
+  chroma stream (4:2:0), then half resolution. Each step is a new encoder
+  and a `StreamConfig`, so it costs a keyframe; steps down are held 2 s
+  apart, and a step back up needs the budget at its ceiling for 8 s, a hold
+  that doubles each time the step up has to be undone. Below twice the floor
+  the encoder's rate control buffer shrinks from 500 ms to 100 ms, so a
+  keyframe on a slow link stays small. On a 3 Mbit/s link a 4K screen ends
+  at 1080p 4:2:0 15 fps with a median latency of ~75 ms; on 20 Mbit/s and
+  above nothing is given up.
+
 - **Threading.** Each pipeline lives on one thread: the server loop and the
   client decode worker are current-thread tokio runtimes that own their
   `gliff-vk` objects. Capture and input each own a Wayland connection on their
