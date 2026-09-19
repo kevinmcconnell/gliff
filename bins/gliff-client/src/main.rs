@@ -13,7 +13,8 @@ use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use std::os::fd::AsRawFd;
 use std::rc::Rc;
-use std::sync::mpsc::{channel, sync_channel, Receiver};
+use std::sync::mpsc::{channel, Receiver};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use adw::prelude::*;
@@ -25,7 +26,7 @@ use gtk::gdk;
 use gtk::glib;
 use gtk4 as gtk;
 use libadwaita as adw;
-use net::{Endpoint, Status, Worker};
+use net::{Endpoint, FrameSlot, Status, Worker};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
 /// A message plus optional trailing payload, sent from the UI to the worker.
@@ -274,19 +275,20 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
 }
 
 fn start_session(ui: Rc<App>, endpoint: Endpoint) {
-    let (frame_tx, frame_rx) = sync_channel::<DisplayFrame>(2);
+    let frames = FrameSlot::new();
     let (status_tx, status_rx) = channel::<Status>();
     let (input_tx, input_rx) = unbounded_channel::<(ClientMsg, Vec<u8>)>();
     *ui.input_tx.borrow_mut() = Some(input_tx);
     *ui.endpoint.borrow_mut() = Some(endpoint.clone());
     ui.status.set_text("Connecting…");
 
+    let worker_frames = frames.clone();
     std::thread::Builder::new()
         .name("gliff-net".into())
         .spawn(move || {
             Worker {
                 endpoint,
-                frames: frame_tx,
+                frames: worker_frames,
                 status: status_tx,
                 input: input_rx,
             }
@@ -294,7 +296,7 @@ fn start_session(ui: Rc<App>, endpoint: Endpoint) {
         })
         .expect("spawn network thread");
 
-    poll_frames(ui.clone(), frame_rx);
+    show_frames(ui.clone(), frames);
     poll_status(ui, status_rx);
 }
 
@@ -318,28 +320,16 @@ fn schedule_reconnect(ui: Rc<App>) {
     });
 }
 
-/// Pull decoded frames on the GTK main loop, latest-wins, and paint them.
-fn poll_frames(ui: Rc<App>, rx: Receiver<DisplayFrame>) {
-    glib::timeout_add_local(Duration::from_millis(8), move || {
-        let mut latest = None;
-        loop {
-            match rx.try_recv() {
-                Ok(f) => latest = Some(f),
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                // The worker ended; stop this per-session timer so it does not
-                // accumulate across reconnects.
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    return glib::ControlFlow::Break
-                }
-            }
-        }
-        if let Some(f) = latest {
+/// Paint each decoded frame as soon as the worker lands it, on the GTK main
+/// loop. Ends when the worker does.
+fn show_frames(ui: Rc<App>, frames: Arc<FrameSlot>) {
+    glib::spawn_future_local(async move {
+        while let Some(f) = frames.next().await {
             match dmabuf_texture(f) {
                 Ok(texture) => ui.frame.set_frame(texture, ui.video.scale_factor()),
                 Err(e) => tracing::warn!(error = %e, "dmabuf texture import failed"),
             }
         }
-        glib::ControlFlow::Continue
     });
 }
 

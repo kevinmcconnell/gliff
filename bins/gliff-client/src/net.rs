@@ -5,8 +5,9 @@
 //! The Vulkan objects live entirely on this worker thread; only dmabuf fds
 //! and plain values cross to the GTK thread.
 
-use std::sync::mpsc::{Sender as StdSender, SyncSender};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Sender as StdSender;
+use std::sync::{Arc, Mutex};
 
 use gliff_proto::{ChromaMode, ClientCaps, ClientMsg, Codec, ServerMsg, PROTOCOL_VERSION};
 use gliff_transport::{spawn_ssh, Framed, SshTarget};
@@ -47,11 +48,53 @@ pub enum Endpoint {
     Ssh(SshTarget),
 }
 
+/// The one decoded frame waiting for the display: a newer frame replaces
+/// an unshown one, and the display is woken as soon as a frame lands, so no
+/// frame waits for a timer and the decoder never buffers more than one.
+pub struct FrameSlot {
+    frame: Mutex<Option<DisplayFrame>>,
+    ready: tokio::sync::Notify,
+    closed: AtomicBool,
+}
+
+impl FrameSlot {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            frame: Mutex::new(None),
+            ready: tokio::sync::Notify::new(),
+            closed: AtomicBool::new(false),
+        })
+    }
+
+    fn put(&self, frame: DisplayFrame) {
+        if let Ok(mut slot) = self.frame.lock() {
+            *slot = Some(frame);
+        }
+        self.ready.notify_one();
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.ready.notify_one();
+    }
+
+    /// Wait for the next frame. `None` once the worker has ended.
+    pub async fn next(&self) -> Option<DisplayFrame> {
+        loop {
+            if let Some(f) = self.frame.lock().ok().and_then(|mut s| s.take()) {
+                return Some(f);
+            }
+            if self.closed.load(Ordering::Acquire) {
+                return None;
+            }
+            self.ready.notified().await;
+        }
+    }
+}
+
 pub struct Worker {
     pub endpoint: Endpoint,
-    /// Bounded so a stalled UI thread cannot make the decoder buffer frames
-    /// without limit; when full, the newest frame is dropped (latest-wins).
-    pub frames: SyncSender<DisplayFrame>,
+    pub frames: Arc<FrameSlot>,
     pub status: StdSender<Status>,
     pub input: UnboundedReceiver<(ClientMsg, Vec<u8>)>,
 }
@@ -71,6 +114,7 @@ impl Worker {
         };
         let local = tokio::task::LocalSet::new();
         let status = self.status.clone();
+        let frames = self.frames.clone();
         let result: anyhow::Result<()> = local.block_on(&rt, async move {
             match self.endpoint {
                 Endpoint::Tcp(ref addr) => {
@@ -85,6 +129,7 @@ impl Worker {
                 }
             }
         });
+        frames.close();
         if let Err(e) = result {
             let _ = status.send(Status::Error(e.to_string()));
         } else {
@@ -110,7 +155,7 @@ fn new_decoder(
 async fn session<R, W>(
     rd: R,
     wr: W,
-    frames: SyncSender<DisplayFrame>,
+    frames: Arc<FrameSlot>,
     status: StdSender<Status>,
     mut input: UnboundedReceiver<(ClientMsg, Vec<u8>)>,
 ) -> anyhow::Result<()>
@@ -232,8 +277,7 @@ where
                             tracing::info!("first frame decoded");
                             logged_first = true;
                         }
-                        // Latest-wins: drop this frame if the UI hasn't drained.
-                        let _ = frames.try_send(frame);
+                        frames.put(frame);
                         frames_since += 1;
                         decode_ms_acc += dec_ms;
                     }

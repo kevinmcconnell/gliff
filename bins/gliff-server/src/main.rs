@@ -47,6 +47,10 @@ struct Cli {
     /// adapts below it when the link shows queueing.
     #[arg(long)]
     bitrate: Option<u32>,
+    /// Cap the frame rate. Lower values give an even cadence and larger,
+    /// better frames on a slow link; higher values give smoother motion.
+    #[arg(long, default_value_t = 60)]
+    max_fps: u32,
 }
 
 fn main() -> Result<()> {
@@ -75,6 +79,7 @@ fn main() -> Result<()> {
         render_node: hypr_capture::render_node(cli.render_node.as_deref()),
         low_bandwidth: cli.low_bandwidth,
         bitrate: cli.bitrate,
+        max_fps: cli.max_fps,
     };
 
     let rt = tokio::runtime::Builder::new_current_thread()

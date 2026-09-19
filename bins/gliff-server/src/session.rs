@@ -28,6 +28,8 @@ pub struct Config {
     pub render_node: PathBuf,
     pub low_bandwidth: bool,
     pub bitrate: Option<u32>,
+    /// Frames per second the stream is paced at, at most.
+    pub max_fps: u32,
 }
 
 const TEXT_MIME: &str = "text/plain;charset=utf-8";
@@ -117,7 +119,8 @@ where
     let gpu = Gpu::open(Some(&cfg.render_node)).context("open Vulkan device")?;
     let streams = if chroma == ChromaMode::Dual420 { 2 } else { 1 };
     let bitrate_ctl = BitrateController::new(stream.0, stream.1, streams, cfg.bitrate);
-    let settings = encoder_settings(stream.0, stream.1, bitrate_ctl.bitrate(MAX_FPS));
+    let max_fps = cfg.max_fps.clamp(MIN_RC_FPS, 240);
+    let settings = encoder_settings(stream.0, stream.1, bitrate_ctl.bitrate(max_fps), max_fps);
     let encoder = Encoder::new(&gpu, settings.clone(), chroma == ChromaMode::Dual420)
         .context("create encoder")?;
 
@@ -151,10 +154,14 @@ where
         rtt: RttEstimator::new(),
         cursor_shape_id: 0,
         encode_us: 0.0,
+        max_fps,
+        next_send_at: Instant::now(),
     };
 
     loop {
+        let pace = tokio::time::Instant::from_std(session.next_send_at);
         let flow = tokio::select! {
+            _ = tokio::time::sleep_until(pace), if session.pending.is_some() => ControlFlow::Continue(()),
             msg = msg_rx.recv() => match msg {
                 Some(msg) => session.on_client_msg(msg)?,
                 None => {
@@ -371,6 +378,9 @@ struct Session {
     cursor_shape_id: u32,
     /// Smoothed time to split and encode one frame, in microseconds.
     encode_us: f64,
+    max_fps: u32,
+    /// The pace: no frame is encoded before this instant.
+    next_send_at: Instant,
 }
 
 /// Slowest pace the rate control is told about; below this each frame would
@@ -448,7 +458,7 @@ impl Session {
             0.8 * self.encode_us + 0.2 * sample
         };
         let sustainable = (1_000_000.0 / (self.encode_us * 1.1).max(1.0)) as u32;
-        let fps = sustainable.clamp(MIN_RC_FPS, MAX_FPS);
+        let fps = sustainable.clamp(MIN_RC_FPS, self.max_fps);
         let current = self.settings.framerate;
         if (fps as f64 - current as f64).abs() / current as f64 > 0.15 {
             self.settings.framerate = fps;
@@ -500,7 +510,7 @@ impl Session {
         let applied = self.wait_for_mode(width, height, scale).await;
         if !same_size {
             self.bitrate_ctl = BitrateController::new(width, height, self.bitrate_ctl.streams, self.bitrate_ctl.cap);
-            let settings = encoder_settings(width, height, self.bitrate_ctl.bitrate(MAX_FPS));
+            let settings = encoder_settings(width, height, self.bitrate_ctl.bitrate(self.max_fps), self.max_fps);
             match Encoder::new(
                 &self.gpu,
                 settings.clone(),
@@ -552,7 +562,7 @@ impl Session {
             return Ok(());
         }
         self.bitrate_ctl = BitrateController::new(stream.0, stream.1, self.bitrate_ctl.streams, self.bitrate_ctl.cap);
-        let settings = encoder_settings(stream.0, stream.1, self.bitrate_ctl.bitrate(MAX_FPS));
+        let settings = encoder_settings(stream.0, stream.1, self.bitrate_ctl.bitrate(self.max_fps), self.max_fps);
         match Encoder::new(
             &self.gpu,
             settings.clone(),
@@ -671,7 +681,9 @@ impl Session {
     /// The client has ack capacity and the previous frame has left for the
     /// wire, so encoding another now will not build a queue.
     fn can_send(&self) -> bool {
-        self.in_flight < self.n_limit && self.queued_frames.load(Ordering::Acquire) == 0
+        self.in_flight < self.n_limit
+            && self.queued_frames.load(Ordering::Acquire) == 0
+            && Instant::now() >= self.next_send_at
     }
 
     /// Encode and send the pending frame if the link can take it, then ask
@@ -757,6 +769,12 @@ impl Session {
         self.rtt.on_sent(self.frame_id, bytes);
         self.bitrate_ctl.note_sent();
         self.note_encode_time(enc_us);
+        // Pace from the previous slot when we are keeping up, so the cadence
+        // is even; otherwise from now.
+        let interval = Duration::from_secs_f64(1.0 / self.max_fps as f64);
+        let now = Instant::now();
+        let from_slot = self.next_send_at + interval;
+        self.next_send_at = if from_slot > now { from_slot } else { now + interval };
         self.frame_id += 1;
         self.in_flight += 1;
         Ok(())
@@ -819,16 +837,12 @@ fn stream_config(
     }
 }
 
-/// The frame rate the stream is paced at, and the ceiling of the pace the
-/// rate control is told about.
-const MAX_FPS: u32 = 60;
-
-fn encoder_settings(width: u32, height: u32, bitrate: u32) -> EncoderSettings {
+fn encoder_settings(width: u32, height: u32, bitrate: u32, framerate: u32) -> EncoderSettings {
     EncoderSettings {
         width,
         height,
         bitrate,
-        framerate: MAX_FPS,
+        framerate,
     }
 }
 
