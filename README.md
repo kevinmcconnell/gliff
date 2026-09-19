@@ -25,6 +25,11 @@ Working and validated on AMD (Ryzen Granite Ridge, Mesa RADV):
   inhibits system shortcuts (release with `Shift+Esc`, set by
   `--release-hotkey`), and auto-reconnects. Validated over localhost against a
   nested Hyprland: connect, stream, resize, ack pacing, both chroma modes.
+- The client follows the Omarchy theme: it maps the palette in
+  `~/.local/state/omarchy/current/theme/colors.toml` onto the libadwaita
+  colour variables, picks the matching light or dark scheme, and re-applies on
+  `omarchy theme set`. Without Omarchy it is stock Adwaita and follows the
+  desktop dark/light preference.
 
 On Intel (Mesa ANV) the client has been tested and works, but we have not
 started server support yet. The client needs

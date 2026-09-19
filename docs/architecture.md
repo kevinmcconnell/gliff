@@ -121,6 +121,17 @@ round-trip.
   or, failing that, a CPU map), so the client needs no GL code and no fallback
   path of its own.
 
+- **Theme.** `theme.rs` reads Omarchy 4's `colors.toml` with the same lenient
+  line parser and fallback chain as `omarchy-theme-color`, and emits a `:root`
+  block that overrides the libadwaita palette variables (`--window-bg-color`,
+  `--accent-bg-color`, `--headerbar-bg-color`, ...). Adwaita derives the rest
+  (standalone accent, borders, shades) from those, so every widget follows.
+  The light/dark scheme is forced from the palette's `mode` rather than the
+  desktop setting, so the base stylesheet always matches the colours. Omarchy
+  swaps the `current/theme` directory atomically on a switch, so a
+  `GFileMonitor` on `current/` watches for that child and re-applies after a
+  short debounce. With no Omarchy state directory the module does nothing.
+
 - **Cursor.** The remote cursor is shown as the video widget's own cursor, so
   the local compositor draws it at the real pointer with no added latency; it is
   never baked into the video. An image with no visible shape falls back to the
