@@ -8,6 +8,7 @@
 mod keymap;
 mod net;
 mod paintable;
+mod theme;
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
@@ -84,6 +85,8 @@ struct App {
     endpoint: RefCell<Option<Endpoint>>,
     /// Consecutive failed connection attempts, reset on a successful connect.
     retries: Cell<u32>,
+    /// Watches the Omarchy theme directory; dropping it stops theme updates.
+    _theme_monitor: Option<gtk::gio::FileMonitor>,
 }
 
 fn main() -> glib::ExitCode {
@@ -175,6 +178,7 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         endpoint: RefCell::new(None),
         retries: Cell::new(0),
         last_remote_clip: RefCell::new(None),
+        _theme_monitor: theme::follow_omarchy_theme(),
     });
 
     let hotkey = ReleaseHotkey::parse(&cli.release_hotkey).unwrap_or_else(|e| {
