@@ -88,6 +88,11 @@ gliff --headless user@host      # a private remote screen sized and
                                        # scaled to this window (resizes live)
 ```
 
+The server adapts the bitrate to the link on its own and, on a slow link,
+steps down frame rate, then chroma, then resolution. `gliff-server
+--max-fps 30` caps the frame rate; `--bitrate` caps the total bits per
+second; `--low-bandwidth` starts with a single 4:2:0 stream.
+
 A mirrored screen keeps its own size and scale and is letterboxed in the
 window; a headless one follows the window. The ssh session
 must see the user's `WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR`; if `gliff-server` is not
@@ -109,6 +114,11 @@ cargo test --workspace     # pure-logic unit tests, no GPU needed
 cargo fmt --all --check    # formatting (rustfmt defaults)
 ./scripts/e2e.sh           # full stack against a nested Hyprland (needs a GPU)
 ```
+
+`gliff-probe stream-bench` connects to a running server and reports frame
+rate, interval jitter, capture-to-decode latency and bandwidth;
+`scripts/bench.sh` drives it against a nested Hyprland, optionally through
+`scripts/throttle-proxy.py` to stand in for a slow link.
 
 `scripts/e2e.sh` must run inside a Hyprland session; it boots a nested Hyprland
 and asserts the probe checks, the 4:4:4 capture pipeline, and both Dual420 and

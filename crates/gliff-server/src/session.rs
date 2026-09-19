@@ -4,6 +4,7 @@ use std::collections::VecDeque;
 use std::ops::ControlFlow;
 use std::os::fd::AsFd;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -27,6 +28,8 @@ pub struct Config {
     pub render_node: PathBuf,
     pub low_bandwidth: bool,
     pub bitrate: Option<u32>,
+    /// Frames per second the stream is paced at, at most.
+    pub max_fps: u32,
 }
 
 const TEXT_MIME: &str = "text/plain;charset=utf-8";
@@ -59,7 +62,7 @@ fn now_ms() -> u64 {
 
 pub async fn run<R, W>(rd: R, wr: W, cfg: Config) -> Result<()>
 where
-    R: AsyncRead + Unpin + 'static,
+    R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + 'static,
 {
     let mut reader = Framed::new(rd);
@@ -102,12 +105,14 @@ where
             "scaling the stream to the encoder maximum"
         );
     }
-    send_stream_config(&mut writer, codec, chroma, &output, stream).await?;
+    writer
+        .write_msg(&stream_config(codec, chroma, &output, stream))
+        .await?;
 
     let (cap_tx, mut cap_rx) = mpsc::unbounded_channel();
     let capturer = start_capture(&cfg.target, &output.name, &cfg.render_node, cap_tx)?;
 
-    let input = start_input(&cfg.target, &output.name, &keymap)?;
+    let input = Arc::new(start_input(&cfg.target, &output.name, &keymap)?);
     input.send(output.logical_extent()).ok();
     if output.is_headless() {
         // Focus follows the pointer, so put it on the new screen right away:
@@ -133,26 +138,33 @@ where
     .map_err(|e| tracing::warn!(error = %e, "clipboard bridge unavailable"))
     .ok();
 
-    let bitrate_ctl = match cfg.bitrate {
-        Some(fixed) => BitrateController::new(fixed, true),
-        None => BitrateController::new(
-            EncoderSettings::default_bitrate(stream.0, stream.1, 60),
-            false,
-        ),
-    };
-    let settings = encoder_settings(stream.0, stream.1, bitrate_ctl.current());
+    let streams = if chroma == ChromaMode::Dual420 { 2 } else { 1 };
+    let bitrate_ctl = BitrateController::new(stream.0, stream.1, streams, cfg.bitrate);
+    let max_fps = cfg.max_fps.clamp(MIN_RC_FPS, 240);
+    let settings = encoder_settings(
+        stream.0,
+        stream.1,
+        bitrate_ctl.bitrate(max_fps),
+        max_fps,
+        bitrate_ctl.vbv_ms(),
+    );
     let encoder = Encoder::new(&gpu, settings.clone(), chroma == ChromaMode::Dual420)
         .context("create encoder")?;
 
-    let (mut msg_rx, mut clip_in_rx) = spawn_reader(reader);
+    let (mut msg_rx, mut clip_in_rx) = spawn_reader(reader, Arc::downgrade(&input));
+    let (out, queued_frames) = spawn_writer(writer);
 
     capturer.request_frame().ok();
     let mut session = Session {
-        writer,
+        out,
+        queued_frames,
         gpu,
         instance,
         output,
         stream,
+        fit: stream,
+        base_chroma: chroma,
+        ladder: Ladder::new(),
         encoder_max,
         caps,
         bitrate_ctl,
@@ -162,6 +174,7 @@ where
         encoder,
         input,
         capturer,
+        resize_request: None,
         pending: None,
         capture_asked: true,
         blocked_noted: false,
@@ -171,12 +184,17 @@ where
         want_keyframe: true,
         rtt: RttEstimator::new(),
         cursor_shape_id: 0,
+        encode_us: 0.0,
+        max_fps,
+        next_send_at: Instant::now(),
     };
 
     loop {
+        let pace = tokio::time::Instant::from_std(session.next_send_at);
         let flow = tokio::select! {
+            _ = tokio::time::sleep_until(pace), if session.pending.is_some() => ControlFlow::Continue(()),
             msg = msg_rx.recv() => match msg {
-                Some(msg) => session.on_client_msg(msg).await?,
+                Some(msg) => session.on_client_msg(msg)?,
                 None => {
                     tracing::info!("client disconnected");
                     ControlFlow::Break(())
@@ -184,7 +202,7 @@ where
             },
             text = clip_out_rx.recv() => {
                 if let Some(text) = text {
-                    session.send_clipboard(text).await?;
+                    session.send_clipboard(text)?;
                 }
                 ControlFlow::Continue(())
             }
@@ -194,10 +212,13 @@ where
                 }
                 ControlFlow::Continue(())
             }
-            ev = cap_rx.recv() => session.on_capture(ev).await?,
+            ev = cap_rx.recv() => session.on_capture(ev)?,
         };
         if flow.is_break() {
             break;
+        }
+        if let Some((w, h, scale)) = session.resize_request.take() {
+            session.resize(w, h, scale).await?;
         }
         session.pump_encoder().await?;
     }
@@ -248,54 +269,142 @@ where
     }
 }
 
-/// Drain the socket on its own task so a burst of input (a mouse drag) can
-/// never starve frame capture and a blocked write can never block reads.
-/// Clipboard payloads are consumed inline and delivered as text.
+/// Drain the socket on its own thread. Input is injected from there, so a
+/// key or pointer event never waits behind an encode or a blocked write on
+/// the session thread; everything else is handed over on a channel. Clipboard
+/// payloads are consumed inline and delivered as text.
 fn spawn_reader<R>(
     mut reader: Framed<R>,
+    input: std::sync::Weak<Input>,
 ) -> (UnboundedReceiver<ClientMsg>, UnboundedReceiver<String>)
 where
-    R: AsyncRead + Unpin + 'static,
+    R: AsyncRead + Unpin + Send + 'static,
 {
     let (msg_tx, msg_rx) = mpsc::unbounded_channel();
     let (clip_tx, clip_rx) = mpsc::unbounded_channel();
-    tokio::task::spawn_local(async move {
-        loop {
-            match reader.read_msg::<ClientMsg>().await {
-                Ok(ClientMsg::ClipboardData { data_len, .. }) => {
-                    if data_len as u64 > gliff_proto::CLIPBOARD_MAX {
-                        break;
-                    }
-                    match reader.read_payload(data_len).await {
-                        Ok(bytes) => {
-                            if let Ok(text) = String::from_utf8(bytes.to_vec()) {
-                                let _ = clip_tx.send(text);
+    std::thread::Builder::new()
+        .name("gliff-reader".into())
+        .spawn(move || {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            rt.block_on(async move {
+                loop {
+                    match reader.read_msg::<ClientMsg>().await {
+                        Ok(ClientMsg::ClipboardData { data_len, .. }) => {
+                            if data_len as u64 > gliff_proto::CLIPBOARD_MAX {
+                                break;
+                            }
+                            match reader.read_payload(data_len).await {
+                                Ok(bytes) => {
+                                    if let Ok(text) = String::from_utf8(bytes.to_vec()) {
+                                        let _ = clip_tx.send(text);
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        Ok(msg) => {
+                            if let Some(cmd) = input_cmd(&msg) {
+                                // The session owns the input thread; once it
+                                // has dropped it, there is nothing to inject into.
+                                let Some(input) = input.upgrade() else {
+                                    break;
+                                };
+                                if input.send(cmd).is_err() {
+                                    break;
+                                }
+                            } else if msg_tx.send(msg).is_err() {
+                                break;
                             }
                         }
                         Err(_) => break,
                     }
                 }
-                Ok(msg) => {
-                    if msg_tx.send(msg).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    });
+            });
+        })
+        .expect("spawn reader thread");
     (msg_rx, clip_rx)
 }
 
-struct Session<W> {
-    writer: Framed<W>,
+/// The input injection a client message asks for, if it is one.
+fn input_cmd(msg: &ClientMsg) -> Option<InputCmd> {
+    Some(match *msg {
+        ClientMsg::Key { keycode, pressed } => InputCmd::Key {
+            code: keycode,
+            pressed,
+        },
+        ClientMsg::PointerMotion { x, y } => InputCmd::Motion { x, y },
+        ClientMsg::PointerButton { button, pressed } => InputCmd::Button { button, pressed },
+        ClientMsg::PointerAxis {
+            axis,
+            value,
+            discrete,
+            stop,
+        } => InputCmd::Axis {
+            axis: match axis {
+                gliff_proto::Axis::Vertical => InAxis::Vertical,
+                gliff_proto::Axis::Horizontal => InAxis::Horizontal,
+            },
+            value,
+            discrete,
+            stop,
+        },
+        _ => return None,
+    })
+}
+
+/// A message and the payloads that follow it on the wire.
+struct Outgoing {
+    msg: ServerMsg,
+    payloads: Vec<Vec<u8>>,
+    video: bool,
+}
+
+/// Write on a separate task so a write that blocks on a full link stalls
+/// neither acks nor capture. The counter is the video frames handed over and
+/// not yet fully written, so the session can see the link is behind.
+fn spawn_writer<W>(mut writer: Framed<W>) -> (UnboundedSender<Outgoing>, Arc<AtomicU32>)
+where
+    W: AsyncWrite + Unpin + 'static,
+{
+    let (tx, mut rx) = mpsc::unbounded_channel::<Outgoing>();
+    let queued = Arc::new(AtomicU32::new(0));
+    let counter = queued.clone();
+    tokio::task::spawn_local(async move {
+        while let Some(out) = rx.recv().await {
+            let payloads: Vec<&[u8]> = out.payloads.iter().map(|p| p.as_slice()).collect();
+            let r = writer.write_msg_with_payloads(&out.msg, &payloads).await;
+            if out.video {
+                counter.fetch_sub(1, Ordering::AcqRel);
+            }
+            if let Err(e) = r {
+                tracing::info!(error = %e, "write failed; closing");
+                break;
+            }
+        }
+    });
+    (tx, queued)
+}
+
+struct Session {
+    out: UnboundedSender<Outgoing>,
+    /// Video frames handed to the writer and not yet on the wire.
+    queued_frames: Arc<AtomicU32>,
     gpu: Arc<Gpu>,
     instance: hypr_ipc::Instance,
     output: SessionOutput,
-    /// Encoded size. Equals the output size, except for a mirrored screen
-    /// larger than the client's window, or any output larger than the
-    /// encoder's maximum, which are scaled down to fit.
+    /// Encoded size: the fitted size, scaled down further by the ladder.
     stream: (u32, u32),
+    /// The size the stream would have at full quality: the output size, or a
+    /// mirrored screen scaled down to the client's window.
+    fit: (u32, u32),
+    /// The chroma mode the session was set up with; the ladder may drop below.
+    base_chroma: ChromaMode,
+    ladder: Ladder,
     /// The largest size the encoder accepts.
     encoder_max: (u32, u32),
     caps: ClientCaps,
@@ -304,8 +413,10 @@ struct Session<W> {
     chroma: ChromaMode,
     settings: EncoderSettings,
     encoder: Encoder,
-    input: Input,
+    input: Arc<Input>,
     capturer: Capturer,
+    /// A Resize from the client, applied on the session loop.
+    resize_request: Option<(u32, u32, f32)>,
     /// The newest captured frame not yet encoded.
     pending: Option<CapturedFrame>,
     capture_asked: bool,
@@ -319,10 +430,33 @@ struct Session<W> {
     want_keyframe: bool,
     rtt: RttEstimator,
     cursor_shape_id: u32,
+    /// Smoothed time to split and encode one frame, in microseconds.
+    encode_us: f64,
+    max_fps: u32,
+    /// The pace: no frame is encoded before this instant.
+    next_send_at: Instant,
 }
 
-impl<W: AsyncWrite + Unpin> Session<W> {
-    async fn on_client_msg(&mut self, msg: ClientMsg) -> Result<ControlFlow<()>> {
+/// Slowest pace the rate control is told about; below this each frame would
+/// take too long to send.
+const MIN_RC_FPS: u32 = 5;
+
+impl Session {
+    /// Queue a message for the writer. A closed writer ends the session.
+    fn send(&self, msg: ServerMsg, payloads: Vec<Vec<u8>>, video: bool) -> Result<()> {
+        if video {
+            self.queued_frames.fetch_add(1, Ordering::AcqRel);
+        }
+        self.out
+            .send(Outgoing {
+                msg,
+                payloads,
+                video,
+            })
+            .map_err(|_| anyhow::anyhow!("connection closed"))
+    }
+
+    fn on_client_msg(&mut self, msg: ClientMsg) -> Result<ControlFlow<()>> {
         match msg {
             ClientMsg::Bye => return Ok(ControlFlow::Break(())),
             ClientMsg::FrameAck {
@@ -330,7 +464,7 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                 decoded_at_ms,
             } => {
                 self.in_flight = self.in_flight.saturating_sub(1);
-                self.rtt.record(frame_id, decoded_at_ms);
+                let acked = self.rtt.record(frame_id, decoded_at_ms);
                 let n_limit = self.rtt.window(self.settings.framerate);
                 if n_limit != self.n_limit {
                     tracing::debug!(
@@ -340,58 +474,73 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                     );
                     self.n_limit = n_limit;
                 }
-                if let Some(bitrate) = self.bitrate_ctl.on_ack(self.rtt.smoothed_ms) {
-                    self.settings.bitrate = bitrate;
-                    self.encoder.set_bitrate(bitrate);
+                if let Some(changed) =
+                    self.bitrate_ctl
+                        .on_ack(acked, &mut self.rtt, self.settings.framerate)
+                {
+                    if changed {
+                        self.apply_rate();
+                    }
+                    self.consider_ladder()?;
                 }
             }
             ClientMsg::RequestKeyframe => self.want_keyframe = true,
-            ClientMsg::Key { keycode, pressed } => self.inject(InputCmd::Key {
-                code: keycode,
-                pressed,
-            }),
-            ClientMsg::PointerMotion { x, y } => self.inject(InputCmd::Motion { x, y }),
-            ClientMsg::PointerButton { button, pressed } => {
-                self.inject(InputCmd::Button { button, pressed })
-            }
-            ClientMsg::PointerAxis {
-                axis,
-                value,
-                discrete,
-                stop,
-            } => {
-                let axis = match axis {
-                    gliff_proto::Axis::Vertical => InAxis::Vertical,
-                    gliff_proto::Axis::Horizontal => InAxis::Horizontal,
-                };
-                self.inject(InputCmd::Axis {
-                    axis,
-                    value,
-                    discrete,
-                    stop,
-                })
-            }
+            // Input is injected by the reader thread.
+            ClientMsg::Key { .. }
+            | ClientMsg::PointerMotion { .. }
+            | ClientMsg::PointerButton { .. }
+            | ClientMsg::PointerAxis { .. } => {}
             ClientMsg::Resize {
                 width,
                 height,
                 scale,
-            } => self.resize(width, height, scale).await?,
-            ClientMsg::Ping { t } => {
-                self.writer
-                    .write_msg(&ServerMsg::Pong {
-                        t,
-                        server_now_ms: now_ms(),
-                    })
-                    .await?
+            } => {
+                self.resize_request = Some((width, height, scale));
             }
-            // ClipboardData is consumed by the reader task; the offer/request
-            // negotiation is not used for text.
+            ClientMsg::Ping { t } => self.send(
+                ServerMsg::Pong {
+                    t,
+                    server_now_ms: now_ms(),
+                },
+                Vec::new(),
+                false,
+            )?,
+            // ClipboardData is consumed by the reader thread; the
+            // offer/request negotiation is not used for text.
             ClientMsg::ClipboardData { .. }
             | ClientMsg::ClipboardOffer { .. }
             | ClientMsg::ClipboardRequest { .. } => {}
             ClientMsg::Hello { .. } => anyhow::bail!("unexpected second Hello"),
         }
         Ok(ControlFlow::Continue(()))
+    }
+
+    /// Track how long frames take to encode and tell the rate control the
+    /// pace that gives, so the per-frame budget matches the bandwidth: an
+    /// encoder that sustains 25 fps at 4K should not spend a 60 fps budget.
+    fn note_encode_time(&mut self, enc_us: u128) {
+        let sample = enc_us as f64;
+        self.encode_us = if self.encode_us == 0.0 {
+            sample
+        } else {
+            0.8 * self.encode_us + 0.2 * sample
+        };
+        let sustainable = (1_000_000.0 / (self.encode_us * 1.1).max(1.0)) as u32;
+        let fps = sustainable.clamp(MIN_RC_FPS, self.pace_cap());
+        let current = self.settings.framerate;
+        if (fps as f64 - current as f64).abs() / current as f64 > 0.15 {
+            self.settings.framerate = fps;
+            self.apply_rate();
+        }
+    }
+
+    /// Program the encoder with the budget at the current pace.
+    fn apply_rate(&mut self) {
+        let fps = self.settings.framerate;
+        self.settings.bitrate = self.bitrate_ctl.bitrate(fps);
+        self.settings.vbv_ms = self.bitrate_ctl.vbv_ms();
+        self.encoder
+            .set_rate(self.settings.bitrate, fps, self.settings.vbv_ms);
     }
 
     /// Forward an input event; a dead input thread ends the session elsewhere.
@@ -434,54 +583,125 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         // so the logical size is whole; wait for it and use what it chose.
         let applied = self.wait_for_mode(width, height, scale).await;
         if !same_size {
-            let stream = EncoderSettings::fit_extent(width, height, self.encoder_max);
-            if stream != (width, height) {
-                tracing::info!(
-                    width = stream.0,
-                    height = stream.1,
-                    "scaling the stream to the encoder maximum"
+            let (old_w, old_h) = (self.output.width, self.output.height);
+            self.output.width = width;
+            self.output.height = height;
+            if !self.rebuild_encoder((width, height)) {
+                // Keep streaming at the old size rather than end the session.
+                tracing::warn!(
+                    width,
+                    height,
+                    "encoder rejected the new size; keeping the old one"
                 );
-            }
-            self.bitrate_ctl
-                .retarget(EncoderSettings::default_bitrate(stream.0, stream.1, 60));
-            let settings = encoder_settings(stream.0, stream.1, self.bitrate_ctl.current());
-            match Encoder::new(
-                &self.gpu,
-                settings.clone(),
-                self.chroma == ChromaMode::Dual420,
-            ) {
-                Ok(encoder) => {
-                    self.encoder = encoder;
-                    self.settings = settings;
-                    self.output.width = width;
-                    self.output.height = height;
-                    self.stream = stream;
-                    self.pending = None;
-                    self.want_keyframe = true;
-                }
-                Err(e) => {
-                    // Keep streaming at the old size rather than end the session.
-                    tracing::warn!(error = %e, width, height, "encoder rejected the new size; keeping the old one");
-                    let (w, h, s) = (self.output.width, self.output.height, self.output.scale);
-                    self.instance
-                        .set_monitor_mode(&self.output.name, w, h, 60, s)
-                        .ok();
-                    self.wait_for_mode(w, h, s).await;
-                    self.inject(self.output.logical_extent());
-                    return Ok(());
-                }
+                self.output.width = old_w;
+                self.output.height = old_h;
+                let s = self.output.scale;
+                self.instance
+                    .set_monitor_mode(&self.output.name, old_w, old_h, 60, s)
+                    .ok();
+                self.wait_for_mode(old_w, old_h, s).await;
+                self.inject(self.output.logical_extent());
+                return Ok(());
             }
         }
         self.output.scale = applied;
         self.inject(self.output.logical_extent());
-        send_stream_config(
-            &mut self.writer,
-            self.codec,
-            self.chroma,
-            &self.output,
-            self.stream,
+        self.send(
+            stream_config(self.codec, self.chroma, &self.output, self.stream),
+            Vec::new(),
+            false,
         )
-        .await
+    }
+
+    /// The most frames per second the stream may run at now.
+    fn pace_cap(&self) -> u32 {
+        self.ladder.fps_cap(self.max_fps)
+    }
+
+    /// Replace the encoder for a new full-quality size or a new ladder
+    /// level, carry the link estimate over, and tell the client. Returns
+    /// false, with nothing changed, when the encoder rejects the size.
+    fn rebuild_encoder(&mut self, fit: (u32, u32)) -> bool {
+        let scaled = self.ladder.scale(fit);
+        let stream = EncoderSettings::fit_extent(scaled.0, scaled.1, self.encoder_max);
+        let chroma = self.ladder.chroma(self.base_chroma);
+        let streams = if chroma == ChromaMode::Dual420 { 2 } else { 1 };
+        let pace = self.settings.framerate.min(self.pace_cap());
+        let mut ctl = self.bitrate_ctl.clone();
+        ctl.reconfigure(stream.0, stream.1, streams, pace, self.settings.framerate);
+        let settings = encoder_settings(stream.0, stream.1, ctl.bitrate(pace), pace, ctl.vbv_ms());
+        match Encoder::new(&self.gpu, settings.clone(), chroma == ChromaMode::Dual420) {
+            Ok(encoder) => {
+                tracing::info!(
+                    width = stream.0,
+                    height = stream.1,
+                    ?chroma,
+                    fps_cap = self.pace_cap(),
+                    level = self.ladder.level,
+                    "stream reconfigured"
+                );
+                self.encoder = encoder;
+                self.settings = settings;
+                self.bitrate_ctl = ctl;
+                self.chroma = chroma;
+                self.encode_us = 0.0;
+                self.fit = fit;
+                self.stream = stream;
+                self.pending = None;
+                self.want_keyframe = true;
+                true
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, width = stream.0, height = stream.1, "encoder rejected the size");
+                false
+            }
+        }
+    }
+
+    /// Step the ladder down when the link cannot pay for the quality floor
+    /// at this level, and back up when the budget has sat at its ceiling
+    /// for a while.
+    fn consider_ladder(&mut self) -> Result<()> {
+        let now = Instant::now();
+        let ctl = &self.bitrate_ctl;
+        let since_change = now.duration_since(self.ladder.changed_at);
+        let step = if !ctl.slow_start
+            && ctl.current <= ctl.floor
+            && since_change >= Ladder::HOLD_DOWN
+            && self.ladder.step_down(self.settings.framerate)
+        {
+            self.ladder.at_ceiling_since = None;
+            self.ladder.note_step_down(now);
+            true
+        } else if ctl.current >= ctl.max && self.ladder.level > 0 {
+            let at_ceiling = *self.ladder.at_ceiling_since.get_or_insert(now);
+            let hold = self.ladder.hold_up;
+            if now.duration_since(at_ceiling) >= hold && since_change >= hold {
+                self.ladder.level -= 1;
+                self.ladder.at_ceiling_since = None;
+                self.ladder.note_step_up(now);
+                true
+            } else {
+                false
+            }
+        } else {
+            self.ladder.at_ceiling_since = None;
+            false
+        };
+        if !step {
+            return Ok(());
+        }
+        self.ladder.changed_at = now;
+        tracing::info!(level = self.ladder.level, "ladder step");
+        let fit = self.fit;
+        if self.rebuild_encoder(fit) {
+            self.send(
+                stream_config(self.codec, self.chroma, &self.output, self.stream),
+                Vec::new(),
+                false,
+            )?;
+        }
+        Ok(())
     }
 
     /// A mirrored screen keeps its size; when it is larger than the client's
@@ -490,46 +710,21 @@ impl<W: AsyncWrite + Unpin> Session<W> {
     async fn fit_mirror(&mut self, win_w: u32, win_h: u32) -> Result<()> {
         let (ow, oh) = (self.output.width as f64, self.output.height as f64);
         let fit = (win_w as f64 / ow).min(win_h as f64 / oh).min(1.0);
-        let stream = EncoderSettings::fit_extent(
+        let fit = (
             ((ow * fit).round() as u32).max(2) & !1,
             ((oh * fit).round() as u32).max(2) & !1,
-            self.encoder_max,
         );
-        if stream == self.stream {
+        if fit == self.fit {
             return Ok(());
         }
-        self.bitrate_ctl
-            .retarget(EncoderSettings::default_bitrate(stream.0, stream.1, 60));
-        let settings = encoder_settings(stream.0, stream.1, self.bitrate_ctl.current());
-        match Encoder::new(
-            &self.gpu,
-            settings.clone(),
-            self.chroma == ChromaMode::Dual420,
-        ) {
-            Ok(encoder) => {
-                tracing::info!(
-                    width = stream.0,
-                    height = stream.1,
-                    "scaling the mirrored screen to the window"
-                );
-                self.encoder = encoder;
-                self.settings = settings;
-                self.stream = stream;
-                self.pending = None;
-                self.want_keyframe = true;
-                send_stream_config(
-                    &mut self.writer,
-                    self.codec,
-                    self.chroma,
-                    &self.output,
-                    self.stream,
-                )
-                .await
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "encoder rejected the fitted size; keeping the current one");
-                Ok(())
-            }
+        if self.rebuild_encoder(fit) {
+            self.send(
+                stream_config(self.codec, self.chroma, &self.output, self.stream),
+                Vec::new(),
+                false,
+            )
+        } else {
+            Ok(())
         }
     }
 
@@ -556,7 +751,7 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         seen.unwrap_or(scale)
     }
 
-    async fn send_clipboard(&mut self, text: String) -> Result<()> {
+    fn send_clipboard(&mut self, text: String) -> Result<()> {
         let bytes = text.into_bytes();
         let total = bytes.len() as u64;
         let msg = ServerMsg::ClipboardData {
@@ -565,10 +760,10 @@ impl<W: AsyncWrite + Unpin> Session<W> {
             total,
             data_len: bytes.len() as u32,
         };
-        Ok(self.writer.write_msg_with_payloads(&msg, &[&bytes]).await?)
+        self.send(msg, vec![bytes], false)
     }
 
-    async fn on_capture(&mut self, ev: Option<Incoming>) -> Result<ControlFlow<()>> {
+    fn on_capture(&mut self, ev: Option<Incoming>) -> Result<ControlFlow<()>> {
         match ev {
             Some(Incoming::Frame(image)) => {
                 self.pending = Some(image);
@@ -591,17 +786,19 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                     hot_y,
                     argb_len: argb.len() as u32,
                 };
-                self.writer.write_msg_with_payloads(&msg, &[&argb]).await?;
+                self.send(msg, vec![argb], false)?;
             }
             Some(Incoming::CursorPos { x, y, visible }) => {
-                self.writer
-                    .write_msg(&ServerMsg::CursorPos {
+                self.send(
+                    ServerMsg::CursorPos {
                         x,
                         y,
                         shape_id: self.cursor_shape_id,
                         visible,
-                    })
-                    .await?;
+                    },
+                    Vec::new(),
+                    false,
+                )?;
             }
             Some(Incoming::Stopped) => {
                 tracing::warn!("capture stopped");
@@ -616,16 +813,33 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         Ok(ControlFlow::Continue(()))
     }
 
-    /// Encode and send the pending frame if the client has ack capacity, then
-    /// ask the capture thread for the next one.
+    /// The client has ack capacity and the previous frame has left for the
+    /// wire, so encoding another now will not build a queue.
+    fn can_send(&self) -> bool {
+        self.link_has_room() && Instant::now() >= self.next_send_at
+    }
+
+    /// The link side of `can_send`: waiting for a pace slot is not
+    /// congestion, so only this part counts as a blocked frame.
+    fn link_has_room(&self) -> bool {
+        self.in_flight < self.n_limit && self.queued_frames.load(Ordering::Acquire) == 0
+    }
+
+    /// Encode and send the pending frame if the link can take it, then ask
+    /// the capture thread for the next one. While the link cannot take a
+    /// frame, capture continues so the frame that eventually goes out is the
+    /// newest, not the one that was waiting.
     async fn pump_encoder(&mut self) -> Result<()> {
         // Count a blocked frame once, not once per event-loop pass.
-        if self.pending.is_some() && self.in_flight >= self.n_limit && !self.blocked_noted {
+        if self.pending.is_some() && !self.link_has_room() && !self.blocked_noted {
             self.bitrate_ctl.note_blocked();
             self.blocked_noted = true;
         }
-        if self.in_flight < self.n_limit {
+        if self.can_send() {
             if let Some(frame) = self.pending.take() {
+                // Ask for the next frame before this one encodes, so the
+                // compositor prepares it while the GPU is busy.
+                self.request_capture();
                 // A frame captured before a resize took effect is stale.
                 let info = &frame.buffer.info;
                 if (info.width & !1, info.height & !1) == (self.output.width, self.output.height) {
@@ -633,11 +847,15 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                 }
             }
         }
-        if !self.capture_asked && self.pending.is_none() && self.in_flight < self.n_limit {
+        self.request_capture();
+        Ok(())
+    }
+
+    fn request_capture(&mut self) {
+        if !self.capture_asked {
             self.capturer.request_frame().ok();
             self.capture_asked = true;
         }
-        Ok(())
     }
 
     async fn encode_and_send(&mut self, frame: &CapturedFrame) -> Result<()> {
@@ -659,7 +877,17 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         // the ring is reallocated (resize), so old imports are never reused.
         let buffer_key = (frame.buffer.generation << 32) | frame.buffer.index as u64;
         let key = std::mem::take(&mut self.want_keyframe);
+        // The pace counts from the start of the encode, so an encode that
+        // takes longer than the interval never adds a wait of its own. When
+        // we keep up, the next slot follows this one, so the cadence is even.
+        let interval = Duration::from_secs_f64(1.0 / self.pace_cap() as f64);
         let t0 = Instant::now();
+        let from_slot = self.next_send_at + interval;
+        self.next_send_at = if from_slot > t0 {
+            from_slot
+        } else {
+            t0 + interval
+        };
         let encoded = self.encoder.encode_dmabuf(buffer_key, &plane, key)?;
         let enc_us = t0.elapsed().as_micros();
         let aux = encoded.aux.unwrap_or_default();
@@ -676,24 +904,111 @@ impl<W: AsyncWrite + Unpin> Session<W> {
             data_len: encoded.main.len() as u32,
             aux_len: aux.len() as u32,
         };
-        self.writer
-            .write_msg_with_payloads(&msg, &[&encoded.main, &aux])
-            .await?;
+        let bytes = encoded.main.len() + aux.len();
+        self.send(msg, vec![encoded.main, aux], true)?;
         tracing::debug!(
             frame_id = self.frame_id,
             key = encoded.keyframe,
-            main = encoded.main.len(),
-            aux = aux.len(),
+            bytes,
             enc_us,
             in_flight = self.in_flight,
             n_limit = self.n_limit,
             "sent frame"
         );
-        self.rtt.on_sent(self.frame_id);
+        self.rtt.on_sent(self.frame_id, bytes);
         self.bitrate_ctl.note_sent();
+        self.note_encode_time(enc_us);
         self.frame_id += 1;
         self.in_flight += 1;
         Ok(())
+    }
+}
+
+/// What to give up, in order, when the link cannot pay for the quality
+/// floor: frame rate first (least visible on a desktop), then the aux
+/// chroma stream, then resolution. Each step costs a keyframe, so steps are
+/// held for a while in both directions.
+struct Ladder {
+    level: u8,
+    changed_at: Instant,
+    at_ceiling_since: Option<Instant>,
+    /// How long the budget must sit at its ceiling before a step up. Doubles
+    /// when a step up is followed by a step down, so a link that cannot
+    /// carry the next level is probed less and less often.
+    hold_up: Duration,
+    last_step_up: Option<Instant>,
+}
+
+impl Ladder {
+    const LEVELS: [(u32, bool, f32); 5] = [
+        // (fps cap, aux stream kept, scale)
+        (u32::MAX, true, 1.0),
+        (30, true, 1.0),
+        (15, true, 1.0),
+        (15, false, 1.0),
+        (15, false, 0.5),
+    ];
+    const HOLD_DOWN: Duration = Duration::from_secs(2);
+    const HOLD_UP: Duration = Duration::from_secs(8);
+    const MAX_HOLD_UP: Duration = Duration::from_secs(300);
+
+    fn new() -> Self {
+        Self {
+            level: 0,
+            changed_at: Instant::now(),
+            at_ceiling_since: None,
+            hold_up: Self::HOLD_UP,
+            last_step_up: None,
+        }
+    }
+
+    fn note_step_down(&mut self, now: Instant) {
+        if let Some(up) = self.last_step_up {
+            if now.duration_since(up) < self.hold_up * 2 {
+                self.hold_up = (self.hold_up * 2).min(Self::MAX_HOLD_UP);
+            } else {
+                self.hold_up = Self::HOLD_UP;
+            }
+        }
+    }
+
+    fn note_step_up(&mut self, now: Instant) {
+        self.last_step_up = Some(now);
+    }
+
+    fn fps_cap(&self, max_fps: u32) -> u32 {
+        Self::LEVELS[self.level as usize].0.min(max_fps)
+    }
+
+    fn chroma(&self, base: ChromaMode) -> ChromaMode {
+        if Self::LEVELS[self.level as usize].1 {
+            base
+        } else {
+            ChromaMode::Single420
+        }
+    }
+
+    fn scale(&self, fit: (u32, u32)) -> (u32, u32) {
+        let s = Self::LEVELS[self.level as usize].2;
+        (
+            ((fit.0 as f32 * s) as u32).max(2) & !1,
+            ((fit.1 as f32 * s) as u32).max(2) & !1,
+        )
+    }
+
+    /// Move to the next level that changes something; a frame rate cap
+    /// above the pace we already run at would not. False at the bottom.
+    fn step_down(&mut self, pace: u32) -> bool {
+        let cur = Self::LEVELS[self.level as usize];
+        let mut next = self.level as usize + 1;
+        while let Some(l) = Self::LEVELS.get(next) {
+            if l.1 != cur.1 || l.2 != cur.2 || l.0 < pace {
+                self.level = next as u8;
+                return true;
+            }
+            next += 1;
+        }
+        false
     }
 }
 
@@ -732,18 +1047,17 @@ impl Drop for SessionOutput {
     }
 }
 
-async fn send_stream_config<W: AsyncWrite + Unpin>(
-    writer: &mut Framed<W>,
+fn stream_config(
     codec: Codec,
     chroma: ChromaMode,
     output: &SessionOutput,
     stream: (u32, u32),
-) -> Result<()> {
+) -> ServerMsg {
     // The scale the client divides stream pixels by to reach the remote's
     // logical space: the output scale times any downscale of the stream.
     let effective_scale = output.scale * stream.0 as f32 / output.width.max(1) as f32;
     // Parameter sets ride in-band on every keyframe, so extradata is empty.
-    let msg = ServerMsg::StreamConfig {
+    ServerMsg::StreamConfig {
         codec,
         chroma,
         width: stream.0,
@@ -751,16 +1065,22 @@ async fn send_stream_config<W: AsyncWrite + Unpin>(
         scale_milli: (effective_scale * 1000.0).round() as u32,
         extradata: Vec::new(),
         aux_extradata: None,
-    };
-    Ok(writer.write_msg(&msg).await?)
+    }
 }
 
-fn encoder_settings(width: u32, height: u32, bitrate: u32) -> EncoderSettings {
+fn encoder_settings(
+    width: u32,
+    height: u32,
+    bitrate: u32,
+    framerate: u32,
+    vbv_ms: u32,
+) -> EncoderSettings {
     EncoderSettings {
         width,
         height,
         bitrate,
-        framerate: 60,
+        framerate,
+        vbv_ms,
     }
 }
 
@@ -888,63 +1208,116 @@ fn start_input(target: &Target, output: &str, keymap: &str) -> Result<Input> {
     Ok(Input::start(ic, Box::new(|_| {}))?)
 }
 
-/// Smoothed ack round-trip time, driving how many frames may be unacked.
+/// Ack round-trip time. The smoothed value tracks the path as it is; the
+/// base (its minimum) is the path without queueing. The difference is how
+/// much has queued up in front of the client.
 struct RttEstimator {
-    sent: VecDeque<(u64, Instant)>,
+    sent: VecDeque<(u64, Instant, usize)>,
     smoothed_ms: f64,
+    base_ms: f64,
+    /// Lowest sample since the controller last looked. A queue raises every
+    /// sample; decode jitter raises only some, so the minimum tells the two
+    /// apart.
+    window_min_ms: f64,
 }
 
-/// Adapts the CBR target to the path. The ack RTT is the signal: its
-/// minimum is the base delay, growth over the base is queueing; a queue or
-/// a starved send window cuts the rate, a quiet path grows it back slowly.
+/// Adapts the per-frame bit budget to the path. The encoder is CBR at
+/// `budget x pace`, so the budget is what each frame may cost and the pace
+/// converts it to a bandwidth. Growth of the ack RTT over its base is
+/// queueing; the rate the acks then arrive at is what the link delivers, so
+/// the budget drops to a fraction of that in one step. A quiet path grows
+/// the budget back: quickly at first (slow start), then gently.
+#[derive(Clone)]
 struct BitrateController {
+    /// Bits per frame per stream, bounded by the quality ceiling and floor.
     min: u32,
     max: u32,
     current: u32,
-    /// Set by `--bitrate`: the target does not follow the stream size.
-    fixed: bool,
-    base_rtt_ms: f64,
+    /// Below this the picture is not worth its frame rate; the ladder steps.
+    floor: u32,
+    /// The last change was a cut.
+    last_was_cut: bool,
+    /// Optional cap on total bits per second across the streams.
+    cap: Option<u32>,
+    streams: u32,
     last_eval: Instant,
     last_change: Instant,
     sent: u32,
     blocked: u32,
+    /// Acks in the current evaluation window: arrival time and the bytes
+    /// of the frame each covers.
+    acks: Vec<(Instant, usize)>,
+    /// Growth steps are large until the first cut.
+    slow_start: bool,
 }
 
 impl BitrateController {
-    const EVAL_EVERY: Duration = Duration::from_millis(500);
-    const GROW_AFTER: Duration = Duration::from_secs(2);
+    const EVAL_EVERY: Duration = Duration::from_millis(250);
+    const GROW_AFTER: Duration = Duration::from_millis(1500);
     const QUEUE_HIGH_MS: f64 = 50.0;
-    const QUEUE_LOW_MS: f64 = 15.0;
+    const QUEUE_LOW_MS: f64 = 10.0;
+    /// Bits per pixel per stream: the quality ceiling, and the floor below
+    /// which a frame is not worth sending.
+    const MAX_BPP: f64 = 0.1;
+    const MIN_BPP: f64 = 0.005;
+    const FLOOR_BPP: f64 = 0.03;
 
-    fn new(max: u32, fixed: bool) -> Self {
+    fn new(width: u32, height: u32, streams: u32, cap: Option<u32>) -> Self {
+        let pixels = width as f64 * height as f64;
+        let max = (pixels * Self::MAX_BPP) as u32;
+        let min = (pixels * Self::MIN_BPP) as u32;
         let now = Instant::now();
         Self {
-            min: (max / 8).max(1_000_000).min(max),
+            min,
             max,
-            current: max,
-            fixed,
-            base_rtt_ms: f64::MAX,
+            current: (max / 4).max(min),
+            floor: (pixels * Self::FLOOR_BPP) as u32,
+            last_was_cut: false,
+            cap,
+            streams: streams.max(1),
             last_eval: now,
             last_change: now,
             sent: 0,
             blocked: 0,
+            acks: Vec::new(),
+            slow_start: true,
         }
     }
 
-    fn current(&self) -> u32 {
-        self.current
+    /// Keep the link estimate across a change of size, stream count or
+    /// pace: the same bits per second, spread over the new frames.
+    fn reconfigure(&mut self, width: u32, height: u32, streams: u32, pace: u32, old_pace: u32) {
+        let bits_per_second = self.current as f64 * self.streams as f64 * old_pace.max(1) as f64;
+        let pixels = width as f64 * height as f64;
+        self.max = (pixels * Self::MAX_BPP) as u32;
+        self.min = (pixels * Self::MIN_BPP) as u32;
+        self.floor = (pixels * Self::FLOOR_BPP) as u32;
+        self.streams = streams.max(1);
+        let per_frame = bits_per_second / (self.streams as f64 * pace.max(1) as f64);
+        self.current = (per_frame as u32).clamp(self.min, self.max);
+        self.last_was_cut = false;
+        self.acks.clear();
     }
 
-    /// The stream size changed: keep the same share of the new ceiling, so
-    /// bits per pixel stay constant across a resize.
-    fn retarget(&mut self, max: u32) {
-        if self.fixed || max == self.max {
-            return;
+    /// How far a frame may overshoot the average. Generous when the budget
+    /// is comfortable (quality on a good link); tight when it is low, so a
+    /// keyframe on a slow link cannot stall it for a second.
+    fn vbv_ms(&self) -> u32 {
+        if self.current >= self.floor * 2 {
+            EncoderSettings::DEFAULT_VBV_MS
+        } else {
+            100
         }
-        let share = self.current as f64 / self.max as f64;
-        self.max = max;
-        self.min = (max / 8).max(1_000_000).min(max);
-        self.current = ((max as f64 * share) as u32).clamp(self.min, self.max);
+    }
+
+    /// The CBR bitrate for one stream at `pace` frames per second.
+    fn bitrate(&self, pace: u32) -> u32 {
+        let by_budget = self.current as u64 * pace as u64;
+        let by_cap = self
+            .cap
+            .map(|c| c as u64 / self.streams as u64)
+            .unwrap_or(u64::MAX);
+        by_budget.min(by_cap).max(1) as u32
     }
 
     fn note_sent(&mut self) {
@@ -956,44 +1329,81 @@ impl BitrateController {
         self.blocked += 1;
     }
 
-    /// Feed the smoothed ack RTT; returns a new target when it changes.
-    fn on_ack(&mut self, smoothed_ms: f64) -> Option<u32> {
-        self.base_rtt_ms = self.base_rtt_ms.min(smoothed_ms);
+    /// Bits per second the acks in the window arrived at. When the link is
+    /// saturated the acks are clocked by its transmission rate, so this is
+    /// close to the link capacity.
+    fn acked_rate(&self) -> Option<f64> {
+        let (first, rest) = self.acks.split_first()?;
+        if rest.len() < 2 {
+            return None;
+        }
+        let span = rest[rest.len() - 1].0.duration_since(first.0).as_secs_f64();
+        if span < 0.05 {
+            return None;
+        }
+        let bytes: usize = rest.iter().map(|(_, b)| b).sum();
+        Some(bytes as f64 * 8.0 / span)
+    }
+
+    /// Feed an ack: the bytes it covers, the RTT estimate and the current
+    /// pace. `None` between evaluations; otherwise whether the budget
+    /// changed.
+    fn on_ack(&mut self, acked_bytes: usize, rtt: &mut RttEstimator, pace: u32) -> Option<bool> {
         let now = Instant::now();
+        self.acks.push((now, acked_bytes));
         if now.duration_since(self.last_eval) < Self::EVAL_EVERY {
             return None;
         }
         self.last_eval = now;
-        // Let the base drift up slowly so a path change is re-learned.
-        self.base_rtt_ms += 0.5;
-        let queueing = smoothed_ms - self.base_rtt_ms;
+        let queueing = rtt.take_queueing_ms();
         let starved = self.sent > 0 && self.blocked > self.sent;
         let (sent, blocked) = (self.sent, self.blocked);
+        let acked_rate = self.acked_rate();
         self.sent = 0;
         self.blocked = 0;
+        self.acks.clear();
         let next = if queueing > Self::QUEUE_HIGH_MS || starved {
-            (self.current / 4 * 3).max(self.min)
-        } else if queueing < Self::QUEUE_LOW_MS
-            && now.duration_since(self.last_change) >= Self::GROW_AFTER
-        {
-            (self.current / 10 * 11).min(self.max)
+            self.slow_start = false;
+            let per_frame =
+                acked_rate.map(|rate| 0.85 * rate / (self.streams as f64 * pace.max(1) as f64));
+            let target = match per_frame {
+                Some(bits) => bits as u32,
+                None => self.current / 4 * 3,
+            };
+            target
+                .clamp(self.current / 2, self.current / 100 * 90)
+                .max(self.min)
+        } else if queueing < Self::QUEUE_LOW_MS {
+            let (step, after) = if self.slow_start {
+                (125, Duration::from_millis(500))
+            } else {
+                (105, Self::GROW_AFTER)
+            };
+            if now.duration_since(self.last_change) >= after {
+                (self.current as u64 * step / 100).min(self.max as u64) as u32
+            } else {
+                self.current
+            }
         } else {
             self.current
         };
         if next == self.current {
-            return None;
+            return Some(false);
         }
+        self.last_was_cut = next < self.current;
         tracing::info!(
-            from = self.current,
-            to = next,
+            from_kbit = self.current / 1000,
+            to_kbit = next / 1000,
+            pace,
             queueing_ms = format!("{queueing:.1}"),
             sent,
             blocked,
-            "adapting bitrate"
+            acked_mbit = acked_rate.map(|r| format!("{:.1}", r / 1e6)),
+            "adapting frame budget"
         );
         self.current = next;
         self.last_change = now;
-        Some(next)
+        Some(true)
     }
 }
 
@@ -1002,26 +1412,52 @@ impl RttEstimator {
         Self {
             sent: VecDeque::new(),
             smoothed_ms: 30.0,
+            base_ms: f64::MAX,
+            window_min_ms: f64::MAX,
         }
     }
 
-    fn on_sent(&mut self, frame_id: u64) {
-        self.sent.push_back((frame_id, Instant::now()));
+    /// Queueing delay seen over the window, then start a new window.
+    fn take_queueing_ms(&mut self) -> f64 {
+        let min = std::mem::replace(&mut self.window_min_ms, f64::MAX);
+        if min == f64::MAX || self.base_ms == f64::MAX {
+            0.0
+        } else {
+            min - self.base_ms
+        }
     }
 
-    fn record(&mut self, _frame_id: u64, _decoded_at_ms: u64) {
-        // We approximate RTT from when we noticed the ack, not the client clock,
-        // which avoids clock-skew: use the gap since the last ack as a proxy.
+    fn on_sent(&mut self, frame_id: u64, bytes: usize) {
+        self.sent.push_back((frame_id, Instant::now(), bytes));
+    }
+
+    /// Record an ack; returns the bytes of the frame it covers. Acks arrive
+    /// in order, so the oldest unacked frame is the one acked.
+    fn record(&mut self, _frame_id: u64, _decoded_at_ms: u64) -> usize {
         let now = Instant::now();
-        if let Some((_, t)) = self.sent.pop_front() {
-            let sample = now.duration_since(t).as_secs_f64() * 1000.0;
-            self.smoothed_ms = 0.875 * self.smoothed_ms + 0.125 * sample.min(1000.0);
-        }
+        let Some((_, t, bytes)) = self.sent.pop_front() else {
+            return 0;
+        };
+        let sample = now.duration_since(t).as_secs_f64() * 1000.0;
+        self.smoothed_ms = 0.875 * self.smoothed_ms + 0.125 * sample.min(1000.0);
+        self.window_min_ms = self.window_min_ms.min(sample);
+        // The base follows the minimum, drifting up slowly so a path change
+        // is re-learned.
+        self.base_ms = (self.base_ms + 0.2).min(sample);
+        bytes
     }
 
+    /// How many frames may be unacked: enough to keep the path busy across
+    /// its base RTT, but not more, so a queue cannot build behind a slow
+    /// link. Queueing delay does not widen the window.
     fn window(&self, framerate: u32) -> u32 {
         let interval_ms = 1000.0 / framerate.max(1) as f64;
-        let n = (self.smoothed_ms / interval_ms).ceil() as i64 + 1;
+        let base = if self.base_ms == f64::MAX {
+            self.smoothed_ms
+        } else {
+            self.base_ms
+        };
+        let n = (base / interval_ms).ceil() as i64 + 1;
         n.clamp(2, 8) as u32
     }
 }
@@ -1029,6 +1465,14 @@ impl RttEstimator {
 #[cfg(test)]
 mod tests {
     use super::RttEstimator;
+
+    #[test]
+    fn queueing_does_not_widen_the_window() {
+        let mut rtt = RttEstimator::new();
+        rtt.base_ms = 20.0;
+        rtt.smoothed_ms = 400.0;
+        assert_eq!(rtt.window(60), 3);
+    }
 
     #[test]
     fn ack_window_stays_in_bounds() {

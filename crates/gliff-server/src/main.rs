@@ -42,10 +42,15 @@ struct Cli {
     /// Single 4:2:0 stream instead of 4:4:4 (lower bandwidth).
     #[arg(long)]
     low_bandwidth: bool,
-    /// Maximum bitrate in bits per second (default: derived from size). The
-    /// server adapts below it when the link shows queueing.
+    /// Cap on the total bits per second across the video streams (default:
+    /// none; the per-frame budget is bounded by size instead). The server
+    /// adapts below it when the link shows queueing.
     #[arg(long)]
     bitrate: Option<u32>,
+    /// Cap the frame rate. Lower values give an even cadence and larger,
+    /// better frames on a slow link; higher values give smoother motion.
+    #[arg(long, default_value_t = 60)]
+    max_fps: u32,
 }
 
 fn main() -> Result<()> {
@@ -74,6 +79,7 @@ fn main() -> Result<()> {
         render_node: hypr_capture::render_node(cli.render_node.as_deref()),
         low_bandwidth: cli.low_bandwidth,
         bitrate: cli.bitrate,
+        max_fps: cli.max_fps,
     };
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -101,7 +107,7 @@ fn main() -> Result<()> {
 
 async fn serve<R, W>(rd: R, wr: W, cfg: session::Config) -> Result<()>
 where
-    R: AsyncRead + Unpin + 'static,
+    R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + 'static,
 {
     match session::run(rd, wr, cfg).await {

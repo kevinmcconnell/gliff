@@ -100,20 +100,44 @@ round-trip.
   (SPS, PPS, slice header up to the reference marking) and manages a two-slot
   DPB with sliding-window marking.
 
-- **Latest-wins, ack-paced.** The server keeps only the most recent captured
-  frame and encodes it when the client has ack capacity. The number of unacked
-  frames allowed is derived from a smoothed ack RTT and clamped to 2..8, so the
-  frame rate is not capped by latency and a slow client cannot build a backlog.
-  Frames are captured on demand, so a static screen costs nothing.
+- **Latest-wins, ack-paced, budget-adapted.** The server keeps only the most
+  recent captured frame and encodes it when the link can take it: the client
+  has ack capacity, the previous frame has left for the wire, and the pace
+  slot (`--max-fps`, default 60) has come. The next capture is requested
+  before the current frame encodes, so the compositor works while the GPU
+  does, and capture continues while the link is blocked so the frame that
+  goes out is the newest. The number of unacked frames allowed follows the
+  base (minimum) ack RTT, clamped to 2..8, so queueing delay cannot widen it.
+  The rate control is a per-frame bit budget (0.1 bits per pixel per stream
+  at most) programmed as CBR at `budget x pace`, where the pace is the frame
+  rate the encoder is measured to sustain, so the nominal bitrate is what is
+  really sent. Queueing (the window-minimum RTT over the base) cuts the
+  budget to 85% of the rate acks arrive at, in one step; a quiet link grows
+  it back, fast at first. Frames are captured on demand, so a static screen
+  costs nothing.
+
+- **Step-down ladder.** When the link cannot pay for a quality floor of
+  0.03 bits per pixel per stream, the session gives things up in the order
+  that hurts a desktop least: the frame rate (cap 30, then 15), then the aux
+  chroma stream (4:2:0), then half resolution. Each step is a new encoder
+  and a `StreamConfig`, so it costs a keyframe; steps down are held 2 s
+  apart, and a step back up needs the budget at its ceiling for 8 s, a hold
+  that doubles each time the step up has to be undone. Below twice the floor
+  the encoder's rate control buffer shrinks from 500 ms to 100 ms, so a
+  keyframe on a slow link stays small. On a 3 Mbit/s link a 4K screen ends
+  at 1080p 4:2:0 15 fps with a median latency of ~75 ms; on 20 Mbit/s and
+  above nothing is given up.
 
 - **Threading.** Each pipeline lives on one thread: the server loop and the
   client decode worker are current-thread tokio runtimes that own their
   `gliff-vk` objects. Capture and input each own a Wayland connection on their
   own calloop thread and talk to the async side through channels; the capture
   thread hands the whole `CapturedFrame` (its dmabuf) to the encoder, which
-  releases the ring slot when the encode has finished. On both peers, reads and
-  writes run on separate tasks so an input burst cannot starve video and a
-  blocked write cannot block reads.
+  releases the ring slot when the encode has finished. On the server the socket
+  reader is its own thread and injects key and pointer events directly, so
+  input never waits behind an encode (~30 ms at 4K) or a blocked write;
+  writes run on a task. On the client the decode worker lands each frame in
+  a slot and wakes the GTK loop, so no frame waits for a timer.
 
 - **Client display.** The decode worker exports each finished BGRX image as a
   linear dmabuf and the UI wraps it in a `GdkDmabufTexture` on a
@@ -171,11 +195,23 @@ Dual420, from `gliff-probe roundtrip`:
 | two decodes + recombine (GPU, one fence wait) | ~5 ms |
 | CPU readback of the BGRX frame (probe only, cached host memory) | ~1.5 ms |
 
+At 3840x2160 Dual420 each encode takes ~14 ms and the two run one after the
+other on the single encode queue, so a frame costs ~29 ms of encode; the
+decode side takes 12-25 ms. The encode time does not depend on the bitrate.
+
+End to end, with `scripts/bench.sh` (server and `gliff-probe stream-bench`
+on one machine, so both ends share the GPU; a nested Hyprland with a 4K
+headless output showing 30 fps moving content):
+
+| Case | Before | After |
+|---|---|---|
+| 4K, open link: frame rate | 18 fps, 61 ms between frames | 30 fps (the content rate), 33 ms ± 1 |
+| 4K, open link: capture-to-decoded latency | 26 ms | 12.5 ms |
+| 4K, 20 Mbit/s link with 10 ms delay: latency p50 / p95 / max | 39 / 313 / 424 ms | 46 / 115 / 156 ms |
+| 4K, 20 Mbit/s link: link use | 9 Mbit/s, oscillating | 19 Mbit/s |
+
 No pixel work happens on the CPU at any resolution; the remaining cost is the
-encode hardware itself, which serialises the two streams, so a 1080p Dual420
-frame costs about two encodes' worth of time. The server adapts the CBR
-target to the link (see the session's `BitrateController`), so a slow link
-lowers quality rather than frame rate.
+encode hardware itself.
 
 ## Pending and recommended improvements
 

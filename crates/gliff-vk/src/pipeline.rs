@@ -79,10 +79,18 @@ impl Encoder {
 
     /// Change the target bitrate of both streams from the next frame on.
     pub fn set_bitrate(&mut self, bitrate: u32) {
+        self.set_rate(bitrate, self.settings.framerate, self.settings.vbv_ms);
+    }
+
+    /// Change the bitrate, the frame rate it is spread over, and the rate
+    /// control buffer.
+    pub fn set_rate(&mut self, bitrate: u32, framerate: u32, vbv_ms: u32) {
         self.settings.bitrate = bitrate;
-        self.main.set_bitrate(bitrate);
+        self.settings.framerate = framerate;
+        self.settings.vbv_ms = vbv_ms;
+        self.main.set_rate(bitrate, framerate, vbv_ms);
         if let Some(a) = &mut self.aux {
-            a.set_bitrate(bitrate);
+            a.set_rate(bitrate, framerate, vbv_ms);
         }
     }
 
@@ -131,6 +139,7 @@ impl Encoder {
 
     fn encode_image(&mut self, src: &Image, force_keyframe: bool) -> Result<EncodedFrame> {
         let (w, h) = (self.settings.width, self.settings.height);
+        let t0 = std::time::Instant::now();
         let split_done = self.timeline.advance();
         let (split, main_in, aux_in) = (&self.split, &self.main_in, self.aux_in.as_ref());
         self.compute.run(
@@ -163,11 +172,19 @@ impl Encoder {
             }
             _ => None,
         };
+        let t_submitted = t0.elapsed();
         let main = self.main.finish(main)?;
+        let t_main = t0.elapsed();
         let aux = match (&mut self.aux, aux) {
             (Some(enc), Some(pending)) => Some(enc.finish(pending)?),
             _ => None,
         };
+        tracing::debug!(
+            submit_us = t_submitted.as_micros(),
+            main_done_us = t_main.as_micros(),
+            total_us = t0.elapsed().as_micros(),
+            "split + encode"
+        );
         Ok(EncodedFrame {
             keyframe: main.keyframe,
             main: main.data,
