@@ -17,9 +17,17 @@ export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
 
 PIDS=()
 NEST=""
+CONF=""
+# Killed with SIGKILL, the nested Hyprland leaves its instance directory
+# and sockets behind, so remove them along with its config file.
 cleanup() {
     for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done
-    [ -n "$NEST" ] && pkill -9 -f "Hyprland .*lossy-hypr.conf" 2>/dev/null || true
+    if [ -n "$NEST" ]; then
+        pkill -9 -f "Hyprland .*lossy-hypr.conf" 2>/dev/null || true
+        sleep 0.5
+        rm -rf "$XDG_RUNTIME_DIR/hypr/$NEST"
+    fi
+    [ -n "$CONF" ] && rm -f "$CONF"
 }
 trap cleanup EXIT
 

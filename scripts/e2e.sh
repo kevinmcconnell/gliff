@@ -15,9 +15,17 @@ cd "$(dirname "$0")/.."
 fail() { echo "E2E FAIL: $*" >&2; cleanup; exit 1; }
 PIDS=()
 NEST_SIG=""
+CONF=""
+# Killed with SIGKILL, the nested Hyprland leaves its instance directory
+# and sockets behind, so remove them along with its config file.
 cleanup() {
     for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done
-    [ -n "$NEST_SIG" ] && pkill -9 -f "Hyprland .*e2e-hypr.conf" 2>/dev/null || true
+    if [ -n "$NEST_SIG" ]; then
+        pkill -9 -f "Hyprland .*e2e-hypr.conf" 2>/dev/null || true
+        sleep 0.5
+        rm -rf "$XDG_RUNTIME_DIR/hypr/$NEST_SIG"
+    fi
+    [ -n "$CONF" ] && rm -f "$CONF"
 }
 trap cleanup EXIT
 
