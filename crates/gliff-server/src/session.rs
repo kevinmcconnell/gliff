@@ -404,7 +404,8 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                 held_ms,
             } => {
                 self.highest_acked = self.highest_acked.max(Some(frame_id));
-                self.rtt.record(frame_id, Duration::from_millis(held_ms as u64));
+                self.rtt
+                    .record(frame_id, Duration::from_millis(held_ms as u64));
                 self.in_flight = self.rtt.in_flight();
                 let n_limit = self.rtt.window(self.settings.framerate);
                 if n_limit != self.n_limit {
@@ -909,7 +910,9 @@ fn setup_output(
     caps: &ClientCaps,
 ) -> Result<SessionOutput> {
     if let Some(name) = &cfg.output {
-        let mons = instance.monitors()?;
+        let mons = instance.monitors().with_context(|| {
+            format!("list monitors of Hyprland instance {}", instance.signature)
+        })?;
         let m = if name == "auto" {
             main_monitor(&mons)
         } else {
@@ -924,7 +927,12 @@ fn setup_output(
             headless: None,
         });
     }
-    let before: Vec<String> = instance.monitors()?.into_iter().map(|m| m.name).collect();
+    let before: Vec<String> = instance
+        .monitors()
+        .with_context(|| format!("list monitors of Hyprland instance {}", instance.signature))?
+        .into_iter()
+        .map(|m| m.name)
+        .collect();
     let requested = format!("gliff-{}", std::process::id());
     instance
         .create_headless_output(&requested)
@@ -938,7 +946,9 @@ fn setup_output(
         headless: Some(instance.clone()),
     };
     std::thread::sleep(Duration::from_millis(200));
-    let after = instance.monitors()?;
+    let after = instance
+        .monitors()
+        .with_context(|| format!("list monitors of Hyprland instance {}", instance.signature))?;
     let m = after
         .iter()
         .find(|m| !before.contains(&m.name))
@@ -954,7 +964,9 @@ fn setup_output(
     let mut applied = None;
     for _ in 0..10 {
         std::thread::sleep(Duration::from_millis(50));
-        let mons = instance.monitors()?;
+        let mons = instance.monitors().with_context(|| {
+            format!("list monitors of Hyprland instance {}", instance.signature)
+        })?;
         let Some(m) = mons.iter().find(|m| m.name == output.name) else {
             continue;
         };

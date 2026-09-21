@@ -31,6 +31,12 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// A Hyprland that crashed leaves its instance directory and socket file
+/// behind, so only a socket that accepts a connection counts as live.
+fn is_live(dir: &Path) -> bool {
+    UnixStream::connect(dir.join(".socket.sock")).is_ok()
+}
+
 /// A running Hyprland instance.
 #[derive(Debug, Clone)]
 pub struct Instance {
@@ -54,7 +60,7 @@ impl Instance {
         let hypr_dir = runtime_dir.join("hypr");
         if let Some(sig) = explicit.map(str::to_owned) {
             let dir = hypr_dir.join(&sig);
-            if !dir.join(".socket.sock").exists() {
+            if !is_live(&dir) {
                 return Err(Error::UnknownInstance(sig));
             }
             return Ok(Self {
@@ -68,7 +74,7 @@ impl Instance {
         {
             let entry = entry?;
             let dir = entry.path();
-            if !dir.join(".socket.sock").exists() {
+            if !is_live(&dir) {
                 continue;
             }
             let modified = entry.metadata()?.modified()?;
@@ -224,13 +230,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn discovers_newest_instance() {
+    fn discovers_newest_live_instance() {
         let tmp = tempfile::tempdir().unwrap();
         let hypr = tmp.path().join("hypr");
-        for (name, age) in [("old_1_1", 20), ("new_2_2", 1)] {
+        let mut listeners = Vec::new();
+        for (name, age, live) in [
+            ("old_1_1", 20, true),
+            ("new_2_2", 1, true),
+            ("dead_3_3", 0, false),
+        ] {
             let dir = hypr.join(name);
             std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(dir.join(".socket.sock"), "").unwrap();
+            let listener =
+                std::os::unix::net::UnixListener::bind(dir.join(".socket.sock")).unwrap();
+            if live {
+                listeners.push(listener);
+            }
             std::fs::write(dir.join("hyprland.lock"), format!("123\nwayland-{age}\n")).unwrap();
             let t = std::time::SystemTime::now() - Duration::from_secs(age);
             std::fs::File::open(&dir).unwrap().set_modified(t).unwrap();
@@ -240,7 +255,9 @@ mod tests {
         assert_eq!(inst.wayland_display().unwrap(), "wayland-1");
         let explicit = Instance::discover_in(tmp.path(), Some("old_1_1")).unwrap();
         assert_eq!(explicit.signature, "old_1_1");
+        assert!(Instance::discover_in(tmp.path(), Some("dead_3_3")).is_err());
         assert!(Instance::discover_in(tmp.path(), Some("missing")).is_err());
+        drop(listeners);
     }
 
     #[test]
