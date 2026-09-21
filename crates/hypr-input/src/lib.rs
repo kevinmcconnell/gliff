@@ -13,7 +13,7 @@ use calloop::channel::Sender;
 
 pub use clipboard::{Clipboard, ClipboardEvent, ClipboardSink};
 pub use hypr_wl::{OutputInfo, Target};
-pub use keymap::{keymap_from_names, KeymapNames};
+pub use keymap::{keymap_from_names, keymap_text, KeymapNames};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -48,7 +48,8 @@ pub struct InputConfig {
     pub target: Target,
     /// Output the pointer is bound to; absolute motion is in its logical space.
     pub output: String,
-    /// Full xkb keymap text (format v1). `None` uses the compositor default.
+    /// Full xkb keymap text (format v1), or `rmlvo:` names to compile (see
+    /// [`keymap_text`]). `None` uses the compositor default.
     pub keymap: Option<String>,
 }
 

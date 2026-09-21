@@ -29,6 +29,33 @@ pub fn keymap_from_names(names: &KeymapNames) -> Result<String> {
     Ok(keymap.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1))
 }
 
+/// Parse a client's keymap: full xkb keymap text (format v1), or RMLVO names
+/// for the server to compile, written `rmlvo:layout=dk;variant=;options=...`
+/// by clients that cannot produce xkb text themselves (macOS). Unnamed
+/// fields are empty; an empty layout means `us`.
+pub fn keymap_text(keymap: &str) -> Result<String> {
+    let Some(fields) = keymap.strip_prefix("rmlvo:") else {
+        return Ok(keymap.to_owned());
+    };
+    let mut names = KeymapNames::default();
+    for field in fields.split(';') {
+        let (key, value) = field.split_once('=').unwrap_or((field, ""));
+        let value = value.trim().to_owned();
+        match key.trim() {
+            "rules" => names.rules = value,
+            "model" => names.model = value,
+            "layout" => names.layout = value,
+            "variant" => names.variant = value,
+            "options" => names.options = (!value.is_empty()).then_some(value),
+            _ => {}
+        }
+    }
+    if names.layout.is_empty() {
+        names.layout = "us".into();
+    }
+    keymap_from_names(&names)
+}
+
 /// Tracks modifier state for the virtual keyboard from raw key events.
 pub struct KeyState {
     pub keymap: xkb::Keymap,
@@ -38,7 +65,10 @@ pub struct KeyState {
 }
 
 impl KeyState {
-    pub fn from_text(text: &str) -> Result<Self> {
+    /// Compile a client's keymap (see [`keymap_text`]).
+    pub fn from_text(keymap: &str) -> Result<Self> {
+        let text = keymap_text(keymap)?;
+        let text = text.as_str();
         let ctx = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
         let keymap = xkb::Keymap::new_from_string(
             &ctx,
@@ -107,6 +137,19 @@ mod tests {
         .unwrap();
         assert!(text.contains("xkb_keymap"));
         assert!(text.contains("xkb_symbols"));
+    }
+
+    #[test]
+    fn compiles_rmlvo_names() {
+        let text = keymap_text("rmlvo:layout=dk;variant=").unwrap();
+        assert!(text.contains("xkb_keymap"));
+        assert!(text.contains("dk"), "the Danish symbols are included");
+        let ks =
+            KeyState::from_text("rmlvo:layout=de;variant=nodeadkeys;options=ctrl:nocaps").unwrap();
+        assert!(ks.text.starts_with("xkb_keymap"));
+        // Plain xkb text passes through unchanged.
+        assert_eq!(keymap_text(&text).unwrap(), text);
+        assert!(keymap_text("rmlvo:layout=no-such-layout").is_err());
     }
 
     #[test]
