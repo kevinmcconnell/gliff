@@ -21,6 +21,8 @@ use hypr_capture::{CaptureConfig, CaptureEvent, CapturedFrame, Capturer};
 use hypr_input::{Axis as InAxis, Clipboard, ClipboardEvent, Input, InputCmd, InputConfig};
 use hypr_wl::Target;
 
+use crate::output::Output;
+
 pub struct Config {
     pub target: Target,
     pub output: Option<String>,
@@ -102,7 +104,9 @@ where
             "scaling the stream to the encoder maximum"
         );
     }
-    send_stream_config(&mut writer, codec, chroma, &output, stream).await?;
+    writer
+        .write_msg(&stream_config(codec, chroma, &output, stream))
+        .await?;
 
     let (cap_tx, mut cap_rx) = mpsc::unbounded_channel();
     let capturer = start_capture(&cfg.target, &output.name, &cfg.render_node, cap_tx)?;
@@ -134,17 +138,25 @@ where
     .ok();
 
     let bitrate_ctl = match cfg.bitrate {
-        Some(fixed) => BitrateController::new(fixed, true),
+        Some(max) => BitrateController::new(max, true),
         None => BitrateController::new(
-            EncoderSettings::default_bitrate(stream.0, stream.1, 60),
+            EncoderSettings::default_bitrate(stream.0, stream.1, 60)
+                .saturating_mul(stream_count(chroma)),
             false,
         ),
     };
-    let settings = encoder_settings(stream.0, stream.1, bitrate_ctl.current());
+    let settings = encoder_settings(
+        stream.0,
+        stream.1,
+        bitrate_ctl.current() / stream_count(chroma),
+    );
     let encoder = Encoder::new(&gpu, settings.clone(), chroma == ChromaMode::Dual420)
         .context("create encoder")?;
 
     let (mut msg_rx, mut clip_in_rx) = spawn_reader(reader);
+    let (writer, mut writes) = Output::spawn(writer);
+    let mut adaptation = tokio::time::interval(Duration::from_millis(250));
+    adaptation.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     capturer.request_frame().ok();
     let mut session = Session {
@@ -164,7 +176,6 @@ where
         capturer,
         pending: None,
         capture_asked: true,
-        blocked_noted: false,
         in_flight: 0,
         n_limit: 2,
         frame_id: 0,
@@ -184,7 +195,7 @@ where
             },
             text = clip_out_rx.recv() => {
                 if let Some(text) = text {
-                    session.send_clipboard(text).await?;
+                    session.send_clipboard(text);
                 }
                 ControlFlow::Continue(())
             }
@@ -194,12 +205,26 @@ where
                 }
                 ControlFlow::Continue(())
             }
-            ev = cap_rx.recv() => session.on_capture(ev).await?,
+            ev = cap_rx.recv() => session.on_capture(ev)?,
+            result = writes.recv() => {
+                session.bitrate_ctl.note_write(result.context("output writer stopped")??);
+                ControlFlow::Continue(())
+            },
+            _ = adaptation.tick() => {
+                if let Some(bitrate) = session.bitrate_ctl.evaluate(
+                    Instant::now(), session.rtt.oldest_age(), session.writer.blocked_for(),
+                ) {
+                    let per_stream = bitrate / stream_count(session.chroma);
+                    session.settings.bitrate = per_stream;
+                    session.encoder.set_bitrate(per_stream);
+                }
+                ControlFlow::Continue(())
+            },
         };
         if flow.is_break() {
             break;
         }
-        session.pump_encoder().await?;
+        session.pump_encoder()?
     }
 
     session.inject(InputCmd::ReleaseAll);
@@ -287,8 +312,8 @@ where
     (msg_rx, clip_rx)
 }
 
-struct Session<W> {
-    writer: Framed<W>,
+struct Session {
+    writer: Output,
     gpu: Arc<Gpu>,
     instance: hypr_ipc::Instance,
     output: SessionOutput,
@@ -309,9 +334,6 @@ struct Session<W> {
     /// The newest captured frame not yet encoded.
     pending: Option<CapturedFrame>,
     capture_asked: bool,
-    /// The pending frame has already counted as blocked for the bitrate
-    /// controller.
-    blocked_noted: bool,
     /// Frames sent but not yet acked; bounded by `n_limit` for pacing.
     in_flight: u32,
     n_limit: u32,
@@ -321,16 +343,19 @@ struct Session<W> {
     cursor_shape_id: u32,
 }
 
-impl<W: AsyncWrite + Unpin> Session<W> {
+impl Session {
     async fn on_client_msg(&mut self, msg: ClientMsg) -> Result<ControlFlow<()>> {
         match msg {
             ClientMsg::Bye => return Ok(ControlFlow::Break(())),
             ClientMsg::FrameAck {
                 frame_id,
-                decoded_at_ms,
+                decoded_at_ms: _,
             } => {
+                let Some(sample) = self.rtt.record(frame_id) else {
+                    return Ok(ControlFlow::Continue(()));
+                };
                 self.in_flight = self.in_flight.saturating_sub(1);
-                self.rtt.record(frame_id, decoded_at_ms);
+                self.bitrate_ctl.on_ack(sample);
                 let n_limit = self.rtt.window(self.settings.framerate);
                 if n_limit != self.n_limit {
                     tracing::debug!(
@@ -339,10 +364,6 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                         "ack window changed"
                     );
                     self.n_limit = n_limit;
-                }
-                if let Some(bitrate) = self.bitrate_ctl.on_ack(self.rtt.smoothed_ms) {
-                    self.settings.bitrate = bitrate;
-                    self.encoder.set_bitrate(bitrate);
                 }
             }
             ClientMsg::RequestKeyframe => self.want_keyframe = true,
@@ -377,12 +398,13 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                 scale,
             } => self.resize(width, height, scale).await?,
             ClientMsg::Ping { t } => {
-                self.writer
-                    .write_msg(&ServerMsg::Pong {
+                self.writer.send(
+                    ServerMsg::Pong {
                         t,
                         server_now_ms: now_ms(),
-                    })
-                    .await?
+                    },
+                    Vec::new(),
+                );
             }
             // ClipboardData is consumed by the reader task; the offer/request
             // negotiation is not used for text.
@@ -442,9 +464,15 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                     "scaling the stream to the encoder maximum"
                 );
             }
-            self.bitrate_ctl
-                .retarget(EncoderSettings::default_bitrate(stream.0, stream.1, 60));
-            let settings = encoder_settings(stream.0, stream.1, self.bitrate_ctl.current());
+            self.bitrate_ctl.retarget(
+                EncoderSettings::default_bitrate(stream.0, stream.1, 60)
+                    .saturating_mul(stream_count(self.chroma)),
+            );
+            let settings = encoder_settings(
+                stream.0,
+                stream.1,
+                self.bitrate_ctl.current() / stream_count(self.chroma),
+            );
             match Encoder::new(
                 &self.gpu,
                 settings.clone(),
@@ -474,14 +502,11 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         }
         self.output.scale = applied;
         self.inject(self.output.logical_extent());
-        send_stream_config(
-            &mut self.writer,
-            self.codec,
-            self.chroma,
-            &self.output,
-            self.stream,
-        )
-        .await
+        self.writer.send(
+            stream_config(self.codec, self.chroma, &self.output, self.stream),
+            Vec::new(),
+        );
+        Ok(())
     }
 
     /// A mirrored screen keeps its size; when it is larger than the client's
@@ -498,9 +523,15 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         if stream == self.stream {
             return Ok(());
         }
-        self.bitrate_ctl
-            .retarget(EncoderSettings::default_bitrate(stream.0, stream.1, 60));
-        let settings = encoder_settings(stream.0, stream.1, self.bitrate_ctl.current());
+        self.bitrate_ctl.retarget(
+            EncoderSettings::default_bitrate(stream.0, stream.1, 60)
+                .saturating_mul(stream_count(self.chroma)),
+        );
+        let settings = encoder_settings(
+            stream.0,
+            stream.1,
+            self.bitrate_ctl.current() / stream_count(self.chroma),
+        );
         match Encoder::new(
             &self.gpu,
             settings.clone(),
@@ -517,14 +548,11 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                 self.stream = stream;
                 self.pending = None;
                 self.want_keyframe = true;
-                send_stream_config(
-                    &mut self.writer,
-                    self.codec,
-                    self.chroma,
-                    &self.output,
-                    self.stream,
-                )
-                .await
+                self.writer.send(
+                    stream_config(self.codec, self.chroma, &self.output, self.stream),
+                    Vec::new(),
+                );
+                Ok(())
             }
             Err(e) => {
                 tracing::warn!(error = %e, "encoder rejected the fitted size; keeping the current one");
@@ -556,7 +584,7 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         seen.unwrap_or(scale)
     }
 
-    async fn send_clipboard(&mut self, text: String) -> Result<()> {
+    fn send_clipboard(&mut self, text: String) {
         let bytes = text.into_bytes();
         let total = bytes.len() as u64;
         let msg = ServerMsg::ClipboardData {
@@ -565,15 +593,14 @@ impl<W: AsyncWrite + Unpin> Session<W> {
             total,
             data_len: bytes.len() as u32,
         };
-        Ok(self.writer.write_msg_with_payloads(&msg, &[&bytes]).await?)
+        self.writer.send(msg, vec![bytes]);
     }
 
-    async fn on_capture(&mut self, ev: Option<Incoming>) -> Result<ControlFlow<()>> {
+    fn on_capture(&mut self, ev: Option<Incoming>) -> Result<ControlFlow<()>> {
         match ev {
             Some(Incoming::Frame(image)) => {
                 self.pending = Some(image);
                 self.capture_asked = false;
-                self.blocked_noted = false;
             }
             Some(Incoming::Cursor {
                 width,
@@ -591,17 +618,18 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                     hot_y,
                     argb_len: argb.len() as u32,
                 };
-                self.writer.write_msg_with_payloads(&msg, &[&argb]).await?;
+                self.writer.send(msg, vec![argb]);
             }
             Some(Incoming::CursorPos { x, y, visible }) => {
-                self.writer
-                    .write_msg(&ServerMsg::CursorPos {
+                self.writer.send(
+                    ServerMsg::CursorPos {
                         x,
                         y,
                         shape_id: self.cursor_shape_id,
                         visible,
-                    })
-                    .await?;
+                    },
+                    Vec::new(),
+                );
             }
             Some(Incoming::Stopped) => {
                 tracing::warn!("capture stopped");
@@ -618,29 +646,28 @@ impl<W: AsyncWrite + Unpin> Session<W> {
 
     /// Encode and send the pending frame if the client has ack capacity, then
     /// ask the capture thread for the next one.
-    async fn pump_encoder(&mut self) -> Result<()> {
-        // Count a blocked frame once, not once per event-loop pass.
-        if self.pending.is_some() && self.in_flight >= self.n_limit && !self.blocked_noted {
-            self.bitrate_ctl.note_blocked();
-            self.blocked_noted = true;
-        }
-        if self.in_flight < self.n_limit {
+    fn pump_encoder(&mut self) -> Result<()> {
+        if self.in_flight < self.n_limit && self.writer.video_ready() {
             if let Some(frame) = self.pending.take() {
                 // A frame captured before a resize took effect is stale.
                 let info = &frame.buffer.info;
                 if (info.width & !1, info.height & !1) == (self.output.width, self.output.height) {
-                    self.encode_and_send(&frame).await?;
+                    self.encode_and_send(&frame)?;
                 }
             }
         }
-        if !self.capture_asked && self.pending.is_none() && self.in_flight < self.n_limit {
+        if !self.capture_asked
+            && self.pending.is_none()
+            && self.in_flight < self.n_limit
+            && self.writer.video_ready()
+        {
             self.capturer.request_frame().ok();
             self.capture_asked = true;
         }
         Ok(())
     }
 
-    async fn encode_and_send(&mut self, frame: &CapturedFrame) -> Result<()> {
+    fn encode_and_send(&mut self, frame: &CapturedFrame) -> Result<()> {
         let (width, height) = self.stream;
         let info = &frame.buffer.info;
         let fourcc = drm_fourcc::DrmFourcc::try_from(info.fourcc).map_err(|_| {
@@ -676,9 +703,6 @@ impl<W: AsyncWrite + Unpin> Session<W> {
             data_len: encoded.main.len() as u32,
             aux_len: aux.len() as u32,
         };
-        self.writer
-            .write_msg_with_payloads(&msg, &[&encoded.main, &aux])
-            .await?;
         tracing::debug!(
             frame_id = self.frame_id,
             key = encoded.keyframe,
@@ -687,10 +711,10 @@ impl<W: AsyncWrite + Unpin> Session<W> {
             enc_us,
             in_flight = self.in_flight,
             n_limit = self.n_limit,
-            "sent frame"
+            "queued frame"
         );
         self.rtt.on_sent(self.frame_id);
-        self.bitrate_ctl.note_sent();
+        self.writer.send(msg, vec![encoded.main, aux]);
         self.frame_id += 1;
         self.in_flight += 1;
         Ok(())
@@ -732,18 +756,17 @@ impl Drop for SessionOutput {
     }
 }
 
-async fn send_stream_config<W: AsyncWrite + Unpin>(
-    writer: &mut Framed<W>,
+fn stream_config(
     codec: Codec,
     chroma: ChromaMode,
     output: &SessionOutput,
     stream: (u32, u32),
-) -> Result<()> {
+) -> ServerMsg {
     // The scale the client divides stream pixels by to reach the remote's
     // logical space: the output scale times any downscale of the stream.
     let effective_scale = output.scale * stream.0 as f32 / output.width.max(1) as f32;
     // Parameter sets ride in-band on every keyframe, so extradata is empty.
-    let msg = ServerMsg::StreamConfig {
+    ServerMsg::StreamConfig {
         codec,
         chroma,
         width: stream.0,
@@ -751,8 +774,15 @@ async fn send_stream_config<W: AsyncWrite + Unpin>(
         scale_milli: (effective_scale * 1000.0).round() as u32,
         extradata: Vec::new(),
         aux_extradata: None,
-    };
-    Ok(writer.write_msg(&msg).await?)
+    }
+}
+
+fn stream_count(chroma: ChromaMode) -> u32 {
+    if chroma == ChromaMode::Dual420 {
+        2
+    } else {
+        1
+    }
 }
 
 fn encoder_settings(width: u32, height: u32, bitrate: u32) -> EncoderSettings {
@@ -894,20 +924,17 @@ struct RttEstimator {
     smoothed_ms: f64,
 }
 
-/// Adapts the CBR target to the path. The ack RTT is the signal: its
-/// minimum is the base delay, growth over the base is queueing; a queue or
-/// a starved send window cuts the rate, a quiet path grows it back slowly.
 struct BitrateController {
     min: u32,
     max: u32,
     current: u32,
-    /// Set by `--bitrate`: the target does not follow the stream size.
-    fixed: bool,
-    base_rtt_ms: f64,
+    fixed_ceiling: bool,
+    base_rtt_ms: Option<f64>,
+    smoothed_ms: f64,
     last_eval: Instant,
     last_change: Instant,
-    sent: u32,
-    blocked: u32,
+    acknowledged: bool,
+    write_delay: Duration,
 }
 
 impl BitrateController {
@@ -916,18 +943,19 @@ impl BitrateController {
     const QUEUE_HIGH_MS: f64 = 50.0;
     const QUEUE_LOW_MS: f64 = 15.0;
 
-    fn new(max: u32, fixed: bool) -> Self {
+    fn new(max: u32, fixed_ceiling: bool) -> Self {
         let now = Instant::now();
         Self {
-            min: (max / 8).max(1_000_000).min(max),
+            min: 250_000.min(max),
             max,
-            current: max,
-            fixed,
-            base_rtt_ms: f64::MAX,
+            current: 2_000_000.min(max),
+            fixed_ceiling,
+            base_rtt_ms: None,
+            smoothed_ms: 0.0,
             last_eval: now,
             last_change: now,
-            sent: 0,
-            blocked: 0,
+            acknowledged: false,
+            write_delay: Duration::ZERO,
         }
     }
 
@@ -935,51 +963,57 @@ impl BitrateController {
         self.current
     }
 
-    /// The stream size changed: keep the same share of the new ceiling, so
-    /// bits per pixel stay constant across a resize.
     fn retarget(&mut self, max: u32) {
-        if self.fixed || max == self.max {
+        if self.fixed_ceiling || max == self.max {
             return;
         }
-        let share = self.current as f64 / self.max as f64;
         self.max = max;
-        self.min = (max / 8).max(1_000_000).min(max);
-        self.current = ((max as f64 * share) as u32).clamp(self.min, self.max);
+        self.min = 250_000.min(max);
+        self.current = self.current.clamp(self.min, self.max);
     }
 
-    fn note_sent(&mut self) {
-        self.sent += 1;
+    fn note_write(&mut self, elapsed: Duration) {
+        self.write_delay = self.write_delay.max(elapsed);
     }
 
-    /// A frame is waiting because every allowed frame is still unacked.
-    fn note_blocked(&mut self) {
-        self.blocked += 1;
+    fn on_ack(&mut self, elapsed: Duration) {
+        let sample = elapsed.as_secs_f64() * 1000.0;
+        self.smoothed_ms = if self.base_rtt_ms.is_some() {
+            0.875 * self.smoothed_ms + 0.125 * sample
+        } else {
+            sample
+        };
+        self.base_rtt_ms = Some(self.base_rtt_ms.map_or(sample, |base| base.min(sample)));
+        self.acknowledged = true;
     }
 
-    /// Feed the smoothed ack RTT; returns a new target when it changes.
-    fn on_ack(&mut self, smoothed_ms: f64) -> Option<u32> {
-        self.base_rtt_ms = self.base_rtt_ms.min(smoothed_ms);
-        let now = Instant::now();
+    fn evaluate(&mut self, now: Instant, oldest: Duration, writing: Duration) -> Option<u32> {
         if now.duration_since(self.last_eval) < Self::EVAL_EVERY {
             return None;
         }
         self.last_eval = now;
-        // Let the base drift up slowly so a path change is re-learned.
-        self.base_rtt_ms += 0.5;
-        let queueing = smoothed_ms - self.base_rtt_ms;
-        let starved = self.sent > 0 && self.blocked > self.sent;
-        let (sent, blocked) = (self.sent, self.blocked);
-        self.sent = 0;
-        self.blocked = 0;
-        let next = if queueing > Self::QUEUE_HIGH_MS || starved {
-            (self.current / 4 * 3).max(self.min)
-        } else if queueing < Self::QUEUE_LOW_MS
-            && now.duration_since(self.last_change) >= Self::GROW_AFTER
-        {
-            (self.current / 10 * 11).min(self.max)
-        } else {
-            self.current
-        };
+        let base = self.base_rtt_ms.unwrap_or(250.0);
+        let queueing = (self.smoothed_ms - base).max(0.0);
+        let stalled = oldest.as_secs_f64() * 1000.0 > (base * 2.0).max(500.0);
+        let write_ms = self.write_delay.max(writing).as_secs_f64() * 1000.0;
+        let acknowledged = std::mem::take(&mut self.acknowledged);
+        self.write_delay = Duration::ZERO;
+        let next =
+            if stalled || write_ms > 100.0 || (acknowledged && queueing > Self::QUEUE_HIGH_MS) {
+                (self.current / 4 * 3).max(self.min)
+            } else if acknowledged
+                && queueing < Self::QUEUE_LOW_MS
+                && now.duration_since(self.last_change) >= Self::GROW_AFTER
+            {
+                (self.current.saturating_add(self.current / 10)).min(self.max)
+            } else {
+                self.current
+            };
+        if acknowledged {
+            if let Some(base) = &mut self.base_rtt_ms {
+                *base += 0.5;
+            }
+        }
         if next == self.current {
             return None;
         }
@@ -987,9 +1021,9 @@ impl BitrateController {
             from = self.current,
             to = next,
             queueing_ms = format!("{queueing:.1}"),
-            sent,
-            blocked,
-            "adapting bitrate"
+            write_ms = format!("{write_ms:.1}"),
+            stalled,
+            "adapting aggregate bitrate"
         );
         self.current = next;
         self.last_change = now;
@@ -1009,14 +1043,18 @@ impl RttEstimator {
         self.sent.push_back((frame_id, Instant::now()));
     }
 
-    fn record(&mut self, _frame_id: u64, _decoded_at_ms: u64) {
-        // We approximate RTT from when we noticed the ack, not the client clock,
-        // which avoids clock-skew: use the gap since the last ack as a proxy.
-        let now = Instant::now();
-        if let Some((_, t)) = self.sent.pop_front() {
-            let sample = now.duration_since(t).as_secs_f64() * 1000.0;
-            self.smoothed_ms = 0.875 * self.smoothed_ms + 0.125 * sample.min(1000.0);
-        }
+    fn record(&mut self, frame_id: u64) -> Option<Duration> {
+        let position = self.sent.iter().position(|(id, _)| *id == frame_id)?;
+        let (_, sent) = self.sent.remove(position)?;
+        let elapsed = sent.elapsed();
+        self.smoothed_ms = 0.875 * self.smoothed_ms + 0.125 * elapsed.as_secs_f64() * 1000.0;
+        Some(elapsed)
+    }
+
+    fn oldest_age(&self) -> Duration {
+        self.sent
+            .front()
+            .map_or(Duration::ZERO, |(_, sent)| sent.elapsed())
     }
 
     fn window(&self, framerate: u32) -> u32 {
@@ -1028,7 +1066,8 @@ impl RttEstimator {
 
 #[cfg(test)]
 mod tests {
-    use super::RttEstimator;
+    use super::{BitrateController, RttEstimator};
+    use std::time::Duration;
 
     #[test]
     fn ack_window_stays_in_bounds() {
@@ -1042,5 +1081,81 @@ mod tests {
                 "window {n} out of bounds at {fps} fps"
             );
         }
+    }
+    #[test]
+    fn stalls_reduce_bitrate_without_acknowledgements() {
+        let mut ctl = BitrateController::new(24_000_000, false);
+        assert_eq!(ctl.current(), 2_000_000);
+        let start = ctl.last_eval;
+        for tick in 1..20 {
+            ctl.evaluate(
+                start + Duration::from_millis(tick * 500),
+                Duration::from_secs(tick),
+                Duration::ZERO,
+            );
+        }
+        assert_eq!(ctl.current(), 250_000);
+    }
+
+    #[test]
+    fn blocked_writes_reduce_bitrate_even_with_timely_acks() {
+        let mut ctl = BitrateController::new(24_000_000, false);
+        ctl.on_ack(Duration::from_millis(250));
+        ctl.note_write(Duration::from_millis(200));
+        assert_eq!(
+            ctl.evaluate(
+                ctl.last_eval + Duration::from_millis(500),
+                Duration::ZERO,
+                Duration::ZERO
+            ),
+            Some(1_500_000)
+        );
+    }
+
+    #[test]
+    fn idle_sessions_do_not_probe_and_high_base_latency_is_not_congestion() {
+        let mut ctl = BitrateController::new(24_000_000, false);
+        let start = ctl.last_eval;
+        assert_eq!(
+            ctl.evaluate(
+                start + Duration::from_secs(10),
+                Duration::ZERO,
+                Duration::ZERO
+            ),
+            None
+        );
+        ctl.on_ack(Duration::from_millis(300));
+        assert_eq!(
+            ctl.evaluate(
+                start + Duration::from_secs(11),
+                Duration::from_millis(300),
+                Duration::ZERO
+            ),
+            Some(2_200_000)
+        );
+    }
+
+    #[test]
+    fn resize_preserves_learned_rate_and_explicit_ceiling() {
+        let mut ctl = BitrateController::new(24_000_000, false);
+        ctl.retarget(48_000_000);
+        assert_eq!(ctl.current(), 2_000_000);
+        ctl.retarget(100_000);
+        assert_eq!(ctl.current(), 100_000);
+        let mut explicit = BitrateController::new(500_000, true);
+        explicit.retarget(48_000_000);
+        assert_eq!(explicit.max, 500_000);
+    }
+
+    #[test]
+    fn ack_matches_frame_and_includes_time_waiting_to_write() {
+        let mut rtt = RttEstimator::new();
+        rtt.on_sent(7);
+        rtt.sent.front_mut().unwrap().1 -= Duration::from_millis(200);
+        assert!(rtt.record(8).is_none());
+        assert_eq!(rtt.sent.len(), 1);
+        assert!(rtt.record(7).unwrap() >= Duration::from_millis(200));
+        assert!(rtt.record(7).is_none());
+        assert_eq!(rtt.oldest_age(), Duration::ZERO);
     }
 }

@@ -2,6 +2,7 @@
 //! serves it to one client over the gliff protocol. `--stdio` (spawned by ssh)
 //! or `--listen` (dev, localhost).
 
+mod output;
 mod session;
 
 use std::path::PathBuf;
@@ -42,9 +43,9 @@ struct Cli {
     /// Single 4:2:0 stream instead of 4:4:4 (lower bandwidth).
     #[arg(long)]
     low_bandwidth: bool,
-    /// Maximum bitrate in bits per second (default: derived from size). The
-    /// server adapts below it when the link shows queueing.
-    #[arg(long)]
+    /// Maximum total video bitrate in bits per second, shared by both colour
+    /// streams (default: derived from size). The server adapts below it.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(2..))]
     bitrate: Option<u32>,
 }
 

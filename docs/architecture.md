@@ -73,7 +73,8 @@ round-trip.
   per frame, keys handed over SSH) is the candidate, not raw UDP. To measure
   again: client `RUST_LOG=info,gliff_vk=debug`, server
   `--server-bin 'env RUST_LOG=info,gliff_server=debug gliff-server'`, compare
-  the `sent frame` and `decode + recombine` timestamps, and sample
+  the `queued frame`, `output write completed`, and `decode + recombine`
+  timestamps, and sample
   `ss -tin` on the server for retransmits.
 
 - **4:4:4 by two 4:2:0 streams (AVC444).** Hardware H.264 encoders only do
@@ -105,6 +106,10 @@ round-trip.
   frames allowed is derived from a smoothed ack RTT and clamped to 2..8, so the
   frame rate is not capped by latency and a slow client cannot build a backlog.
   Frames are captured on demand, so a static screen costs nothing.
+  A separate writer retains at most one queued encoded frame behind its active
+  write. Unsent cursor and clipboard state is coalesced; stream configuration
+  stays ordered with its video frames. The session can process input while a
+  video write is blocked.
 
 - **Threading.** Each pipeline lives on one thread: the server loop and the
   client decode worker are current-thread tokio runtimes that own their
@@ -175,7 +180,12 @@ No pixel work happens on the CPU at any resolution; the remaining cost is the
 encode hardware itself, which serialises the two streams, so a 1080p Dual420
 frame costs about two encodes' worth of time. The server adapts the CBR
 target to the link (see the session's `BitrateController`), so a slow link
-lowers quality rather than frame rate.
+lowers quality rather than frame rate. Its budget covers both colour streams,
+starting at 2 Mbit/s and falling as low as 250 kbit/s (or the configured ceiling
+if lower). `gliff-server --bitrate` sets the total video ceiling. The controller
+evaluates every 500 ms, including during stalls, using write duration, oldest
+outstanding frame age, and acknowledgement latency measured from enqueueing.
+Acknowledgement latency includes client decoding; it is not a pure network RTT.
 
 ## Pending and recommended improvements
 
