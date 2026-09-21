@@ -13,7 +13,7 @@ use wayland_client::protocol::wl_registry::WlRegistry;
 use wayland_client::{Connection, Dispatch, QueueHandle};
 
 use gliff_proto::color::{bgra_to_yuv444, psnr, yuv444_to_bgra};
-use gliff_vk::{Decoder, DmabufPlane, Encoder, EncoderSettings, Gpu};
+use gliff_vk::{Decoder, DmabufPlane, Encoder, EncoderSettings, Gpu, Reference};
 use hypr_capture::{CaptureConfig, CaptureEvent, Capturer};
 use hypr_input::{keys, Input, InputConfig, InputEvent};
 use hypr_wl::Target;
@@ -63,6 +63,11 @@ enum Cmd {
         /// restore it, to exercise the live rate-control update.
         #[arg(long)]
         adapt: bool,
+        /// Withhold a few frames from the decoder and make the next one
+        /// predict from the last frame it saw, to exercise recovery without
+        /// a keyframe.
+        #[arg(long)]
+        lossy: bool,
     },
     /// Capture one frame of an output and write it as PNG
     Capture {
@@ -96,6 +101,28 @@ enum Cmd {
         connect: String,
         #[arg(long, default_value_t = 30)]
         frames: usize,
+    },
+    /// Stream from a running `gliff-server --listen` for a while and report
+    /// frame rate, interval jitter, end-to-end latency and bandwidth
+    StreamBench {
+        #[arg(long, default_value = "127.0.0.1:9000")]
+        connect: String,
+        #[arg(long, default_value_t = 10.0)]
+        seconds: f64,
+        /// Ask the server for this stream size (0 = leave it alone).
+        #[arg(long, default_value_t = 0)]
+        width: u32,
+        #[arg(long, default_value_t = 0)]
+        height: u32,
+        /// Ack frames without decoding them (server-side throughput only).
+        #[arg(long)]
+        no_decode: bool,
+        /// Write one CSV row per frame here.
+        #[arg(long)]
+        csv: Option<PathBuf>,
+        /// Keep video on the connection instead of taking the UDP path.
+        #[arg(long)]
+        tcp: bool,
     },
     /// Watch or set the compositor's text clipboard (ext-data-control)
     Clipboard {
@@ -138,7 +165,8 @@ fn main() -> Result<()> {
             single,
             bitrate,
             adapt,
-        } => roundtrip(&node, width, height, frames, !single, bitrate, adapt)?,
+            lossy,
+        } => roundtrip(&node, width, height, frames, !single, bitrate, adapt, lossy)?,
         Cmd::Capture {
             output,
             png,
@@ -151,6 +179,23 @@ fn main() -> Result<()> {
         } => input(&target, output, &text, click)?,
         Cmd::Pipeline { output } => pipeline(&target, &node, output)?,
         Cmd::ServeTest { connect, frames } => serve_test(&node, &connect, frames)?,
+        Cmd::StreamBench {
+            connect,
+            seconds,
+            width,
+            height,
+            no_decode,
+            csv,
+            tcp,
+        } => stream_bench(
+            &node,
+            &connect,
+            seconds,
+            (width, height),
+            no_decode,
+            csv.as_deref(),
+            tcp,
+        )?,
         Cmd::Clipboard { set, secs } => clipboard(&target, set, secs)?,
         Cmd::Bench { iters } => bench(iters)?,
         Cmd::All => {
@@ -158,7 +203,8 @@ fn main() -> Result<()> {
             outputs(&target)?;
             permissions(&target)?;
             vulkan_info(&node)?;
-            roundtrip(&node, 640, 360, 10, true, None, false)?;
+            roundtrip(&node, 640, 360, 10, true, None, false, false)?;
+            roundtrip(&node, 640, 360, 10, true, None, false, true)?;
         }
     }
     Ok(())
@@ -435,7 +481,7 @@ fn serve_test(node: &std::path::Path, addr: &str, frames: usize) -> Result<()> {
         let (rd, wr) = tokio::io::split(stream);
         let mut reader = Framed::new(rd);
         let mut writer = Framed::new(wr);
-        let caps = ClientCaps { codecs: vec![Codec::H264], max_width: 1280, max_height: 720, chroma: vec![ChromaMode::Dual420, ChromaMode::Single420] };
+        let caps = ClientCaps { codecs: vec![Codec::H264], max_width: 1280, max_height: 720, chroma: vec![ChromaMode::Dual420, ChromaMode::Single420], udp: false };
         writer.write_msg(&ClientMsg::Hello { version: gliff_proto::PROTOCOL_VERSION, keymap: String::new(), caps }).await?;
         let ack = reader.read_msg::<ServerMsg>().await?;
         let ServerMsg::HelloAck { session, outputs, .. } = ack else { bail!("expected HelloAck, got {ack:?}") };
@@ -458,7 +504,7 @@ fn serve_test(node: &std::path::Path, addr: &str, frames: usize) -> Result<()> {
                     let out = decoder.decode_to_bgra(&main, &aux)?;
                     if out.is_some() { got += 1; }
                     if got == 1 { eprintln!("  first decoded frame ok ({}x{}, main {} aux {} bytes, key {keyframe})", w, h, data_len, aux_len); }
-                    writer.write_msg(&ClientMsg::FrameAck { frame_id, decoded_at_ms: 0 }).await?;
+                    writer.write_msg(&ClientMsg::FrameAck { frame_id, decoded_at_ms: 0, held_ms: 0 }).await?;
                     if got == 3 { writer.write_msg(&ClientMsg::Resize { width: 800, height: 600, scale: 2.0 }).await?; }
                     if got == 4 {
                         if let Ok(text) = std::env::var("GLIFF_SEND_CLIP") {
@@ -489,6 +535,231 @@ fn serve_test(node: &std::path::Path, addr: &str, frames: usize) -> Result<()> {
             let what = if session.headless { "server applied the requested output scale" } else { "server scaled the mirrored screen down to the window" };
             status(scaled, what);
         }
+        Ok::<(), anyhow::Error>(())
+    })?;
+    Ok(())
+}
+
+fn percentile(sorted: &[f64], p: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let i = ((sorted.len() - 1) as f64 * p).round() as usize;
+    sorted[i.min(sorted.len() - 1)]
+}
+
+fn stats(label: &str, unit: &str, mut v: Vec<f64>) {
+    if v.is_empty() {
+        println!("  {label:<18} n/a");
+        return;
+    }
+    v.sort_by(|a, b| a.total_cmp(b));
+    let mean = v.iter().sum::<f64>() / v.len() as f64;
+    println!(
+        "  {label:<18} mean {mean:7.2} {unit}  p50 {:7.2}  p95 {:7.2}  max {:7.2}",
+        percentile(&v, 0.5),
+        percentile(&v, 0.95),
+        v[v.len() - 1]
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stream_bench(
+    node: &std::path::Path,
+    addr: &str,
+    seconds: f64,
+    size: (u32, u32),
+    no_decode: bool,
+    csv: Option<&std::path::Path>,
+    tcp_only: bool,
+) -> Result<()> {
+    use gliff_proto::{ChromaMode, ClientCaps, ClientMsg, Codec, ServerMsg};
+    use gliff_transport::recv::{spawn_server_reader, Incoming};
+    use gliff_transport::udp::Packet;
+    use gliff_transport::udp_io::{ack as udp_ack, spawn_client, ClientEvent};
+    use gliff_transport::Framed;
+    use std::collections::VecDeque;
+    use std::io::Write;
+    use std::time::Instant;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async move {
+        let stream = tokio::net::TcpStream::connect(addr).await.with_context(|| format!("connect {addr}"))?;
+        stream.set_nodelay(true)?;
+        let peer_ip = stream.peer_addr()?.ip();
+        let (rd, wr) = tokio::io::split(stream);
+        let mut reader = Framed::new(rd);
+        let mut writer = Framed::new(wr);
+        let caps = ClientCaps { codecs: vec![Codec::H264], max_width: 3840, max_height: 2160, chroma: vec![ChromaMode::Dual420, ChromaMode::Single420], udp: !tcp_only };
+        writer.write_msg(&ClientMsg::Hello { version: gliff_proto::PROTOCOL_VERSION, keymap: String::new(), caps }).await?;
+        let ack = reader.read_msg::<ServerMsg>().await?;
+        let ServerMsg::HelloAck { session, udp: udp_offer, .. } = ack else { bail!("expected HelloAck, got {ack:?}") };
+        let cfg = reader.read_msg::<ServerMsg>().await?;
+        let (mut w, mut h, mut chroma) = match cfg { ServerMsg::StreamConfig { width, height, chroma, .. } => (width, height, chroma), o => bail!("expected StreamConfig, got {o:?}") };
+        println!("  connected: headless={} output={} stream {w}x{h} {chroma:?}", session.headless, session.output);
+        if size.0 > 0 && size.1 > 0 {
+            writer.write_msg(&ClientMsg::Resize { width: size.0, height: size.1, scale: 1.0 }).await?;
+        }
+        let (mut udp_rx, udp_tx) = match udp_offer {
+            Some(offer) if !tcp_only => {
+                let (rx, tx) = spawn_client(vec![std::net::SocketAddr::new(peer_ip, offer.port)], offer.key, Duration::from_secs(6));
+                (Some(rx), Some(tx))
+            }
+            _ => (None, None),
+        };
+        let gpu = Gpu::open(Some(node))?;
+        let mut decoder = if no_decode { None } else { Some(Decoder::new(&gpu, chroma != ChromaMode::Single420, w, h)?) };
+        let mut csv_out = match csv { Some(p) => Some(std::io::BufWriter::new(std::fs::File::create(p)?)), None => None };
+        if let Some(c) = csv_out.as_mut() { writeln!(c, "t_ms,frame_id,key,bytes,latency_ms,decode_ms,path")?; }
+
+        let start = Instant::now();
+        let warmup = Duration::from_secs_f64(1.0);
+        let deadline = start + Duration::from_secs_f64(seconds);
+        let mut last_arrival: Option<Instant> = None;
+        let mut intervals = Vec::new();
+        let mut latency_recv = Vec::new();
+        let mut latency_done = Vec::new();
+        let mut decode_ms = Vec::new();
+        let mut sizes = Vec::new();
+        let mut frames = 0u64;
+        let mut keyframes = 0u64;
+        let mut recoveries = 0u64;
+        let mut dropped = 0u64;
+        let mut bytes = 0u64;
+        let mut measured_from: Option<Instant> = None;
+        let mut reconfigs = 0u32;
+        let mut udp_active = false;
+        let mut udp_stats = None;
+        let mut decoded_ids: VecDeque<u64> = VecDeque::new();
+        let mut tcp_rx = spawn_server_reader(reader);
+        // One frame from either path: decode it if its reference is at
+        // hand, ack it, and record the numbers.
+        struct Frame<'a> { frame_id: u64, keyframe: bool, reference: Option<u64>, pts_us: u64, main: &'a [u8], aux: &'a [u8], held_ms: u32 }
+        loop {
+            let now = Instant::now();
+            if now >= deadline { break; }
+            let frame_from_tcp;
+            let frame_from_udp;
+            let f: Frame = tokio::select! {
+                inc = tcp_rx.recv() => {
+                    let Some(Incoming { msg, main, aux }) = inc else { break };
+                    match msg {
+                        ServerMsg::VideoFrame { frame_id, keyframe, reference, pts_us, .. } => {
+                            frame_from_tcp = (main, aux);
+                            Frame { frame_id, keyframe, reference, pts_us, main: &frame_from_tcp.0, aux: &frame_from_tcp.1, held_ms: 0 }
+                        }
+                        ServerMsg::StreamConfig { width, height, chroma: c, scale_milli, .. } => {
+                            w = width; h = height; chroma = c; reconfigs += 1;
+                            println!("  reconfig to {w}x{h} {chroma:?} scale {scale_milli}");
+                            if decoder.is_some() { decoder = Some(Decoder::new(&gpu, chroma != ChromaMode::Single420, w, h)?); }
+                            decoded_ids.clear();
+                            last_arrival = None;
+                            continue;
+                        }
+                        _ => continue,
+                    }
+                }
+                ev = async { match udp_rx.as_mut() { Some(rx) => rx.recv().await, None => std::future::pending().await } } => {
+                    match ev {
+                        Some(ClientEvent::Up { rtt }) => {
+                            println!("  UDP path up, rtt {:.1} ms", rtt.as_secs_f64() * 1000.0);
+                            udp_active = true;
+                            writer.write_msg(&ClientMsg::VideoPath { udp: true }).await?;
+                            continue;
+                        }
+                        Some(ClientEvent::Frame(af)) => {
+                            frame_from_udp = af;
+                            Frame { frame_id: frame_from_udp.info.frame_id, keyframe: frame_from_udp.info.keyframe, reference: frame_from_udp.info.reference, pts_us: frame_from_udp.info.pts_us, main: &frame_from_udp.main, aux: &frame_from_udp.aux, held_ms: frame_from_udp.held.as_millis() as u32 }
+                        }
+                        Some(ClientEvent::Lost(_)) => {
+                            recoveries += 1;
+                            if let Some(tx) = &udp_tx { let _ = tx.send(Packet::Recover { last_good: decoded_ids.back().copied() }); }
+                            continue;
+                        }
+                        Some(ClientEvent::Stats(s)) => { udp_stats = Some(s); continue; }
+                        Some(ClientEvent::Down) | None => {
+                            println!("  UDP path down; back on TCP");
+                            if udp_active { writer.write_msg(&ClientMsg::VideoPath { udp: false }).await?; }
+                            udp_active = false;
+                            udp_rx = None;
+                            continue;
+                        }
+                    }
+                }
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => break,
+            };
+            let arrived = Instant::now();
+            let now_us = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_micros() as i64;
+            let lat_recv = (now_us - f.pts_us as i64) as f64 / 1000.0;
+            let have_reference = f.keyframe || f.reference.is_some_and(|r| decoded_ids.contains(&r));
+            let t0 = Instant::now();
+            let mut dec = 0.0;
+            let mut got_picture = true;
+            if let Some(d) = decoder.as_mut() {
+                if have_reference {
+                    got_picture = d.decode(f.main, f.aux)?.is_some();
+                    dec = t0.elapsed().as_secs_f64() * 1000.0;
+                } else {
+                    got_picture = false;
+                }
+            }
+            match (&udp_tx, udp_active) {
+                (Some(tx), true) => { let _ = tx.send(udp_ack(f.frame_id, f.held_ms)); }
+                _ => writer.write_msg(&ClientMsg::FrameAck { frame_id: f.frame_id, decoded_at_ms: 0, held_ms: f.held_ms }).await?,
+            }
+            if !have_reference && decoder.is_some() {
+                dropped += 1;
+                recoveries += 1;
+                let last_good = decoded_ids.back().copied();
+                match (&udp_tx, udp_active) {
+                    (Some(tx), true) => { let _ = tx.send(Packet::Recover { last_good }); }
+                    _ => writer.write_msg(&ClientMsg::Recover { last_good }).await?,
+                }
+            }
+            if got_picture {
+                if f.keyframe { decoded_ids.clear(); }
+                decoded_ids.push_back(f.frame_id);
+                if decoded_ids.len() > gliff_vk::MAX_REFERENCES { decoded_ids.pop_front(); }
+            } else { continue; }
+            let in_window = arrived.duration_since(start) >= warmup;
+            let total = f.main.len() + f.aux.len();
+            if in_window {
+                if measured_from.is_none() { measured_from = Some(arrived); }
+                frames += 1;
+                if f.keyframe { keyframes += 1; }
+                bytes += total as u64;
+                sizes.push(total as f64 / 1024.0);
+                if let Some(prev) = last_arrival { intervals.push(arrived.duration_since(prev).as_secs_f64() * 1000.0); }
+                latency_recv.push(lat_recv);
+                latency_done.push(lat_recv + dec);
+                if decoder.is_some() { decode_ms.push(dec); }
+            }
+            last_arrival = Some(arrived);
+            if let Some(c) = csv_out.as_mut() {
+                writeln!(c, "{:.1},{},{},{},{lat_recv:.2},{dec:.2},{}", arrived.duration_since(start).as_secs_f64() * 1000.0, f.frame_id, f.keyframe as u8, total, if udp_active { "udp" } else { "tcp" })?;
+            }
+        }
+        writer.write_msg(&ClientMsg::Bye).await?;
+        let span = measured_from.map(|t| last_arrival.unwrap_or(t).duration_since(t).as_secs_f64()).unwrap_or(0.0).max(0.001);
+        let fps = frames as f64 / span;
+        let mbit = bytes as f64 * 8.0 / 1e6 / span;
+        let path = if udp_active { "udp" } else { "tcp" };
+        println!("  {w}x{h} {chroma:?}: {frames} frames in {span:.1} s ({keyframes} keyframes, {reconfigs} reconfigs)");
+        println!("  fps {fps:.1}   {mbit:.1} Mbit/s   decode={}   path {path}", !no_decode);
+        let stalls = intervals.iter().filter(|&&ms| ms > 100.0).count();
+        stats("interval", "ms", intervals);
+        println!("  {:<18} {stalls}", "gaps over 100 ms");
+        stats("latency to recv", "ms", latency_recv);
+        stats("latency decoded", "ms", latency_done);
+        stats("decode", "ms", decode_ms);
+        stats("frame size", "KiB", sizes);
+        println!("  {:<18} dropped {dropped} (no reference), recovery requests {recoveries}", "frames");
+        if let Some(s) = udp_stats {
+            println!("  {:<18} lost {} repaired {} nacks {}", "udp", s.lost, s.repaired, s.nacks);
+        }
+        println!("RESULT fps={fps:.1} mbit={mbit:.1} path={path} stalls={stalls}");
         Ok::<(), anyhow::Error>(())
     })?;
     Ok(())
@@ -624,6 +895,7 @@ fn synthetic_bgra(w: usize, h: usize, t: usize) -> Vec<u8> {
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn roundtrip(
     node: &std::path::Path,
     width: u32,
@@ -632,6 +904,7 @@ fn roundtrip(
     dual: bool,
     bitrate: Option<u32>,
     adapt: bool,
+    lossy: bool,
 ) -> Result<()> {
     let gpu = Gpu::open(Some(node))?;
     println!("  {} ({}) dual={dual}", gpu.name, gpu.driver);
@@ -645,13 +918,29 @@ fn roundtrip(
     let mut encoder = Encoder::new(&gpu, settings, dual).context("vulkan encoder")?;
     let mut decoder = Decoder::new(&gpu, dual, width, height).context("vulkan decoder")?;
     let (w, h) = (width as usize, height as usize);
+    // With --lossy the frames in `lost` never reach the decoder, and the
+    // frame after them predicts from the last one before them.
+    let lost = if lossy {
+        let first = frames / 2 + 2;
+        first..(first + 3).min(frames.saturating_sub(1))
+    } else {
+        0..0
+    };
     let mut min_psnr = f64::MAX;
     let mut decoded = 0;
     let mut total_bytes = 0;
+    let mut recovered = false;
     let start = std::time::Instant::now();
     for i in 0..frames {
         let src = synthetic_bgra(w, h, i);
         let force = i == frames / 2;
+        let reference = if force {
+            Reference::Keyframe
+        } else if !lost.is_empty() && i == lost.end {
+            Reference::Frame(lost.start as u64 - 1)
+        } else {
+            Reference::Latest
+        };
         if adapt && i == frames / 3 {
             println!("  bitrate -> {}", bitrate / 4);
             encoder.set_bitrate(bitrate / 4);
@@ -662,11 +951,22 @@ fn roundtrip(
         }
         let t0 = std::time::Instant::now();
         let packet = encoder
-            .encode_bgra(&src, force)
+            .encode_bgra(&src, i as u64, reference)
             .with_context(|| format!("encode frame {i}"))?;
         let enc_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let aux = packet.aux.as_deref().unwrap_or(&[]);
         total_bytes += packet.main.len() + aux.len();
+        if let Reference::Frame(from) = reference {
+            recovered = packet.reference == Some(from) && !packet.keyframe;
+            println!(
+                "  frame {i}: predicts from frame {from} (got {:?}, key={})",
+                packet.reference, packet.keyframe
+            );
+        }
+        if lost.contains(&i) {
+            println!("  frame {i}: {} bytes, withheld from the decoder", packet.main.len() + aux.len());
+            continue;
+        }
         let t1 = std::time::Instant::now();
         let out = decoder
             .decode_to_bgra(&packet.main, aux)
@@ -722,12 +1022,16 @@ fn roundtrip(
         "  {frames} frames, {total_bytes} bytes, {:.1} fps end to end",
         frames as f64 / elapsed
     );
+    let expected = frames - lost.len();
     status(
-        decoded == frames,
-        &format!("decoded {decoded}/{frames} frames"),
+        decoded == expected,
+        &format!("decoded {decoded}/{expected} frames"),
     );
     status(min_psnr > 30.0, &format!("min RGB PSNR {min_psnr:.1} dB"));
-    if decoded != frames || min_psnr <= 30.0 {
+    if lossy {
+        status(recovered, "recovery frame predicted from an older frame, no keyframe");
+    }
+    if decoded != expected || min_psnr <= 30.0 || (lossy && !recovered) {
         bail!("vulkan round-trip failed");
     }
     Ok(())
@@ -807,7 +1111,9 @@ fn pipeline(target: &Target, node: &std::path::Path, output: Option<String>) -> 
     let mut encoder = Encoder::new(&gpu, settings, true).context("encoder")?;
     let mut decoder = Decoder::new(&gpu, true, sw, sh).context("decoder")?;
     let t0 = std::time::Instant::now();
-    let packet = encoder.encode_dmabuf(1, &plane, true).context("encode")?;
+    let packet = encoder
+        .encode_dmabuf(1, &plane, 0, Reference::Keyframe)
+        .context("encode")?;
     let enc_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let aux = packet.aux.as_deref().unwrap_or(&[]);
     println!(

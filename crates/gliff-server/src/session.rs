@@ -4,6 +4,7 @@ use std::collections::VecDeque;
 use std::ops::ControlFlow;
 use std::os::fd::AsFd;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -13,10 +14,12 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use gliff_proto::{
     ChromaMode, ClientCaps, ClientMsg, Codec, OutputInfo as ProtoOutput, Rect, ServerMsg,
-    SessionInfo, PROTOCOL_VERSION,
+    SessionInfo, UdpOffer, PROTOCOL_VERSION,
 };
+use gliff_transport::udp::{FrameInfo, Packet};
+use gliff_transport::udp_io::{OutFrame, UdpServer};
 use gliff_transport::Framed;
-use gliff_vk::{DmabufPlane, Encoder, EncoderSettings, Gpu};
+use gliff_vk::{DmabufPlane, Encoder, EncoderSettings, Gpu, Reference};
 use hypr_capture::{CaptureConfig, CaptureEvent, CapturedFrame, Capturer};
 use hypr_input::{Axis as InAxis, Clipboard, ClipboardEvent, Input, InputCmd, InputConfig};
 use hypr_wl::Target;
@@ -27,6 +30,10 @@ pub struct Config {
     pub render_node: PathBuf,
     pub low_bandwidth: bool,
     pub bitrate: Option<u32>,
+    /// Offer the client a UDP path for video.
+    pub udp: bool,
+    /// A fixed UDP port (for a firewall rule); any free port otherwise.
+    pub udp_port: Option<u16>,
 }
 
 const TEXT_MIME: &str = "text/plain;charset=utf-8";
@@ -77,6 +84,20 @@ where
         ChromaMode::Dual420
     };
     let codec = Codec::H264;
+    let udp_server = if cfg.udp && caps.udp {
+        match UdpServer::bind(cfg.udp_port) {
+            Ok(s) => {
+                tracing::info!(port = s.port(), "UDP video path offered");
+                Some(s)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "no UDP socket; video stays on the connection");
+                None
+            }
+        }
+    } else {
+        None
+    };
     writer
         .write_msg(&ServerMsg::HelloAck {
             version: PROTOCOL_VERSION,
@@ -90,6 +111,10 @@ where
                 height: output.height,
                 scale_milli: (output.scale * 1000.0).round() as u32,
             }],
+            udp: udp_server.as_ref().map(|s| UdpOffer {
+                port: s.port(),
+                key: s.key(),
+            }),
         })
         .await?;
     let gpu = Gpu::open(Some(&cfg.render_node)).context("open Vulkan device")?;
@@ -144,7 +169,35 @@ where
     let encoder = Encoder::new(&gpu, settings.clone(), chroma == ChromaMode::Dual420)
         .context("create encoder")?;
 
-    let (mut msg_rx, mut clip_in_rx) = spawn_reader(reader);
+    let (msg_tx, mut msg_rx) = mpsc::unbounded_channel();
+    let mut clip_in_rx = spawn_reader(reader, msg_tx.clone());
+    let udp_queued = Arc::new(AtomicU32::new(0));
+    let udp = udp_server.map(|server| {
+        let (frames, mut packets) = server.spawn(udp_queued.clone());
+        // The client's UDP acks and recovery requests join the connection's
+        // messages, so the session handles both paths the same way.
+        tokio::task::spawn_local(async move {
+            while let Some(p) = packets.recv().await {
+                let msg = match p {
+                    Packet::Ack {
+                        frame_id,
+                        decoded_at_ms,
+                        held_ms,
+                    } => ClientMsg::FrameAck {
+                        frame_id,
+                        decoded_at_ms,
+                        held_ms,
+                    },
+                    Packet::Recover { last_good } => ClientMsg::Recover { last_good },
+                    _ => continue,
+                };
+                if msg_tx.send(msg).is_err() {
+                    break;
+                }
+            }
+        });
+        frames
+    });
 
     capturer.request_frame().ok();
     let mut session = Session {
@@ -169,6 +222,12 @@ where
         n_limit: 2,
         frame_id: 0,
         want_keyframe: true,
+        recover_from: None,
+        recovery_sent: None,
+        highest_acked: None,
+        udp,
+        udp_active: false,
+        udp_queued,
         rtt: RttEstimator::new(),
         cursor_shape_id: 0,
     };
@@ -253,11 +312,11 @@ where
 /// Clipboard payloads are consumed inline and delivered as text.
 fn spawn_reader<R>(
     mut reader: Framed<R>,
-) -> (UnboundedReceiver<ClientMsg>, UnboundedReceiver<String>)
+    msg_tx: UnboundedSender<ClientMsg>,
+) -> UnboundedReceiver<String>
 where
     R: AsyncRead + Unpin + 'static,
 {
-    let (msg_tx, msg_rx) = mpsc::unbounded_channel();
     let (clip_tx, clip_rx) = mpsc::unbounded_channel();
     tokio::task::spawn_local(async move {
         loop {
@@ -284,7 +343,7 @@ where
             }
         }
     });
-    (msg_rx, clip_rx)
+    clip_rx
 }
 
 struct Session<W> {
@@ -317,6 +376,20 @@ struct Session<W> {
     n_limit: u32,
     frame_id: u64,
     want_keyframe: bool,
+    /// The next frame predicts from this frame, which the client reports
+    /// it still holds, instead of the previous one.
+    recover_from: Option<u64>,
+    /// The last recovery frame sent: the frame it predicted from and its
+    /// own id. A repeated request for the same frame while it is on its
+    /// way is not a new loss.
+    recovery_sent: Option<(u64, u64)>,
+    highest_acked: Option<u64>,
+    /// The UDP thread, when the path was offered.
+    udp: Option<UnboundedSender<OutFrame>>,
+    /// Video goes over UDP: the client's probe was answered.
+    udp_active: bool,
+    /// Frames handed to the UDP thread and not yet sent.
+    udp_queued: Arc<AtomicU32>,
     rtt: RttEstimator,
     cursor_shape_id: u32,
 }
@@ -327,10 +400,12 @@ impl<W: AsyncWrite + Unpin> Session<W> {
             ClientMsg::Bye => return Ok(ControlFlow::Break(())),
             ClientMsg::FrameAck {
                 frame_id,
-                decoded_at_ms,
+                decoded_at_ms: _,
+                held_ms,
             } => {
-                self.in_flight = self.in_flight.saturating_sub(1);
-                self.rtt.record(frame_id, decoded_at_ms);
+                self.highest_acked = self.highest_acked.max(Some(frame_id));
+                self.rtt.record(frame_id, Duration::from_millis(held_ms as u64));
+                self.in_flight = self.rtt.in_flight();
                 let n_limit = self.rtt.window(self.settings.framerate);
                 if n_limit != self.n_limit {
                     tracing::debug!(
@@ -340,12 +415,33 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                     );
                     self.n_limit = n_limit;
                 }
-                if let Some(bitrate) = self.bitrate_ctl.on_ack(self.rtt.smoothed_ms) {
+                if let Some(bitrate) = self.bitrate_ctl.on_ack(self.rtt.path_ms) {
                     self.settings.bitrate = bitrate;
                     self.encoder.set_bitrate(bitrate);
                 }
             }
             ClientMsg::RequestKeyframe => self.want_keyframe = true,
+            ClientMsg::Recover { last_good: None } => self.want_keyframe = true,
+            ClientMsg::Recover {
+                last_good: Some(from),
+            } => {
+                let on_its_way = self
+                    .recovery_sent
+                    .is_some_and(|(src, sent)| src == from && self.highest_acked < Some(sent));
+                if !on_its_way {
+                    self.recover_from = Some(from);
+                }
+            }
+            ClientMsg::VideoPath { udp } => {
+                let active = udp && self.udp.is_some();
+                if active != self.udp_active {
+                    tracing::info!(path = if active { "udp" } else { "tcp" }, "video path");
+                    self.udp_active = active;
+                    // Frames still on the old path may land after the first
+                    // on the new one; a keyframe needs none of them.
+                    self.want_keyframe = true;
+                }
+            }
             ClientMsg::Key { keycode, pressed } => self.inject(InputCmd::Key {
                 code: keycode,
                 pressed,
@@ -658,41 +754,83 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         // The import is cached per ring buffer; the generation changes when
         // the ring is reallocated (resize), so old imports are never reused.
         let buffer_key = (frame.buffer.generation << 32) | frame.buffer.index as u64;
-        let key = std::mem::take(&mut self.want_keyframe);
-        let t0 = Instant::now();
-        let encoded = self.encoder.encode_dmabuf(buffer_key, &plane, key)?;
-        let enc_us = t0.elapsed().as_micros();
-        let aux = encoded.aux.unwrap_or_default();
-        let msg = ServerMsg::VideoFrame {
-            frame_id: self.frame_id,
-            pts_us: now_ms() * 1000,
-            keyframe: encoded.keyframe,
-            damage: vec![Rect {
-                x: 0,
-                y: 0,
-                width: width as i32,
-                height: height as i32,
-            }],
-            data_len: encoded.main.len() as u32,
-            aux_len: aux.len() as u32,
+        let reference = if std::mem::take(&mut self.want_keyframe) {
+            Reference::Keyframe
+        } else {
+            match self.recover_from.take() {
+                Some(from) => Reference::Frame(from),
+                None => Reference::Latest,
+            }
         };
-        self.writer
-            .write_msg_with_payloads(&msg, &[&encoded.main, &aux])
-            .await?;
+        let t0 = Instant::now();
+        let encoded = self
+            .encoder
+            .encode_dmabuf(buffer_key, &plane, self.frame_id, reference)?;
+        let enc_us = t0.elapsed().as_micros();
+        if let Reference::Frame(from) = reference {
+            self.recovery_sent = Some((from, self.frame_id));
+            tracing::info!(
+                frame_id = self.frame_id,
+                from,
+                keyframe = encoded.keyframe,
+                "recovery frame"
+            );
+        }
+        let aux = encoded.aux.unwrap_or_default();
+        let (main_len, aux_len) = (encoded.main.len(), aux.len());
+        let pts_us = now_ms() * 1000;
+        match (&self.udp, self.udp_active) {
+            (Some(udp), true) => {
+                self.udp_queued.fetch_add(1, Ordering::AcqRel);
+                udp.send(OutFrame {
+                    info: FrameInfo {
+                        frame_id: self.frame_id,
+                        keyframe: encoded.keyframe,
+                        reference: encoded.reference,
+                        pts_us,
+                    },
+                    main: encoded.main,
+                    aux,
+                    pace_bps: (self.settings.bitrate as u64 * 8).max(16_000_000),
+                })
+                .map_err(|_| anyhow::anyhow!("UDP thread gone"))?;
+            }
+            _ => {
+                let msg = ServerMsg::VideoFrame {
+                    frame_id: self.frame_id,
+                    pts_us,
+                    keyframe: encoded.keyframe,
+                    reference: encoded.reference,
+                    damage: vec![Rect {
+                        x: 0,
+                        y: 0,
+                        width: width as i32,
+                        height: height as i32,
+                    }],
+                    data_len: main_len as u32,
+                    aux_len: aux_len as u32,
+                };
+                self.writer
+                    .write_msg_with_payloads(&msg, &[&encoded.main, &aux])
+                    .await?;
+            }
+        }
         tracing::debug!(
             frame_id = self.frame_id,
             key = encoded.keyframe,
-            main = encoded.main.len(),
-            aux = aux.len(),
+            reference = encoded.reference,
+            main = main_len,
+            aux = aux_len,
             enc_us,
             in_flight = self.in_flight,
             n_limit = self.n_limit,
+            udp = self.udp_active,
             "sent frame"
         );
         self.rtt.on_sent(self.frame_id);
         self.bitrate_ctl.note_sent();
         self.frame_id += 1;
-        self.in_flight += 1;
+        self.in_flight = self.rtt.in_flight();
         Ok(())
     }
 }
@@ -889,9 +1027,12 @@ fn start_input(target: &Target, output: &str, keymap: &str) -> Result<Input> {
 }
 
 /// Smoothed ack round-trip time, driving how many frames may be unacked.
+/// `path_ms` leaves out the time the client held a frame for a repair: the
+/// window must cover that wait, but it is not queueing on the path.
 struct RttEstimator {
     sent: VecDeque<(u64, Instant)>,
     smoothed_ms: f64,
+    path_ms: f64,
 }
 
 /// Adapts the CBR target to the path. The ack RTT is the signal: its
@@ -1002,6 +1143,7 @@ impl RttEstimator {
         Self {
             sent: VecDeque::new(),
             smoothed_ms: 30.0,
+            path_ms: 30.0,
         }
     }
 
@@ -1009,13 +1151,31 @@ impl RttEstimator {
         self.sent.push_back((frame_id, Instant::now()));
     }
 
-    fn record(&mut self, _frame_id: u64, _decoded_at_ms: u64) {
-        // We approximate RTT from when we noticed the ack, not the client clock,
-        // which avoids clock-skew: use the gap since the last ack as a proxy.
+    /// Frames sent and not yet acked.
+    fn in_flight(&self) -> u32 {
+        self.sent.len() as u32
+    }
+
+    /// Record an ack. An ack is cumulative: every frame up to `frame_id`
+    /// is done with, decoded or dropped. The RTT sample is the acked
+    /// frame's own, measured on this clock so skew does not matter, less
+    /// the time the client held it for a repair: a loss is not queueing.
+    fn record(&mut self, frame_id: u64, held: Duration) {
         let now = Instant::now();
-        if let Some((_, t)) = self.sent.pop_front() {
-            let sample = now.duration_since(t).as_secs_f64() * 1000.0;
+        let mut sent_at = None;
+        while let Some(&(id, t)) = self.sent.front() {
+            if id > frame_id {
+                break;
+            }
+            self.sent.pop_front();
+            sent_at = Some(t);
+        }
+        if let Some(t) = sent_at {
+            let total = now.duration_since(t);
+            let sample = total.as_secs_f64() * 1000.0;
+            let path = total.saturating_sub(held).as_secs_f64() * 1000.0;
             self.smoothed_ms = 0.875 * self.smoothed_ms + 0.125 * sample.min(1000.0);
+            self.path_ms = 0.875 * self.path_ms + 0.125 * path.min(1000.0);
         }
     }
 

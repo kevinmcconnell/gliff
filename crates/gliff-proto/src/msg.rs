@@ -106,9 +106,13 @@ pub enum ClientMsg {
         discrete: Option<i32>,
         stop: bool,
     },
+    /// Every frame up to `frame_id` is decoded or dropped. `held_ms` is
+    /// the time the frame waited on the client for a repair or for an
+    /// earlier frame, which the server takes out of its round-trip sample.
     FrameAck {
         frame_id: u64,
         decoded_at_ms: u64,
+        held_ms: u32,
     },
     RequestKeyframe,
     ClipboardOffer {
@@ -239,6 +243,7 @@ mod tests {
             ClientMsg::FrameAck {
                 frame_id: 42,
                 decoded_at_ms: 1000,
+                held_ms: 0,
             },
         ];
         for m in msgs {

@@ -47,7 +47,13 @@ pub enum Packet {
     /// Client to server: send these parts of this frame again.
     Nack { frame_id: u64, missing: Vec<u16> },
     /// Client to server: every frame up to this one is decoded or dropped.
-    Ack { frame_id: u64, decoded_at_ms: u64 },
+    /// `held_ms` is how long the frame waited for a repair or for an
+    /// earlier frame; it is not the path's delay.
+    Ack {
+        frame_id: u64,
+        decoded_at_ms: u64,
+        held_ms: u32,
+    },
     /// Client to server: as `ClientMsg::Recover`.
     Recover { last_good: Option<u64> },
 }
@@ -264,6 +270,9 @@ pub struct AssembledFrame {
     pub info: FrameInfo,
     pub main: Vec<u8>,
     pub aux: Vec<u8>,
+    /// Time from its first part to its delivery: waiting for a repair, or
+    /// for an earlier frame.
+    pub held: Duration,
 }
 
 /// What the assembler hands up.
@@ -283,7 +292,10 @@ struct Pending {
     parts: Vec<Option<Vec<u8>>>,
     have: u16,
     first_seen: Instant,
+    last_part: Instant,
     last_nack: Option<Instant>,
+    /// The parts the last request asked for.
+    requested: Vec<u16>,
     nacks: u32,
 }
 
@@ -292,6 +304,18 @@ impl Pending {
         self.have == self.count
     }
 
+    /// Parts below the highest one received: they should have been here.
+    fn gaps(&self) -> Vec<u16> {
+        let highest = self.parts.iter().rposition(Option::is_some).unwrap_or(0);
+        self.parts[..highest]
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.is_none())
+            .map(|(i, _)| i as u16)
+            .collect()
+    }
+
+    /// Every part not received, the tail included.
     fn missing(&self) -> Vec<u16> {
         self.parts
             .iter()
@@ -304,8 +328,9 @@ impl Pending {
 
 /// Puts parts back into frames and delivers them in order. A frame with
 /// parts missing is asked for again after a gap shows (a later part or
-/// frame arrived) or after a wait; after `MAX_NACKS` unanswered requests
-/// it is dropped and the stream goes on from the next frame.
+/// frame arrived) or after a wait, and every pending frame is asked for at
+/// once, so repairs overlap; after `MAX_NACKS` unanswered requests a frame
+/// is dropped and the stream goes on from the next one.
 pub struct Assembler {
     frames: BTreeMap<u64, Pending>,
     /// Every frame below this is delivered or dropped.
@@ -326,12 +351,13 @@ pub struct Stats {
 }
 
 impl Assembler {
-    const MAX_NACKS: u32 = 2;
+    const MAX_NACKS: u32 = 3;
     const MIN_NACK_INTERVAL: Duration = Duration::from_millis(8);
-    const MAX_NACK_INTERVAL: Duration = Duration::from_millis(250);
+    /// A satellite or in-flight link has a round trip over a second.
+    const MAX_NACK_INTERVAL: Duration = Duration::from_millis(2500);
     /// Frames kept ahead of the one being waited for; beyond this the
     /// oldest is given up so a lost frame cannot stall the stream for long.
-    const MAX_AHEAD: usize = 6;
+    const MAX_AHEAD: usize = 8;
 
     pub fn new() -> Self {
         Self {
@@ -384,7 +410,9 @@ impl Assembler {
             parts: vec![None; count as usize],
             have: 0,
             first_seen: now,
+            last_part: now,
             last_nack: None,
+            requested: Vec::new(),
             nacks: 0,
         });
         if pending.count != count {
@@ -393,6 +421,7 @@ impl Assembler {
         if pending.parts[index as usize].is_none() {
             pending.parts[index as usize] = Some(bytes);
             pending.have += 1;
+            pending.last_part = now;
         }
         self.advance(now)
     }
@@ -408,18 +437,18 @@ impl Assembler {
 
     fn advance(&mut self, now: Instant) -> Vec<Event> {
         let mut events = Vec::new();
-        loop {
-            let Some((&id, _)) = self.frames.iter().next() else {
-                break;
-            };
-            let complete = self.frames[&id].complete();
-            if complete {
+        let interval = self.nack_interval();
+        // Deliver from the front, in order; drop the oldest frame when its
+        // repairs went unanswered or too many frames wait behind it.
+        while let Some((&id, p)) = self.frames.iter().next() {
+            if p.complete() {
                 let p = self.frames.remove(&id).expect("present");
                 if p.nacks > 0 {
                     self.stats.repaired += 1;
                 }
                 self.stats.frames += 1;
                 self.next = id + 1;
+                let held = now.duration_since(p.first_seen);
                 let body: Vec<u8> = p.parts.into_iter().flatten().flatten().collect();
                 if body.len() != p.total_len || p.main_len > body.len() {
                     // Parts disagree with the header: treat as lost.
@@ -430,48 +459,63 @@ impl Assembler {
                 let aux = body[p.main_len..].to_vec();
                 let mut main = body;
                 main.truncate(p.main_len);
+                tracing::trace!(frame_id = id, held_ms = held.as_millis() as u64, nacks = p.nacks, parts = p.count, "frame assembled");
                 events.push(Event::Frame(AssembledFrame {
                     info: p.info,
                     main,
                     aux,
+                    held,
                 }));
                 continue;
             }
-            // The oldest frame is incomplete: ask for its parts, or give up.
-            let interval = self.nack_interval();
-            let ahead = self.frames.len();
-            let later_seen = ahead > 1;
-            let p = self.frames.get_mut(&id).expect("present");
-            let gap_shown = later_seen
-                || p.parts.iter().rposition(Option::is_some).unwrap_or(0) + 1 > p.have as usize;
-            let due = match p.last_nack {
-                None => gap_shown || now.duration_since(p.first_seen) >= interval / 2,
-                Some(t) => now.duration_since(t) >= interval,
-            };
-            if !due {
-                break;
-            }
-            let give_up = p.nacks >= Self::MAX_NACKS || ahead > Self::MAX_AHEAD;
-            if give_up {
-                self.frames.remove(&id);
+            let unanswered = p.nacks >= Self::MAX_NACKS
+                && p
+                    .last_nack
+                    .is_some_and(|t| now.duration_since(t) >= interval);
+            if unanswered || self.frames.len() > Self::MAX_AHEAD {
+                let p = self.frames.remove(&id).expect("present");
+                tracing::debug!(frame_id = id, have = p.have, count = p.count, nacks = p.nacks, waiting = self.frames.len(), "frame given up");
                 self.next = id + 1;
                 self.stats.lost += 1;
                 self.outgoing.push(Packet::Ack {
                     frame_id: id,
                     decoded_at_ms: 0,
+                    held_ms: now.duration_since(p.first_seen).as_millis() as u32,
                 });
                 events.push(Event::Lost(id));
                 continue;
             }
-            let missing = p.missing();
+            break;
+        }
+        // Ask for the parts every incomplete frame misses. A gap below the
+        // highest part received is asked for at once; the tail only when
+        // the sender has moved on to a later frame or nothing has come for
+        // a while, as its parts may still be on their way. A part not asked
+        // for before goes out at once; a repeat waits a round trip.
+        let newest = self.frames.keys().next_back().copied();
+        for (&id, p) in self.frames.iter_mut() {
+            if p.complete() || p.nacks >= Self::MAX_NACKS {
+                continue;
+            }
+            let tail_lost =
+                Some(id) != newest || now.duration_since(p.last_part) >= interval / 2;
+            let missing = if tail_lost { p.missing() } else { p.gaps() };
+            if missing.is_empty() {
+                continue;
+            }
+            let new_parts = missing.iter().any(|i| !p.requested.contains(i));
+            if !new_parts && p.last_nack.is_some_and(|t| now.duration_since(t) < interval) {
+                continue;
+            }
+            tracing::debug!(frame_id = id, missing = missing.len(), have = p.have, count = p.count, tail_lost, nack = p.nacks + 1, "nack");
             p.last_nack = Some(now);
+            p.requested.clone_from(&missing);
             p.nacks += 1;
             self.stats.nacks += 1;
             self.outgoing.push(Packet::Nack {
                 frame_id: id,
                 missing,
             });
-            break;
         }
         events
     }
@@ -598,7 +642,8 @@ mod tests {
             vec![Event::Frame(AssembledFrame {
                 info: info(3),
                 main,
-                aux
+                aux,
+                held: Duration::ZERO,
             })]
         );
         assert!(asm.outgoing.is_empty());
@@ -661,19 +706,57 @@ mod tests {
         assert_eq!(asm.outgoing.len(), 1);
         assert!(asm.tick(t0 + Duration::from_millis(40)).is_empty());
         assert_eq!(asm.outgoing.len(), 2);
-        let ev = asm.tick(t0 + Duration::from_millis(70));
+        assert!(asm.tick(t0 + Duration::from_millis(70)).is_empty());
+        assert_eq!(asm.outgoing.len(), 3);
+        let ev = asm.tick(t0 + Duration::from_millis(100));
         assert_eq!(ev, vec![Event::Lost(0)]);
-        assert_eq!(
+        assert!(matches!(
             asm.outgoing.last(),
-            Some(&Packet::Ack {
-                frame_id: 0,
-                decoded_at_ms: 0
-            })
-        );
+            Some(&Packet::Ack { frame_id: 0, .. })
+        ));
         assert_eq!(asm.stats.lost, 1);
         // A late part of the dropped frame is ignored.
         assert!(feed(&mut asm, &f0[2..3], &[], t0 + Duration::from_millis(80)).is_empty());
         assert_eq!(asm.pending(), 0);
+    }
+
+    #[test]
+    fn every_pending_frame_is_asked_for_at_once() {
+        let mut asm = Assembler::new();
+        let t0 = Instant::now();
+        let f0 = split_frame(&info(0), &vec![0u8; 3000], &[]);
+        let f1 = split_frame(&info(1), &vec![1u8; 3000], &[]);
+        let f2 = split_frame(&info(2), &vec![2u8; 3000], &[]);
+        // Frames 0 and 1 each lose a part; frame 2 arrives whole.
+        assert!(feed(&mut asm, &f0, &[0], t0).is_empty());
+        assert!(feed(&mut asm, &f1, &[1], t0).is_empty());
+        assert!(feed(&mut asm, &f2, &[], t0).is_empty());
+        let nacked: Vec<u64> = asm
+            .outgoing
+            .iter()
+            .filter_map(|p| match p {
+                Packet::Nack { frame_id, .. } => Some(*frame_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(nacked, vec![0, 1]);
+        // Both repairs land together: all three frames come out, in order,
+        // and the held time of frame 2 is its wait behind them.
+        let t1 = t0 + Duration::from_millis(30);
+        let mut ev = feed(&mut asm, &f1[1..2], &[], t1);
+        assert!(ev.is_empty());
+        ev.extend(feed(&mut asm, &f0[0..1], &[], t1));
+        let ids: Vec<u64> = ev
+            .iter()
+            .map(|e| match e {
+                Event::Frame(f) => f.info.frame_id,
+                Event::Lost(id) => *id,
+            })
+            .collect();
+        assert_eq!(ids, vec![0, 1, 2]);
+        if let Event::Frame(f) = &ev[2] {
+            assert_eq!(f.held, Duration::from_millis(30));
+        }
     }
 
     #[test]

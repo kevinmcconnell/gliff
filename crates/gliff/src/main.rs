@@ -57,10 +57,15 @@ struct Cli {
     /// click it again.
     #[arg(long, default_value = "shift+escape")]
     release_hotkey: String,
+    /// Keep video on the ssh connection; do not try the UDP path.
+    #[arg(long)]
+    no_udp: bool,
 }
 
 /// Everything the UI shares with its callbacks.
 struct App {
+    /// Try to take video over UDP when the server offers it.
+    udp: bool,
     /// The picture, upcast; input controllers attach to it and we measure it.
     video: gtk::Widget,
     /// What the picture shows: the latest frame at 1:1 device pixels.
@@ -165,6 +170,7 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
     window.set_content(Some(&content));
 
     let ui = Rc::new(App {
+        udp: !cli.no_udp,
         video: video.clone(),
         frame,
         stats: stats.clone(),
@@ -292,6 +298,7 @@ fn start_session(ui: Rc<App>, endpoint: Endpoint) {
     *ui.input_tx.borrow_mut() = Some(input_tx);
     *ui.endpoint.borrow_mut() = Some(endpoint.clone());
     ui.status.set_text("Connecting…");
+    let udp = ui.udp;
 
     std::thread::Builder::new()
         .name("gliff-net".into())
@@ -301,6 +308,7 @@ fn start_session(ui: Rc<App>, endpoint: Endpoint) {
                 frames: frame_tx,
                 status: status_tx,
                 input: input_rx,
+                udp,
             }
             .run();
         })
@@ -403,9 +411,10 @@ fn poll_status(ui: Rc<App>, rx: Receiver<Status>) {
                     fps,
                     mbit,
                     decode_ms,
+                    path,
                 } => {
                     ui.stats.set_text(&format!(
-                        "{fps:.0} fps  {mbit:.1} Mbit/s  decode {decode_ms:.1} ms"
+                        "{fps:.0} fps  {mbit:.1} Mbit/s  decode {decode_ms:.1} ms  {path}"
                     ));
                 }
                 Status::Cursor {

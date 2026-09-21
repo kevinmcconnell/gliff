@@ -37,7 +37,7 @@ video, cursor and pongs flow server→client.
 | Crate | Role | `unsafe` |
 |---|---|---|
 | `gliff-proto` | wire messages, framing header, CPU reference for colour and the AVC444 split/recombine | none |
-| `gliff-transport` | `Framed` length-prefixed IO with out-of-band payloads (`write_vectored`), ssh spawn | none |
+| `gliff-transport` | `Framed` length-prefixed IO with out-of-band payloads (`write_vectored`), ssh spawn, the sealed UDP video path (`udp`, `udp_io`) | none |
 | `hypr-ipc` | Hyprland control socket (instance discovery, outputs, options) | none |
 | `hypr-wl` | shared Wayland plumbing (connect, globals, output/seat tracking, calloop runner) | none |
 | `hypr-capture` | output + cursor capture into GBM dmabufs on a calloop thread | none |
@@ -62,19 +62,35 @@ round-trip.
   payloads ride outside the postcard body so the encoder output is sent with
   `write_vectored` and read straight into the decoder.
 
-- **Why not UDP.** Measured on 2026-09-14 between two Wi-Fi machines over
-  Tailscale's direct path (MTU 1280, 330-380 Mbit/s of SSH throughput, RTT
-  3-12 ms with contention spikes): a 1856x1238 Dual420 mirror ran at 58 fps
-  with a worst frame-arrival gap of 71 ms while TCP retransmitted 0.7-6.5% of
-  segments. A frame is ~115 packets, so raw UDP would damage most frames at
-  those loss rates, and a working UDP path needs NACK or FEC, a jitter buffer
-  and codec resilience, whose recovery also costs one RTT. TCP in SSH stays
-  until a high-RTT lossy path becomes a primary use; then QUIC (one stream
-  per frame, keys handed over SSH) is the candidate, not raw UDP. To measure
-  again: client `RUST_LOG=info,gliff_vk=debug`, server
-  `--server-bin 'env RUST_LOG=info,gliff_server=debug gliff-server'`, compare
-  the `sent frame` and `decode + recombine` timestamps, and sample
-  `ss -tin` on the server for retransmits.
+- **Video over UDP, everything else over SSH.** Measured on 2026-09-14
+  between two Wi-Fi machines over Tailscale (MTU 1280, RTT 3-12 ms), TCP
+  retransmitted 0.7-6.5% of segments and one loss held the whole stream for
+  a round trip, or for a retransmit timer at the tail. So the server hands
+  the client a random 32-byte session key and a UDP port inside the SSH
+  handshake (`HelloAck.udp`), the client probes that port from a thread of
+  its own while video already flows over SSH, and once a probe is answered
+  it tells the server (`VideoPath`) and frames move to UDP. Input, cursor,
+  clipboard and control stay on SSH. Each datagram is `seq || ChaCha20-
+  Poly1305(body)` with the sequence as nonce and associated data, at most
+  1200 bytes, so nothing that does not authenticate costs more than one MAC
+  check, and an anti-replay window drops repeats. A frame is split into
+  parts whose header repeats in each; the client reassembles, asks again
+  (NACK) for a gap below the highest part received at once and for a
+  missing tail once a later frame shows, waits a round trip between
+  repeats, and gives a frame up after three unanswered requests or when
+  eight frames wait behind it. The server paces parts at eight times the
+  bitrate (a burst of a whole keyframe overruns the receiver's 212 KiB
+  socket buffer) and keeps the last sixteen frames for retransmission.
+  Acks and recovery requests ride UDP too; an ack is cumulative and carries
+  the time the client held the frame for a repair, which the server takes
+  out of its queueing estimate but leaves in the ack window. When probes go
+  unanswered for five seconds the client says so and video returns to SSH;
+  each switch starts with a keyframe, since frames still on the old path
+  may land after the first on the new one. `--no-udp` on either end keeps
+  video on SSH; `--udp-port` fixes the port for a firewall rule. Why not
+  QUIC: its streams retransmit what the client has already given up on and
+  its congestion control is loss-based, both wrong for latest-wins video,
+  and the key exchange it would bring is already done by SSH.
 
 - **4:4:4 by two 4:2:0 streams (AVC444).** Hardware H.264 encoders only do
   4:2:0, which blurs coloured text. gliff splits full 4:4:4 into a main stream
@@ -96,9 +112,15 @@ round-trip.
 - **Low-delay H.264.** The encoder emits IDR then P frames with one reference
   and no reordering (POC type 0), High profile, CABAC, CBR at the configured
   bitrate, with the SPS and PPS prepended to every IDR so any keyframe is a
-  random-access point. The decoder parses only what the hardware does not
-  (SPS, PPS, slice header up to the reference marking) and manages a two-slot
-  DPB with sliding-window marking.
+  random-access point. The encoder keeps up to eight reconstructed pictures
+  (fewer where the device's H.264 level cannot hold them at the size) and
+  every frame names the one it predicts from, normally the previous. A
+  client that no longer has that frame drops the new one and reports the
+  last frame it decoded (`Recover`); the next frame predicts from that one
+  through a reference list modification, so a loss costs one P frame, not
+  an IDR, as long as the frame is among the last eight. The decoder parses
+  only what the hardware does not (SPS, PPS, slice header up to the
+  reference marking) and manages the DPB with sliding-window marking.
 
 - **Latest-wins, ack-paced.** The server keeps only the most recent captured
   frame and encodes it when the client has ack capacity. The number of unacked
@@ -159,6 +181,12 @@ round-trip.
   checks, the GPU pipeline, both Dual420 and Single420 server-plus-client
   streams, and the clipboard. It needs a Hyprland session and a GPU with Vulkan
   Video, so it is not a CI unit test; run it on a target machine.
+
+`gliff-probe roundtrip --lossy` withholds frames from the decoder and checks
+that the next frame predicts from the last good one on the device.
+`scripts/lossy-bench.sh DELAY_MS LOSS_PCT` compares the TCP and UDP paths on
+a private loopback shaped by netem (`scripts/netem.sh`, MTU 1280, no root),
+and `stream-bench --tcp` forces the connection path.
 
 ## Measurements
 

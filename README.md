@@ -118,7 +118,7 @@ Single420 server-plus-client streams.
 
 - `crates/gliff-proto` wire types, framing, and the CPU reference for colour
   conversion and the AVC444 4:4:4 split/recombine that the shaders must match.
-- `crates/gliff-transport` framed IO, ssh spawning.
+- `crates/gliff-transport` framed IO, ssh spawning, the sealed UDP video path.
 - `crates/hypr-ipc`, `crates/hypr-wl` Hyprland IPC and shared Wayland plumbing.
 - `crates/hypr-capture` output + cursor capture into dmabufs.
 - `crates/hypr-input` keyboard and pointer injection.

@@ -46,6 +46,13 @@ struct Cli {
     /// server adapts below it when the link shows queueing.
     #[arg(long)]
     bitrate: Option<u32>,
+    /// Keep video on the connection; do not offer the client a UDP path.
+    #[arg(long)]
+    no_udp: bool,
+    /// UDP port for the video path (default: any free port). Set it when a
+    /// firewall must let the path through.
+    #[arg(long)]
+    udp_port: Option<u16>,
 }
 
 fn main() -> Result<()> {
@@ -74,6 +81,8 @@ fn main() -> Result<()> {
         render_node: hypr_capture::render_node(cli.render_node.as_deref()),
         low_bandwidth: cli.low_bandwidth,
         bitrate: cli.bitrate,
+        udp: !cli.no_udp,
+        udp_port: cli.udp_port,
     };
 
     let rt = tokio::runtime::Builder::new_current_thread()

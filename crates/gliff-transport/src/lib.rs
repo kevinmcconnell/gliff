@@ -8,6 +8,7 @@
 //! returns them as a `Bytes` slice for the decoder.
 
 mod ssh;
+pub mod recv;
 pub mod udp;
 pub mod udp_io;
 
