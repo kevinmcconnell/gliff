@@ -6,8 +6,8 @@ usage() {
 Usage: scripts/network-test.sh <slow|lossy|bad>
 
   slow   5 Mbit/s, 100 ms added RTT with jitter, no injected loss
-  lossy  3% random packet loss, 20 ms added RTT
-  bad    5 Mbit/s, 100 ms added RTT with jitter, 3% random loss
+  lossy  8% random packet loss, 250 ms added RTT
+  bad    5 Mbit/s, 250 ms added RTT with jitter, 8% random loss
 
 Builds release binaries and opens nested Hyprland plus a gliff client.
 Requires sudo, iproute2, ethtool, util-linux, dbus, and a terminal
@@ -35,8 +35,8 @@ fi
 quality=$1
 case "$quality" in
     slow) impairment=(delay 50ms 10ms distribution normal rate 5mbit) ;;
-    lossy) impairment=(delay 10ms loss random 3%) ;;
-    bad) impairment=(delay 50ms 10ms distribution normal loss random 3% rate 5mbit) ;;
+    lossy) impairment=(delay 125ms loss random 8%) ;;
+    bad) impairment=(delay 125ms 10ms distribution normal loss random 8% rate 5mbit) ;;
     *) usage >&2; exit 2 ;;
 esac
 

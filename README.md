@@ -125,8 +125,9 @@ For an interactive test over a simulated poor network:
 The launcher builds the release client and server, opens a nested Hyprland
 desktop with a terminal, and connects gliff using direct TCP. `slow` adds a
 5 Mbit/s shared rate limit and roughly 100 ms RTT with jitter; `lossy` adds
-3% random packet loss in each direction and roughly 20 ms RTT; `bad` combines
-the slow profile with 3% loss. Queueing and retransmissions add further delay.
+8% random packet loss in each direction and roughly 250 ms RTT; `bad` combines
+that loss and RTT with jitter and the 5 Mbit/s limit. Queueing and
+retransmissions add further delay.
 
 Requires `sudo`, `iproute2`, `ethtool`, `util-linux`, `dbus`, and one of `foot`,
 `kitty`, or `alacritty`. Run as your normal user inside Wayland. Only network
