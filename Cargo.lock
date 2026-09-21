@@ -750,6 +750,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "gliff-ffi"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "gliff-client",
+ "gliff-proto",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "gliff-probe"
 version = "0.1.0"
 dependencies = [

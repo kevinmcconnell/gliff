@@ -215,6 +215,12 @@ fn closed_before_handshake_is_an_error() {
         signal,
     );
     hang_up.join().unwrap();
+    // Depending on timing the hang-up shows as a closed read or a reset
+    // write; either way it is one error, not a clean close.
     assert_eq!(recorder.statuses.len(), 1);
-    assert!(recorder.statuses[0].starts_with("Error(\"connection closed before"));
+    assert!(
+        recorder.statuses[0].starts_with("Error("),
+        "{:?}",
+        recorder.statuses
+    );
 }

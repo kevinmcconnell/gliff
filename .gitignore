@@ -1,3 +1,5 @@
 target/
 *.png
 macos/.build/
+macos/Sources/CGliff/include/gliff.h
+dist/

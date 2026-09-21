@@ -1,0 +1,22 @@
+[package]
+name = "gliff-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# The C ABI the macOS app links: gliff-client plus the platform-neutral
+# helpers, as a static library. cbindgen.toml describes the header.
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio = { workspace = true }
+gliff-proto.workspace = true
+gliff-client.workspace = true

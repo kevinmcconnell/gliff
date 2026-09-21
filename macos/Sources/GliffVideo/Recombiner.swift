@@ -49,12 +49,36 @@ public final class Recombiner {
         self.cache = cache
     }
 
-    /// Recombine one frame and wait for the GPU. The plane textures (and the
-    /// pixel buffers behind them) are held until the command buffer completes.
+    /// Recombine one frame into a new texture and wait for the GPU.
     public func recombine(main: CVPixelBuffer, aux: CVPixelBuffer?) throws -> MTLTexture {
+        let output = try makeOutput(width: CVPixelBufferGetWidth(main), height: CVPixelBufferGetHeight(main))
+        try recombine(main: main, aux: aux, into: output)
+        return output
+    }
+
+    /// A texture the recombine can write and a renderer can sample.
+    public func makeOutput(width: Int, height: Int) throws -> MTLTexture {
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .bgra8Unorm, width: width, height: height, mipmapped: false
+        )
+        descriptor.usage = [.shaderWrite, .shaderRead]
+        descriptor.storageMode = .shared
+        guard let output = device.makeTexture(descriptor: descriptor) else {
+            throw RecombineError.texture("output")
+        }
+        return output
+    }
+
+    /// Recombine one frame into `output` and wait for the GPU. The plane
+    /// textures (and the pixel buffers behind them) are held until the
+    /// command buffer completes.
+    public func recombine(main: CVPixelBuffer, aux: CVPixelBuffer?, into output: MTLTexture) throws {
         let width = CVPixelBufferGetWidth(main)
         let height = CVPixelBufferGetHeight(main)
         if let aux, CVPixelBufferGetWidth(aux) != width || CVPixelBufferGetHeight(aux) != height {
+            throw RecombineError.sizeMismatch
+        }
+        guard output.width == width, output.height == height else {
             throw RecombineError.sizeMismatch
         }
 
@@ -64,17 +88,10 @@ public final class Recombiner {
             try plane(aux ?? main, 0, .r8Unorm, "aux luma"),
             try plane(aux ?? main, 1, .rg8Unorm, "aux chroma"),
         ]
-
-        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: .bgra8Unorm, width: width, height: height, mipmapped: false
-        )
-        descriptor.usage = [.shaderWrite, .shaderRead]
-        descriptor.storageMode = .shared
-        guard let output = device.makeTexture(descriptor: descriptor),
-              let commands = queue.makeCommandBuffer(),
+        guard let commands = queue.makeCommandBuffer(),
               let encoder = commands.makeComputeCommandEncoder()
         else {
-            throw RecombineError.texture("output")
+            throw RecombineError.texture("command buffer")
         }
 
         var params: [Int32] = [Int32(width), Int32(height), aux == nil ? 0 : 1]
@@ -91,7 +108,9 @@ public final class Recombiner {
         commands.addCompletedHandler { _ in _ = planes }
         commands.commit()
         commands.waitUntilCompleted()
-        return output
+        if let error = commands.error {
+            throw error
+        }
     }
 
     private func plane(
