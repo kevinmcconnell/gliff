@@ -2,7 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 2;
+/// 3: `Hello.keymap` may be `rmlvo:` names instead of xkb text.
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// Chunk cap for clipboard payloads on the wire.
 pub const CLIPBOARD_CHUNK: usize = 256 * 1024;
@@ -70,6 +71,8 @@ pub struct SessionInfo {
 pub enum ClientMsg {
     Hello {
         version: u16,
+        /// xkb keymap text (format v1), `rmlvo:layout=..;variant=..;options=..`
+        /// names for the server to compile, or empty for its default.
         keymap: String,
         caps: ClientCaps,
     },

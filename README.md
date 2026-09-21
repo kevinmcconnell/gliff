@@ -31,6 +31,13 @@ Working and validated on AMD (Ryzen Granite Ridge, Mesa RADV):
   `omarchy theme set`. Without Omarchy it is stock Adwaita and follows the
   desktop dark/light preference.
 
+- A native macOS client, `Gliff.app` (Apple Silicon, macOS 14+), that
+  connects to a Hyprland server the same way: VideoToolbox decodes both
+  H.264 streams, a Metal port of the recombine shader rebuilds 4:4:4, and
+  a Metal layer draws it. Validated from an M4 Mac mini against the
+  AMD machine above, over ssh and over TCP: both streams, mirror and headless
+  screens, typing, and the clipboard both ways. See `macos/`.
+
 On Intel (Mesa ANV) the client has been tested and works, but we have not
 started server support yet. The client needs
 `ANV_DEBUG=video-decode,video-encode` set; `docs/hardware-quirks.md` explains
@@ -73,6 +80,30 @@ To run under the Khronos validation layer during development:
 VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation gliff-probe roundtrip
 ```
 
+### macOS client
+
+On a Mac with the Xcode Command Line Tools and Homebrew:
+
+```
+brew install rustup cbindgen
+rustup default stable
+macos/build.sh             # builds and ad-hoc signs dist/Gliff.app
+macos/build.sh test        # also runs the Swift tests
+```
+
+Use Homebrew's `rustup`, not its `rust`: the latter's standard library
+is built for the newest macOS only. From Linux, `scripts/mac-build.sh`
+syncs the working tree to a Mac and builds and tests there.
+
+Open `dist/Gliff.app`, type `user@host` and press Connect, or run
+`dist/Gliff.app/Contents/MacOS/Gliff [--headless] user@host`. The Mac
+needs key-based ssh access to the host (there is no terminal for a
+password prompt), and the app sends the Mac's keyboard layout, which the
+server compiles into its keymap. Click the screen to give it the
+keyboard, Cmd chords included; Shift+Esc gives it back. Connection >
+Capture System Shortcuts also routes Cmd-Tab and the other system keys to
+the remote, after macOS grants the Accessibility permission.
+
 ## Run (ssh, the real path)
 
 ```
@@ -111,14 +142,19 @@ cargo fmt --all --check    # formatting (rustfmt defaults)
 ```
 
 `scripts/e2e.sh` must run inside a Hyprland session; it boots a nested Hyprland
-and asserts the probe checks, the 4:4:4 capture pipeline, and both Dual420 and
-Single420 server-plus-client streams.
+and asserts the probe checks, the 4:4:4 capture pipeline, both Dual420 and
+Single420 server-plus-client streams, the clipboard, and the GTK client.
 
 ## Layout
 
 - `crates/gliff-proto` wire types, framing, and the CPU reference for colour
   conversion and the AVC444 4:4:4 split/recombine that the shaders must match.
 - `crates/gliff-transport` framed IO, ssh spawning.
+- `crates/gliff-client` the client session shared by every front end; the
+  platform supplies the decoder.
+- `crates/gliff-ffi` that session as a C library, for the macOS client.
+- `macos/` the macOS client: `GliffVideo` (VideoToolbox + Metal),
+  `GliffInput` (key codes and layouts), and the AppKit app.
 - `crates/hypr-ipc`, `crates/hypr-wl` Hyprland IPC and shared Wayland plumbing.
 - `crates/hypr-capture` output + cursor capture into dmabufs.
 - `crates/hypr-input` keyboard and pointer injection.

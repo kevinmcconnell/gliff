@@ -3,6 +3,8 @@ resolver = "2"
 members = [
     "crates/gliff-proto",
     "crates/gliff-transport",
+    "crates/gliff-client",
+    "crates/gliff-ffi",
     "crates/hypr-ipc",
     "crates/hypr-wl",
     "crates/hypr-capture",
@@ -28,6 +30,7 @@ undocumented_unsafe_blocks = "warn"
 [workspace.dependencies]
 gliff-proto = { path = "crates/gliff-proto" }
 gliff-transport = { path = "crates/gliff-transport" }
+gliff-client = { path = "crates/gliff-client" }
 hypr-ipc = { path = "crates/hypr-ipc" }
 hypr-wl = { path = "crates/hypr-wl" }
 hypr-capture = { path = "crates/hypr-capture" }

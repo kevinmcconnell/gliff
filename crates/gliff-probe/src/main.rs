@@ -63,6 +63,10 @@ enum Cmd {
         /// restore it, to exercise the live rate-control update.
         #[arg(long)]
         adapt: bool,
+        /// Write the coded streams and the decoded frames to this directory,
+        /// as fixtures for other decoders (see `write_dump`).
+        #[arg(long)]
+        dump: Option<PathBuf>,
     },
     /// Capture one frame of an output and write it as PNG
     Capture {
@@ -138,7 +142,19 @@ fn main() -> Result<()> {
             single,
             bitrate,
             adapt,
-        } => roundtrip(&node, width, height, frames, !single, bitrate, adapt)?,
+            dump,
+        } => roundtrip(
+            &node,
+            &Roundtrip {
+                width,
+                height,
+                frames,
+                dual: !single,
+                bitrate,
+                adapt,
+                dump,
+            },
+        )?,
         Cmd::Capture {
             output,
             png,
@@ -158,7 +174,7 @@ fn main() -> Result<()> {
             outputs(&target)?;
             permissions(&target)?;
             vulkan_info(&node)?;
-            roundtrip(&node, 640, 360, 10, true, None, false)?;
+            roundtrip(&node, &Roundtrip::default())?;
         }
     }
     Ok(())
@@ -624,15 +640,46 @@ fn synthetic_bgra(w: usize, h: usize, t: usize) -> Vec<u8> {
     out
 }
 
-fn roundtrip(
-    node: &std::path::Path,
+/// Options for [`roundtrip`]; the default is the quick check `all` runs.
+struct Roundtrip {
     width: u32,
     height: u32,
     frames: usize,
     dual: bool,
     bitrate: Option<u32>,
     adapt: bool,
-) -> Result<()> {
+    dump: Option<PathBuf>,
+}
+
+impl Default for Roundtrip {
+    fn default() -> Self {
+        Self {
+            width: 640,
+            height: 360,
+            frames: 10,
+            dual: true,
+            bitrate: None,
+            adapt: false,
+            dump: None,
+        }
+    }
+}
+
+fn roundtrip(node: &std::path::Path, opts: &Roundtrip) -> Result<()> {
+    let &Roundtrip {
+        width,
+        height,
+        frames,
+        dual,
+        bitrate,
+        adapt,
+        ..
+    } = opts;
+    let mut dump = opts
+        .dump
+        .as_deref()
+        .map(|dir| Dump::create(dir, width, height, dual))
+        .transpose()?;
     let gpu = Gpu::open(Some(node))?;
     println!("  {} ({}) dual={dual}", gpu.name, gpu.driver);
     let bitrate = bitrate.unwrap_or(4 * EncoderSettings::default_bitrate(width, height, 60));
@@ -677,6 +724,9 @@ fn roundtrip(
         }
         if force && !packet.keyframe {
             bail!("forced keyframe was not honoured");
+        }
+        if let Some(d) = dump.as_mut() {
+            d.frame(i, &packet.main, aux, packet.keyframe, out.as_deref())?;
         }
         let Some(out) = out else {
             println!("  frame {i}: no output");
@@ -731,6 +781,69 @@ fn roundtrip(
         bail!("vulkan round-trip failed");
     }
     Ok(())
+}
+
+/// Fixtures for checking another decoder against ours, written by
+/// `roundtrip --dump`. In the directory:
+///
+/// - `meta.txt`: `width height dual frames`, one line.
+/// - `main.h264`, `aux.h264`: every frame's Annex B access unit, concatenated
+///   (`aux.h264` is empty for a single stream).
+/// - `frames.txt`: one line per frame, `main_len aux_len keyframe`.
+/// - `out<i>.bgra`: the frame our Vulkan decoder and recombine produced,
+///   tightly packed BGRX. H.264 decoding is bit-exact, so another decoder
+///   plus a correct recombine should match it to within rounding.
+struct Dump {
+    dir: PathBuf,
+    main: std::fs::File,
+    aux: std::fs::File,
+    frames: std::fs::File,
+    meta: String,
+    count: usize,
+}
+
+impl Dump {
+    fn create(dir: &std::path::Path, width: u32, height: u32, dual: bool) -> Result<Self> {
+        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+        let file = |name: &str| std::fs::File::create(dir.join(name));
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            main: file("main.h264")?,
+            aux: file("aux.h264")?,
+            frames: file("frames.txt")?,
+            meta: format!("{width} {height} {}", dual as u8),
+            count: 0,
+        })
+    }
+
+    fn frame(
+        &mut self,
+        i: usize,
+        main: &[u8],
+        aux: &[u8],
+        keyframe: bool,
+        out: Option<&[u8]>,
+    ) -> Result<()> {
+        use std::io::Write;
+        self.main.write_all(main)?;
+        self.aux.write_all(aux)?;
+        writeln!(
+            self.frames,
+            "{} {} {}",
+            main.len(),
+            aux.len(),
+            keyframe as u8
+        )?;
+        if let Some(out) = out {
+            std::fs::write(self.dir.join(format!("out{i}.bgra")), out)?;
+        }
+        self.count += 1;
+        std::fs::write(
+            self.dir.join("meta.txt"),
+            format!("{} {}\n", self.meta, self.count),
+        )?;
+        Ok(())
+    }
 }
 
 /// Capture one frame and push it through the exact server and client

@@ -38,13 +38,15 @@ video, cursor and pongs flow server→client.
 |---|---|---|
 | `gliff-proto` | wire messages, framing header, CPU reference for colour and the AVC444 split/recombine | none |
 | `gliff-transport` | `Framed` length-prefixed IO with out-of-band payloads (`write_vectored`), ssh spawn | none |
+| `gliff-client` | the platform-neutral client session: handshake, ack pacing, clipboard, stats; decode is a `Sink` the front end supplies | none |
+| `gliff-ffi` | `gliff-client` as a C static library with a cbindgen header, for the macOS app | yes: the C ABI |
 | `hypr-ipc` | Hyprland control socket (instance discovery, outputs, options) | none |
 | `hypr-wl` | shared Wayland plumbing (connect, globals, output/seat tracking, calloop runner) | none |
 | `hypr-capture` | output + cursor capture into GBM dmabufs on a calloop thread | none |
 | `hypr-input` | virtual keyboard (xkb state) + virtual pointer + text clipboard on calloop threads | none |
 | `gliff-vk` | Vulkan device, dmabuf import/export, split/recombine compute, H.264 encode/decode, header parser | **yes, isolated here** |
 | `gliff-server` | ties capture+input+encoder to the protocol; `--stdio`/`--listen` | none |
-| `gliff` | GTK4/libadwaita UI, decode worker | one block: hands GTK a dmabuf fd |
+| `gliff` | GTK4/libadwaita UI, Vulkan decode sink | one block: hands GTK a dmabuf fd |
 | `gliff-probe` | environment checks and the headless test client | none |
 
 `gliff-vk` wraps `ash`, whose every call is `unsafe` because Vulkan is a C API
@@ -120,6 +122,18 @@ round-trip.
   `gtk::Picture`. GTK imports the dmabuf itself (through its GL/Vulkan renderer
   or, failing that, a CPU map), so the client needs no GL code and no fallback
   path of its own.
+
+- **macOS client.** `macos/` is a Swift package over `gliff-ffi`. The
+  Rust session runs on its own thread and calls back into Swift to decode
+  each frame, so the ack still follows the real decode time. VideoToolbox
+  decodes the two streams in parallel into IOSurface-backed NV12 buffers
+  that Metal reads without a copy; `Recombiner` is `recombine.comp` in
+  Metal Shading Language (without the `.bgr` swizzle, since Metal's
+  `bgra8Unorm` stores logical RGBA), and matches the Vulkan output to
+  within one step per sample. A `CAMetalLayer` view draws the latest frame
+  letterboxed. The Mac cannot produce xkb keymap text, so it sends its
+  layout as `rmlvo:` names and the server compiles the keymap (protocol
+  version 3).
 
 - **Theme.** `theme.rs` reads Omarchy 4's `colors.toml` with the same lenient
   line parser and fallback chain as `omarchy-theme-color`, and emits a `:root`

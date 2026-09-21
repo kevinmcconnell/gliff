@@ -7,6 +7,8 @@
 #   2. gliff-probe pipeline: capture one frame and run the whole GPU 4:4:4 path
 #   3. server --listen --headless  + serve-test client  (Dual420 4:4:4)
 #   4. server --listen --headless --low-bandwidth + serve-test (Single420)
+#   5. clipboard both directions
+#   6. the GTK client itself: connect, first frame, resize to its window
 #
 # Exits non-zero on the first failure.
 set -uo pipefail
@@ -43,6 +45,7 @@ sleep 6
 NEST_SIG=$(comm -13 <(echo "$before" | sort) <(ls "$XDG_RUNTIME_DIR/hypr" | sort) | head -1)
 [ -n "$NEST_SIG" ] || fail "nested Hyprland did not start"
 export HYPRLAND_INSTANCE_SIGNATURE="$NEST_SIG"
+PARENT_WAYLAND=$WAYLAND_DISPLAY
 export WAYLAND_DISPLAY=$(sed -n 2p "$XDG_RUNTIME_DIR/hypr/$NEST_SIG/hyprland.lock")
 echo "   nested sig $NEST_SIG on $WAYLAND_DISPLAY"
 
@@ -101,5 +104,17 @@ grep -q "CLIP-RECV: e2e-clip-in" "$clipf" || fail "compositor->client clipboard 
 [ "$pasted" = "e2e-clip-out" ] || fail "client->compositor clipboard (got: $pasted)"
 rm -f "$clipf"
 echo "   clipboard both directions PASS"
+
+echo "== 6. GTK client =="
+"$SERVER" --listen 127.0.0.1:9043 --headless --instance "$NEST_SIG" >/tmp/gliff-e2e-server.log 2>&1 &
+gsp=$!; PIDS+=("$gsp"); sleep 2
+damage & gdp=$!; PIDS+=("$gdp")
+gtklog=$(mktemp)
+WAYLAND_DISPLAY="$PARENT_WAYLAND" RUST_LOG=info timeout 8 target/release/gliff --connect 127.0.0.1:9043 >"$gtklog" 2>&1
+kill "$gdp" "$gsp" 2>/dev/null
+grep -q "first frame decoded" "$gtklog" || fail "GTK client decoded no frame ($(tail -1 "$gtklog"))"
+[ "$(grep -c "stream configured" "$gtklog")" -ge 2 ] || fail "GTK client did not resize the headless output"
+rm -f "$gtklog"
+echo "   GTK client PASS"
 
 echo "E2E PASS: all checks passed"
