@@ -159,6 +159,7 @@ where
         output,
         stream,
         encoder_max,
+        client_extent: (caps.max_width, caps.max_height),
         caps,
         bitrate_ctl,
         codec,
@@ -308,6 +309,9 @@ struct Session {
     /// The largest size the encoder accepts.
     encoder_max: (u32, u32),
     caps: ClientCaps,
+    /// The client's last reported window size, so a mirrored output that
+    /// changes mode can be refitted to the window.
+    client_extent: (u32, u32),
     bitrate_ctl: BitrateController,
     codec: Codec,
     chroma: ChromaMode,
@@ -422,6 +426,7 @@ impl Session {
         if width < 320 || height < 240 {
             return Ok(());
         }
+        self.client_extent = (width, height);
         if !self.output.is_headless() {
             return self.fit_mirror(width, height);
         }
@@ -573,6 +578,30 @@ impl Session {
     fn on_capture(&mut self, ev: Option<Incoming>) -> Result<ControlFlow<()>> {
         match ev {
             Some(Incoming::Frame(image)) => {
+                let size = (image.buffer.info.width & !1, image.buffer.info.height & !1);
+                if !self.output.is_headless() && size != (self.output.width, self.output.height) {
+                    self.output.width = size.0;
+                    self.output.height = size.1;
+                    if let Some(monitor) = self
+                        .instance
+                        .monitors()?
+                        .iter()
+                        .find(|m| m.name == self.output.name)
+                    {
+                        self.output.scale = monitor.scale;
+                    }
+                    self.inject(self.output.logical_extent());
+                    let previous_stream = self.stream;
+                    self.fit_mirror(self.client_extent.0, self.client_extent.1)?;
+                    if self.stream == previous_stream {
+                        self.writer.send(
+                            stream_config(self.codec, self.chroma, &self.output, self.stream),
+                            Vec::new(),
+                        );
+                        self.want_keyframe = true;
+                    }
+                    tracing::info!(width = size.0, height = size.1, "mirrored output resized");
+                }
                 self.pending = Some(image);
                 self.capture_asked = false;
                 self.blocked_noted = false;
