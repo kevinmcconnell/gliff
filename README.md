@@ -114,6 +114,32 @@ cargo fmt --all --check    # formatting (rustfmt defaults)
 and asserts the probe checks, the 4:4:4 capture pipeline, and both Dual420 and
 Single420 server-plus-client streams.
 
+For an interactive test over a simulated poor network:
+
+```
+./scripts/network-test.sh slow
+./scripts/network-test.sh lossy
+./scripts/network-test.sh bad
+```
+
+The launcher builds the release client and server, opens a nested Hyprland
+desktop with a terminal, and connects gliff using direct TCP. `slow` adds a
+5 Mbit/s shared rate limit and roughly 100 ms RTT with jitter; `lossy` adds
+3% random packet loss in each direction and roughly 20 ms RTT; `bad` combines
+the slow profile with 3% loss. Queueing and retransmissions add further delay.
+
+Requires `sudo`, `iproute2`, `ethtool`, `util-linux`, `dbus`, and one of `foot`,
+`kitty`, or `alacritty`. Run as your normal user inside Wayland. Only network
+setup runs as root; the desktop, server, and client run as your user. A private
+network namespace isolates the test from normal traffic; applications inside
+it have no external network access. This exercises TCP, not SSH buffering.
+
+Use Super+Return to open another nested terminal and Shift+Esc to release
+gliff's input capture. Closing gliff or pressing Ctrl-C stops the test and
+removes its network namespace once its processes exit. Logs remain in the
+printed `/tmp/gliff-network.*` directory. Loopback netem is useful for
+interactive comparisons, but is not a precise model of a physical network.
+
 ## Layout
 
 - `crates/gliff-proto` wire types, framing, and the CPU reference for colour
