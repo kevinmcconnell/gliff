@@ -91,4 +91,12 @@ impl FramePaintable {
         }
         self.invalidate_contents();
     }
+
+    /// Show nothing, as when no machine is connected.
+    pub fn clear(&self) {
+        if self.imp().texture.borrow_mut().take().is_some() {
+            self.invalidate_size();
+            self.invalidate_contents();
+        }
+    }
 }

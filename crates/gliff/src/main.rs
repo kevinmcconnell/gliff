@@ -8,11 +8,13 @@
 mod keymap;
 mod net;
 mod paintable;
+mod recent;
 mod theme;
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use std::os::fd::AsRawFd;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::mpsc::{channel, sync_channel, Receiver};
 use std::time::{Duration, Instant};
@@ -27,15 +29,18 @@ use gtk::glib;
 use gtk4 as gtk;
 use libadwaita as adw;
 use net::{Endpoint, Status, Worker};
+use recent::Config;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
 /// A message plus optional trailing payload, sent from the UI to the worker.
 type OutSender = UnboundedSender<(ClientMsg, Vec<u8>)>;
 
-#[derive(Parser)]
+#[derive(Parser, Clone)]
 #[command(name = "gliff", about = "Remote-desktop a Hyprland session over ssh")]
 struct Cli {
-    /// `user@host` to ssh to and spawn gliff-server, or empty to type it in.
+    /// `user@host` to ssh to and spawn gliff-server. Without it the window
+    /// opens with the address bar focused, offering the machines used most
+    /// recently.
     host: Option<String>,
     /// Dev: connect directly to a `gliff-server --listen` address.
     #[arg(long)]
@@ -61,12 +66,20 @@ struct Cli {
 
 /// Everything the UI shares with its callbacks.
 struct App {
+    window: adw::ApplicationWindow,
     /// The picture, upcast; input controllers attach to it and we measure it.
     video: gtk::Widget,
     /// What the picture shows: the latest frame at 1:1 device pixels.
     frame: paintable::FramePaintable,
     stats: gtk::Label,
     status: gtk::Label,
+    /// The address bar: shows the current machine; Enter connects to what
+    /// was typed instead.
+    entry: gtk::Entry,
+    /// Drops below the address bar with the recent machines while it has
+    /// focus.
+    recent_popover: gtk::Popover,
+    recent_list: gtk::ListBox,
     /// Size of the stream the server is sending, from the last StreamConfig.
     stream_size: Cell<(u32, u32)>,
     /// The remote output's scale: pointer coordinates go in physical / scale.
@@ -85,8 +98,18 @@ struct App {
     endpoint: RefCell<Option<Endpoint>>,
     /// Consecutive failed connection attempts, reset on a successful connect.
     retries: Cell<u32>,
-    /// Watches the Omarchy theme directory; dropping it stops theme updates.
-    _theme_monitor: Option<gtk::gio::FileMonitor>,
+    /// Bumped by every `start_session`, so pollers and delayed reconnects of
+    /// an earlier session can tell they are stale.
+    session: Cell<u64>,
+    /// Connects to the address bar's machine; turns into a Reconnect button
+    /// once automatic reconnects have given up.
+    connect_btn: gtk::Button,
+    /// The `user@host` in the address bar, recorded in the recent list on
+    /// the first successful connect; `None` for a dev `--connect` session.
+    machine: RefCell<Option<String>>,
+    remembered: Cell<bool>,
+    config_path: PathBuf,
+    cli: Cli,
 }
 
 fn main() -> glib::ExitCode {
@@ -97,28 +120,74 @@ fn main() -> glib::ExitCode {
     let app = adw::Application::builder()
         .application_id("com.gliff.Client")
         .build();
+    // The theme is per display, so it is set up once. The monitor lives in
+    // this closure for the app's lifetime; dropping it would stop theme
+    // updates.
+    let theme_monitor = RefCell::new(None);
+    app.connect_startup(move |_| {
+        *theme_monitor.borrow_mut() = theme::follow_omarchy_theme();
+    });
     app.connect_activate(move |app| build_ui(app, &cli));
     // GTK owns argv parsing; we already parsed with clap, so pass none.
     let empty: Vec<String> = vec![];
     app.run_with_args(&empty)
 }
 
+/// The endpoint named on the command line, if any.
+fn endpoint_from_cli(cli: &Cli) -> Option<Endpoint> {
+    if let Some(addr) = &cli.connect {
+        return Some(Endpoint::Tcp(addr.clone()));
+    }
+    cli.host.as_deref().map(|host| ssh_endpoint(cli, host))
+}
+
+fn ssh_endpoint(cli: &Cli, host: &str) -> Endpoint {
+    let mut t = SshTarget::new(host.to_string());
+    t.server_bin = cli.server_bin.clone();
+    t.server_args = match (&cli.output, cli.headless) {
+        (Some(name), _) => vec!["--output".into(), name.clone()],
+        (None, true) => vec!["--headless".into()],
+        (None, false) => vec!["--output".into(), "auto".into()],
+    };
+    Endpoint::Ssh(t)
+}
+
+/// What the address bar shows for an endpoint.
+fn machine_name(endpoint: &Endpoint) -> &str {
+    match endpoint {
+        Endpoint::Ssh(t) => t.host.as_str(),
+        Endpoint::Tcp(addr) => addr.as_str(),
+    }
+}
+
+/// Title in the `Document — App` form used by GNOME apps, so the machine
+/// is what a task switcher shows first.
+fn window_title(endpoint: &Endpoint) -> String {
+    format!("{} — Gliff", machine_name(endpoint))
+}
+
+/// The one window: a header with the machine address bar, the remote
+/// screen (black until connected), and a status line.
 fn build_ui(app: &adw::Application, cli: &Cli) {
     let window = adw::ApplicationWindow::builder()
         .application(app)
+        .title("Gliff")
         .default_width(1280)
         .default_height(760)
         .build();
 
-    let header = adw::HeaderBar::new();
-    let host_entry = gtk::Entry::builder()
+    let header = adw::HeaderBar::builder().show_title(false).build();
+    let entry = gtk::Entry::builder()
         .placeholder_text("user@host")
-        .hexpand(true)
+        .width_chars(32)
         .build();
-    if let Some(h) = &cli.host {
-        host_entry.set_text(h);
-    }
-    let connect_btn = gtk::Button::with_label("Connect");
+    let connect_btn = gtk::Button::builder()
+        .icon_name(CONNECT_ICON)
+        .tooltip_text("Connect")
+        .build();
+    let address_bar = gtk::Box::builder().css_classes(["linked"]).build();
+    address_bar.append(&entry);
+    address_bar.append(&connect_btn);
     let fullscreen_btn = gtk::ToggleButton::builder()
         .icon_name("view-fullscreen-symbolic")
         .build();
@@ -126,10 +195,22 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         .icon_name("utilities-system-monitor-symbolic")
         .tooltip_text("Show stats")
         .build();
-    header.pack_start(&host_entry);
-    header.pack_start(&connect_btn);
+    header.pack_start(&address_bar);
     header.pack_end(&fullscreen_btn);
     header.pack_end(&stats_btn);
+
+    // The recent machines drop below the address bar while it has focus.
+    let recent_list = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .css_classes(["boxed-list"])
+        .build();
+    let recent_popover = gtk::Popover::builder()
+        .child(&recent_list)
+        .autohide(false)
+        .has_arrow(false)
+        .position(gtk::PositionType::Bottom)
+        .build();
+    recent_popover.set_parent(&entry);
 
     let stats = gtk::Label::builder()
         .halign(gtk::Align::Start)
@@ -149,6 +230,7 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         .vexpand(true)
         .can_shrink(true)
         .content_fit(gtk::ContentFit::ScaleDown)
+        .css_classes(["video"])
         .build();
     let frame = paintable::FramePaintable::default();
     picture.set_paintable(Some(&frame));
@@ -165,10 +247,14 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
     window.set_content(Some(&content));
 
     let ui = Rc::new(App {
+        window: window.clone(),
         video: video.clone(),
         frame,
         stats: stats.clone(),
         status: status.clone(),
+        entry: entry.clone(),
+        recent_popover: recent_popover.clone(),
+        recent_list: recent_list.clone(),
         stream_size: Cell::new((0, 0)),
         stream_scale: Cell::new(1.0),
         view_size: Cell::new((0, 0)),
@@ -177,8 +263,13 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         pressed_keys: RefCell::new(BTreeSet::new()),
         endpoint: RefCell::new(None),
         retries: Cell::new(0),
+        session: Cell::new(0),
         last_remote_clip: RefCell::new(None),
-        _theme_monitor: theme::follow_omarchy_theme(),
+        connect_btn: connect_btn.clone(),
+        machine: RefCell::new(None),
+        remembered: Cell::new(false),
+        config_path: Config::default_path(),
+        cli: cli.clone(),
     });
 
     let hotkey = ReleaseHotkey::parse(&cli.release_hotkey).unwrap_or_else(|e| {
@@ -187,6 +278,7 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
     });
     install_input_handlers(&ui, &video, &window, hotkey);
     install_resize_handler(&ui);
+    install_address_bar(&ui);
 
     // Fullscreen toggle.
     {
@@ -200,39 +292,11 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         });
     }
 
-    // Connect button.
-    {
-        let ui = ui.clone();
-        let host_entry = host_entry.clone();
-        let connect = cli.connect.clone();
-        let server_bin = cli.server_bin.clone();
-        let server_args: Vec<String> = match (&cli.output, cli.headless) {
-            (Some(name), _) => vec!["--output".into(), name.clone()],
-            (None, true) => vec!["--headless".into()],
-            (None, false) => vec!["--output".into(), "auto".into()],
-        };
-        connect_btn.connect_clicked(move |_| {
-            let endpoint = match &connect {
-                Some(addr) => Endpoint::Tcp(addr.clone()),
-                None => {
-                    let host = host_entry.text().to_string();
-                    if host.is_empty() {
-                        ui.status.set_text("Enter a host first");
-                        return;
-                    }
-                    let mut t = SshTarget::new(host);
-                    t.server_bin = server_bin.clone();
-                    t.server_args = server_args.clone();
-                    Endpoint::Ssh(t)
-                }
-            };
-            ui.retries.set(0);
-            start_session(ui.clone(), endpoint);
-        });
-    }
-
     let css = gtk::CssProvider::new();
-    css.load_from_string(".stats { background: rgba(0,0,0,0.6); color: #fff; padding: 6px; margin: 6px; border-radius: 6px; font-family: monospace; }");
+    css.load_from_string(
+        ".video { background: #000; } \
+         .stats { background: rgba(0,0,0,0.6); color: #fff; padding: 6px; margin: 6px; border-radius: 6px; font-family: monospace; }",
+    );
     if let Some(display) = gdk::Display::default() {
         gtk::style_context_add_provider_for_display(
             &display,
@@ -278,19 +342,203 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
     }
 
     window.present();
-
-    // Auto-connect when an endpoint was given on the command line.
-    if cli.connect.is_some() || cli.host.is_some() {
-        connect_btn.emit_clicked();
+    match endpoint_from_cli(cli) {
+        Some(endpoint) => connect_to(&ui, endpoint),
+        None => {
+            entry.grab_focus();
+        }
     }
 }
 
+const CONNECT_ICON: &str = "go-next-symbolic";
+const RECONNECT_ICON: &str = "view-refresh-symbolic";
+
+/// Wire the address bar: Enter connects to what was typed, Escape gives up
+/// the edit, and the recent machines drop down while it has focus.
+fn install_address_bar(ui: &Rc<App>) {
+    {
+        let ui = ui.clone();
+        ui.entry
+            .clone()
+            .connect_activate(move |_| connect_from_address_bar(&ui));
+    }
+    {
+        let ui = ui.clone();
+        ui.connect_btn
+            .clone()
+            .connect_clicked(move |_| connect_from_address_bar(&ui));
+    }
+    // The window may become active with the address bar already focused,
+    // as a bare `gliff` does, so the drop-down follows activation too.
+    {
+        let ui = ui.clone();
+        ui.window.clone().connect_is_active_notify(move |w| {
+            if !w.is_active() {
+                ui.recent_popover.popdown();
+                return;
+            }
+            let ui = ui.clone();
+            glib::idle_add_local_once(move || {
+                let in_entry = gtk::prelude::GtkWindowExt::focus(&ui.window)
+                    .is_some_and(|f| f.is_ancestor(&ui.entry));
+                if in_entry {
+                    show_recents(&ui);
+                }
+            });
+        });
+    }
+    {
+        let ui = ui.clone();
+        ui.recent_list.clone().connect_row_activated(move |_, row| {
+            if let Some(row) = row.downcast_ref::<adw::ActionRow>() {
+                connect_to(&ui, ssh_endpoint(&ui.cli, &row.title()));
+            }
+        });
+    }
+
+    let focus = gtk::EventControllerFocus::new();
+    {
+        let ui = ui.clone();
+        focus.connect_enter(move |_| show_recents(&ui));
+    }
+    {
+        let ui = ui.clone();
+        // Focus may be moving into the drop-down itself (a click on a row, or
+        // the Down key), so decide once the new focus is known.
+        focus.connect_leave(move |_| {
+            let ui = ui.clone();
+            glib::idle_add_local_once(move || {
+                let in_popover = gtk::prelude::GtkWindowExt::focus(&ui.window)
+                    .is_some_and(|w| w.is_ancestor(&ui.recent_popover));
+                if !in_popover {
+                    ui.recent_popover.popdown();
+                }
+            });
+        });
+    }
+    ui.entry.add_controller(focus);
+
+    let keys = gtk::EventControllerKey::new();
+    {
+        let ui = ui.clone();
+        keys.connect_key_pressed(move |_, keyval, _, _| match keyval {
+            gdk::Key::Escape => {
+                cancel_address_edit(&ui);
+                glib::Propagation::Stop
+            }
+            gdk::Key::Down if ui.recent_popover.is_visible() => {
+                ui.recent_list.child_focus(gtk::DirectionType::Down);
+                glib::Propagation::Stop
+            }
+            _ => glib::Propagation::Proceed,
+        });
+    }
+    ui.entry.add_controller(keys);
+
+    let list_keys = gtk::EventControllerKey::new();
+    {
+        let ui = ui.clone();
+        list_keys.connect_key_pressed(move |_, keyval, _, _| {
+            if keyval == gdk::Key::Escape {
+                cancel_address_edit(&ui);
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+    }
+    ui.recent_list.add_controller(list_keys);
+}
+
+/// Connect to the machine in the address bar. The current machine's own
+/// endpoint is reused, so this also serves as Reconnect.
+fn connect_from_address_bar(ui: &Rc<App>) {
+    let machine = ui.entry.text().trim().to_string();
+    if machine.is_empty() {
+        return;
+    }
+    let current = ui.endpoint.borrow().clone();
+    let endpoint = match current {
+        Some(endpoint) if machine_name(&endpoint) == machine => endpoint,
+        _ => ssh_endpoint(&ui.cli, &machine),
+    };
+    connect_to(ui, endpoint);
+}
+
+/// Fill the drop-down with the recent machines and show it under the
+/// address bar, unless there are none. Popping up under a window the
+/// compositor has not shown yet stalls GDK, so until the window is active
+/// this does nothing and `install_address_bar` retries on activation.
+fn show_recents(ui: &App) {
+    while let Some(row) = ui.recent_list.first_child() {
+        ui.recent_list.remove(&row);
+    }
+    let recent = Config::load(&ui.config_path).recent;
+    if recent.is_empty() || !ui.window.is_active() {
+        ui.recent_popover.popdown();
+        return;
+    }
+    for machine in &recent {
+        let row = adw::ActionRow::builder()
+            .title(machine)
+            .activatable(true)
+            .build();
+        ui.recent_list.append(&row);
+    }
+    ui.recent_popover.set_size_request(ui.entry.width(), -1);
+    ui.recent_popover.popup();
+}
+
+/// Put the address bar back to the current machine and, when there is
+/// one, hand focus back to the remote screen.
+fn cancel_address_edit(ui: &App) {
+    let current = ui.endpoint.borrow().clone();
+    ui.entry.set_text(current.as_ref().map_or("", machine_name));
+    ui.recent_popover.popdown();
+    if current.is_some() {
+        ui.video.grab_focus();
+    } else {
+        ui.entry.grab_focus();
+    }
+}
+
+/// Make `endpoint` the window's machine and connect to it, dropping any
+/// session in progress.
+fn connect_to(ui: &Rc<App>, endpoint: Endpoint) {
+    let name = machine_name(&endpoint).to_string();
+    ui.entry.set_text(&name);
+    ui.window.set_title(Some(&window_title(&endpoint)));
+    *ui.machine.borrow_mut() = match &endpoint {
+        Endpoint::Ssh(_) => Some(name),
+        Endpoint::Tcp(_) => None,
+    };
+    ui.remembered.set(false);
+    ui.retries.set(0);
+    ui.connect_btn.set_icon_name(CONNECT_ICON);
+    ui.connect_btn.set_tooltip_text(Some("Connect"));
+    show_disconnected(ui);
+    ui.video.grab_focus();
+    start_session(ui.clone(), endpoint);
+}
+
+/// Go back to a black screen with no stream geometry.
+fn show_disconnected(ui: &App) {
+    ui.frame.clear();
+    ui.stream_size.set((0, 0));
+    ui.stats.set_text("");
+    ui.video.set_cursor(None);
+}
+
+/// Start a worker for `endpoint`. Each call is a new session generation;
+/// pollers and reconnects from an older generation stop themselves.
 fn start_session(ui: Rc<App>, endpoint: Endpoint) {
     let (frame_tx, frame_rx) = sync_channel::<DisplayFrame>(2);
     let (status_tx, status_rx) = channel::<Status>();
     let (input_tx, input_rx) = unbounded_channel::<(ClientMsg, Vec<u8>)>();
+    // Replacing the sender closes the old worker's input, which ends it.
     *ui.input_tx.borrow_mut() = Some(input_tx);
     *ui.endpoint.borrow_mut() = Some(endpoint.clone());
+    let session = ui.session.get() + 1;
+    ui.session.set(session);
     ui.status.set_text("Connecting…");
 
     std::thread::Builder::new()
@@ -306,18 +554,38 @@ fn start_session(ui: Rc<App>, endpoint: Endpoint) {
         })
         .expect("spawn network thread");
 
-    poll_frames(ui.clone(), frame_rx);
-    poll_status(ui, status_rx);
+    poll_frames(ui.clone(), frame_rx, session);
+    poll_status(ui, status_rx, session);
 }
 
 const MAX_RETRIES: u32 = 5;
 
+/// Put this window's machine at the top of the recent list, once per
+/// session. The connected status repeats on every stream reconfigure, such
+/// as a resize.
+fn remember_machine(ui: &App) {
+    let Some(machine) = ui.machine.borrow().clone() else {
+        return;
+    };
+    if ui.remembered.replace(true) {
+        return;
+    }
+    let mut config = Config::load(&ui.config_path);
+    config.touch(&machine);
+    if let Err(e) = config.save(&ui.config_path) {
+        tracing::warn!(path = %ui.config_path.display(), error = %e, "cannot save config");
+    }
+}
+
 /// Schedule a reconnect after a short delay, unless we have exhausted retries.
-fn schedule_reconnect(ui: Rc<App>) {
+fn schedule_reconnect(ui: Rc<App>, session: u64) {
     let n = ui.retries.get() + 1;
     ui.retries.set(n);
     if n > MAX_RETRIES {
-        ui.status.set_text("Disconnected — press Connect to retry");
+        ui.status
+            .set_text("Disconnected — press Reconnect to retry");
+        ui.connect_btn.set_icon_name(RECONNECT_ICON);
+        ui.connect_btn.set_tooltip_text(Some("Reconnect"));
         return;
     }
     let Some(endpoint) = ui.endpoint.borrow().clone() else {
@@ -326,13 +594,18 @@ fn schedule_reconnect(ui: Rc<App>) {
     ui.status.set_text(&format!("Reconnecting… (attempt {n})"));
     let ui2 = ui.clone();
     glib::timeout_add_local_once(Duration::from_millis(1500), move || {
-        start_session(ui2, endpoint);
+        if ui2.session.get() == session {
+            start_session(ui2, endpoint);
+        }
     });
 }
 
 /// Pull decoded frames on the GTK main loop, latest-wins, and paint them.
-fn poll_frames(ui: Rc<App>, rx: Receiver<DisplayFrame>) {
+fn poll_frames(ui: Rc<App>, rx: Receiver<DisplayFrame>, session: u64) {
     glib::timeout_add_local(Duration::from_millis(8), move || {
+        if ui.session.get() != session {
+            return glib::ControlFlow::Break;
+        }
         let mut latest = None;
         loop {
             match rx.try_recv() {
@@ -381,8 +654,11 @@ fn dmabuf_texture(f: DisplayFrame) -> Result<gdk::Texture, glib::Error> {
     }
 }
 
-fn poll_status(ui: Rc<App>, rx: Receiver<Status>) {
+fn poll_status(ui: Rc<App>, rx: Receiver<Status>, session: u64) {
     glib::timeout_add_local(Duration::from_millis(100), move || {
+        if ui.session.get() != session {
+            return glib::ControlFlow::Break;
+        }
         while let Ok(s) = rx.try_recv() {
             match s {
                 Status::Connected {
@@ -395,6 +671,7 @@ fn poll_status(ui: Rc<App>, rx: Receiver<Status>) {
                     ui.resize_requested.set((0, 0));
                     ui.retries.set(0);
                     ui.status.set_text(&format!("Connected — {width}x{height}"));
+                    remember_machine(&ui);
                     // A fresh server starts at its own default size; a
                     // reconnect must bring it back to the window.
                     request_resize(&ui);
@@ -424,11 +701,13 @@ fn poll_status(ui: Rc<App>, rx: Receiver<Status>) {
                 Status::Error(e) => {
                     tracing::error!(error = %e, "connection failed");
                     ui.status.set_text(&format!("Error: {e}"));
-                    schedule_reconnect(ui.clone());
+                    show_disconnected(&ui);
+                    schedule_reconnect(ui.clone(), session);
                     return glib::ControlFlow::Break;
                 }
                 Status::Closed => {
-                    schedule_reconnect(ui.clone());
+                    show_disconnected(&ui);
+                    schedule_reconnect(ui.clone(), session);
                     return glib::ControlFlow::Break;
                 }
             }

@@ -177,15 +177,19 @@ where
             }
         }
     });
-    // Forward UI input into the same write channel.
+    // Forward UI input into the same write channel. The UI closes its end
+    // when it switches to another machine; `ui_gone` then ends this session
+    // and, with it, the ssh child.
+    let (ui_gone_tx, mut ui_gone) = tokio::sync::oneshot::channel::<()>();
     {
         let out_tx = out_tx.clone();
         tokio::task::spawn_local(async move {
             while let Some(mp) = input.recv().await {
                 if out_tx.send(mp).is_err() {
-                    break;
+                    return;
                 }
             }
+            let _ = ui_gone_tx.send(());
         });
     }
 
@@ -195,7 +199,11 @@ where
     let mut last_report = std::time::Instant::now();
 
     loop {
-        let msg = match reader.read_msg::<ServerMsg>().await {
+        let read = tokio::select! {
+            read = reader.read_msg::<ServerMsg>() => read,
+            _ = &mut ui_gone => return Ok(()),
+        };
+        let msg = match read {
             Ok(m) => m,
             Err(gliff_transport::Error::Closed) => break,
             Err(e) => return Err(e.into()),
