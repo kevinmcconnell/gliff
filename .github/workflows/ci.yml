@@ -40,8 +40,25 @@ jobs:
       - uses: ./.github/actions/setup
       - run: mbx test --workspace --locked
 
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install cbindgen
+        run: brew install cbindgen
+      - run: cargo test --locked -p gliff-proto -p gliff-transport -p gliff-client -p gliff-ffi
+      - run: macos/build.sh test
+      - name: Package
+        run: |
+          cd dist
+          ditto -c -k --keepParent Gliff.app gliff-arm64-macos.zip
+      - uses: actions/upload-artifact@v5
+        with:
+          name: gliff-macos
+          path: dist/gliff-arm64-macos.zip
+
   release:
-    needs: [fmt, clippy, test]
+    needs: [fmt, clippy, test, macos]
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     container: archlinux:base-devel
@@ -62,6 +79,13 @@ jobs:
 
       - run: cargo build --release --locked
 
+      # The macOS job builds the app; this job publishes it with the Linux
+      # binaries, so the two never race over the release.
+      - uses: actions/download-artifact@v5
+        with:
+          name: gliff-macos
+          path: dist-macos
+
       - name: Package
         id: package
         run: |
@@ -76,13 +100,19 @@ jobs:
           cp README.md LICENSE docs/hardware-quirks.md "dist/$name/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+          mac="gliff-$version-arm64-macos.zip"
+          mv dist-macos/gliff-arm64-macos.zip "dist/$mac"
+          (cd dist && sha256sum "$mac" > "$mac.sha256")
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "archive=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "mac=dist/$mac" >> "$GITHUB_OUTPUT"
 
       - name: Write release notes
         run: |
           cat > notes.md <<'NOTES'
-          Prebuilt x86_64 Linux binaries: `gliff` (client), `gliff-server`, `gliff-probe`.
+          Prebuilt x86_64 Linux binaries: `gliff` (client), `gliff-server`, `gliff-probe`,
+          and `Gliff.app`, the macOS client (Apple Silicon, macOS 14+). The app is
+          signed ad hoc, not notarized: open it with right-click > Open the first time.
 
           The binaries are dynamically linked. Runtime requirements:
 
@@ -101,7 +131,9 @@ jobs:
             --generate-notes \
             --notes-file notes.md \
             "${{ steps.package.outputs.archive }}" \
-            "${{ steps.package.outputs.archive }}.sha256"
+            "${{ steps.package.outputs.archive }}.sha256" \
+            "${{ steps.package.outputs.mac }}" \
+            "${{ steps.package.outputs.mac }}.sha256"
 
       - name: Publish rolling latest pre-release
         if: github.ref_type == 'branch'
@@ -115,4 +147,6 @@ jobs:
             --title "Latest build (main)" \
             --notes-file latest-notes.md \
             "${{ steps.package.outputs.archive }}" \
-            "${{ steps.package.outputs.archive }}.sha256"
+            "${{ steps.package.outputs.archive }}.sha256" \
+            "${{ steps.package.outputs.mac }}" \
+            "${{ steps.package.outputs.mac }}.sha256"

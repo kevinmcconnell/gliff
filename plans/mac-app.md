@@ -14,8 +14,34 @@ The GTK client is three layers. Each has a different fate on macOS:
 | Decode and recombine | `gliff-vk`: Vulkan Video H.264 decode, `recombine.comp` | **Replace.** MoltenVK has no Vulkan Video. Use VideoToolbox for decode and a Metal port of `recombine.comp`. |
 | Display and input | GTK4 + libadwaita, dmabuf textures, xkb, Wayland shortcut inhibit | **Replace.** AppKit window, `CAMetalLayer`, `NSEvent`, a key-code table, `CGEventTap`. |
 
-The wire protocol needs no change for a working client. One small change
-comes later, for keyboard layouts (phase 7).
+## Status (2026-09-21)
+
+Built and working: `Gliff.app` on nyc-m4 (M4 Mac mini, macOS 15.5)
+connects to nyc-a2 (AMD, Hyprland) over ssh (`gliff-server --stdio`) and
+over the TCP dev path. Checked live:
+- 60 fps Dual420 at 3.4 ms for decode plus recombine, 1080p class
+- mirror mode (scaled to the window) and headless mode (resized to the window)
+- text typed from the Mac arriving in a terminal on the remote
+- the clipboard in both directions
+- the decoded frame and the drawn view, saved as PNGs and checked
+
+Phases 0–7 are done, and phase 8 in part: ad hoc signing and a CI job that
+ships the zip with each release.
+
+Not done, or only checkable by a person at the Mac:
+- Real keyboard and mouse events. The key table, modifier bits and
+  scroll signs are unit-tested, and `--type` drives the same session
+  calls, but no physical key press has been sent. The ISO section/grave
+  swap needs an Apple ISO keyboard to confirm.
+- The system-shortcut event tap: it needs the Accessibility permission,
+  granted by a person.
+- The remote cursor image: Hyprland currently sends only transparent
+  cursor images (see `docs/hardware-quirks.md`), so the arrow shows.
+- Developer ID signing and notarization (open decision 2). Until then,
+  release builds are ad hoc signed.
+
+The only protocol change was for keyboard layouts (phase 7): version 3
+lets `Hello.keymap` carry `rmlvo:` names for the server to compile.
 
 ## Architecture
 
@@ -74,15 +100,16 @@ Each phase ends with something runnable on nyc-m4.
 
 - **Done (2026-09-21).** nyc-m4 is an Apple M4 on macOS 15.5 with
   Homebrew, the Command Line Tools 16.4 (Swift 6.1.2), and `brew install
-  rust cbindgen` (Rust 1.98.1). No full Xcode. Checked there: SwiftPM
+  rustup cbindgen` (Rust 1.98.1). Not Homebrew's `rust`: its standard
+  library is built for macOS 15, which the linker flags for a macOS 14 app. No full Xcode. Checked there: SwiftPM
   builds, Metal compiles shaders at runtime, and VideoToolbox reports
   hardware H.264 and AV1 decode. The Command Line Tools have no XCTest, so
   Swift tests use `swift-testing` (`import Testing`), which works.
 - **Done.** `scripts/mac-build.sh` rsyncs the working tree to
   `nyc-m4:~/src/gliff` and runs a command there. By default it runs the
   portable crates' tests, plus `swift build` and `swift test` once
-  `macos/` exists. It reuses the ssh master at `~/.ssh/cm-nyc-m4`. Still
-  to add: copying `dist/gliff.app.zip` back once there is an app.
+  `macos/` exists. It reuses the ssh master at `~/.ssh/cm-nyc-m4`. The
+  default now builds `dist/Gliff.app` with `macos/build.sh test`.
 - Build with no Xcode project: a SwiftPM package in `macos/` for the app,
   plus a small script that assembles `gliff.app` (Info.plist, binary,
   resources) and signs it ad hoc. Everything then runs headless over ssh,
