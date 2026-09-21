@@ -112,7 +112,8 @@ cargo fmt --all --check    # formatting (rustfmt defaults)
 
 `scripts/e2e.sh` must run inside a Hyprland session; it boots a nested Hyprland
 and asserts the probe checks, the 4:4:4 capture pipeline, and both Dual420 and
-Single420 server-plus-client streams.
+Single420 server-plus-client streams, including continued decoding after a
+mirrored output changes size.
 
 For an interactive test over a simulated poor network:
 

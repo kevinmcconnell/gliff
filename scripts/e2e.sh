@@ -102,4 +102,37 @@ grep -q "CLIP-RECV: e2e-clip-in" "$clipf" || fail "compositor->client clipboard 
 rm -f "$clipf"
 echo "   clipboard both directions PASS"
 
+echo "== 6. mirrored output resize =="
+hyprctl output create headless e2emirror >/dev/null 2>&1
+sleep 1
+mirror=$(hyprctl monitors -j | python3 -c "import sys,json; print(next(m['name'] for m in json.load(sys.stdin) if 'e2emirror' in m['name']))")
+hyprctl keyword monitor "$mirror,1280x800@60,auto,1" >/dev/null 2>&1
+sleep 1
+"$SERVER" --listen 127.0.0.1:9043 --output "$mirror" --instance "$NEST_SIG" >/tmp/gliff-e2e-mirror-server.log 2>&1 &
+msp=$!; PIDS+=("$msp"); sleep 1
+damage & mdp=$!; PIDS+=("$mdp")
+mirror_log=$(mktemp)
+timeout 30 "$PROBE" serve-test --connect 127.0.0.1:9043 --frames 30 >"$mirror_log" 2>&1 &
+mcp=$!; PIDS+=("$mcp")
+wait_for_mirror() {
+    local pattern=$1
+    for ((attempt = 0; attempt < 100; attempt++)); do
+        grep -q "$pattern" "$mirror_log" && return 0
+        kill -0 "$mcp" 2>/dev/null || break
+        sleep 0.1
+    done
+    fail "mirror resize: missing '$pattern' (log: $mirror_log)"
+}
+wait_for_mirror 'first decoded frame ok'
+hyprctl keyword monitor "$mirror,640x480@60,auto,1" >/dev/null 2>&1
+wait_for_mirror 'reconfig to 640x480'
+hyprctl keyword monitor "$mirror,1024x768@60,auto,1" >/dev/null 2>&1
+wait_for_mirror 'reconfig to 800x600'
+wait "$mcp" || fail "mirror resize: probe failed (log: $mirror_log)"
+grep -q '^PASS decoded 30 frames' "$mirror_log" || fail "mirror resize: frames stopped (log: $mirror_log)"
+grep -q '^FAIL' "$mirror_log" && fail "mirror resize: failed assertion (log: $mirror_log)"
+kill "$mdp" "$msp" 2>/dev/null
+hyprctl output remove "$mirror" >/dev/null 2>&1
+echo "   mirrored output resize PASS"
+
 echo "E2E PASS: all checks passed"
