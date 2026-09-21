@@ -111,14 +111,16 @@ cargo fmt --all --check    # formatting (rustfmt defaults)
 ```
 
 `scripts/e2e.sh` must run inside a Hyprland session; it boots a nested Hyprland
-and asserts the probe checks, the 4:4:4 capture pipeline, and both Dual420 and
-Single420 server-plus-client streams.
+and asserts the probe checks, the 4:4:4 capture pipeline, both Dual420 and
+Single420 server-plus-client streams, the clipboard, and the GTK client.
 
 ## Layout
 
 - `crates/gliff-proto` wire types, framing, and the CPU reference for colour
   conversion and the AVC444 4:4:4 split/recombine that the shaders must match.
 - `crates/gliff-transport` framed IO, ssh spawning.
+- `crates/gliff-client` the client session shared by every front end; the
+  platform supplies the decoder.
 - `crates/hypr-ipc`, `crates/hypr-wl` Hyprland IPC and shared Wayland plumbing.
 - `crates/hypr-capture` output + cursor capture into dmabufs.
 - `crates/hypr-input` keyboard and pointer injection.

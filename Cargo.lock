@@ -723,6 +723,7 @@ dependencies = [
  "bytes",
  "clap",
  "drm-fourcc",
+ "gliff-client",
  "gliff-proto",
  "gliff-transport",
  "gliff-vk",
@@ -734,6 +735,18 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "gliff-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "gliff-proto",
+ "gliff-transport",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

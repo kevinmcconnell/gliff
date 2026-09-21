@@ -18,6 +18,7 @@ gtk4.workspace = true
 libadwaita.workspace = true
 gliff-proto.workspace = true
 gliff-transport.workspace = true
+gliff-client.workspace = true
 gliff-vk.workspace = true
 hypr-capture.workspace = true
 bytes.workspace = true

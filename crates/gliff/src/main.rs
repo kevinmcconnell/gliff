@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use adw::prelude::*;
 use clap::Parser;
+use gliff_client::{has_visible_shape, FrameRect};
 use gliff_proto::{Axis, ClientMsg};
 use gliff_transport::SshTarget;
 use gliff_vk::DisplayFrame;
@@ -431,6 +432,7 @@ fn poll_status(ui: Rc<App>, rx: Receiver<Status>) {
                     schedule_reconnect(ui.clone());
                     return glib::ControlFlow::Break;
                 }
+                Status::Log(line) => tracing::info!(target: "gliff::remote", "{line}"),
             }
         }
         glib::ControlFlow::Continue
@@ -463,37 +465,17 @@ fn set_remote_cursor(ui: &App, width: u32, height: u32, hot_x: i32, hot_y: i32, 
     ui.video.set_cursor(Some(&cursor));
 }
 
-fn has_visible_shape(argb: &[u8]) -> bool {
-    let mut pixels = argb.chunks_exact(4);
-    let Some(first) = pixels.next() else {
-        return false;
-    };
-    let opaque = first[3] != 0 || pixels.clone().any(|p| p[3] != 0);
-    let uniform = pixels.all(|p| p == first);
-    opaque && !uniform
-}
-
-/// Map a widget-space point to the remote output's logical coordinates:
-/// undo the letterbox to physical stream pixels, then divide by the remote
-/// scale, which is what the virtual pointer expects.
+/// Map a widget-space point to the remote output's logical coordinates.
 fn to_remote(ui: &App, x: f64, y: f64) -> (f64, f64) {
     let (rw, rh) = ui.stream_size.get();
-    if rw == 0 || rh == 0 {
-        return (0.0, 0.0);
-    }
-    // The frame is drawn at one stream pixel per device pixel, centred, and
-    // only ever shrunk to fit (ScaleDown): its logical size is stream / device
-    // scale, times a fit factor of at most 1.
-    let device = ui.video.scale_factor().max(1) as f64;
-    let (lw, lh) = (rw as f64 / device, rh as f64 / device);
-    let (aw, ah) = (ui.video.width() as f64, ui.video.height() as f64);
-    let fit = (aw / lw).min(ah / lh).min(1.0);
-    let (fw, fh) = (lw * fit, lh * fit);
-    let (ox, oy) = ((aw - fw) / 2.0, (ah - fh) / 2.0);
-    let px = ((x - ox) / fit * device).clamp(0.0, rw as f64);
-    let py = ((y - oy) / fit * device).clamp(0.0, rh as f64);
-    let scale = ui.stream_scale.get().max(0.01) as f64;
-    (px / scale, py / scale)
+    let rect = FrameRect::new(
+        rw,
+        rh,
+        ui.video.scale_factor().max(1) as f64,
+        ui.video.width() as f64,
+        ui.video.height() as f64,
+    );
+    rect.to_remote(x, y, ui.stream_scale.get() as f64)
 }
 
 fn send(ui: &App, msg: ClientMsg) {
@@ -913,17 +895,6 @@ fn evdev_button(n: u32) -> u32 {
 mod tests {
     use super::*;
     use std::cell::RefCell;
-
-    #[test]
-    fn visible_shape_needs_alpha_and_contrast() {
-        let transparent = [0u8; 16];
-        let black = [0, 0, 0, 255].repeat(4);
-        let mut arrow = [0u8; 16];
-        arrow[3] = 255;
-        assert!(!has_visible_shape(&transparent));
-        assert!(!has_visible_shape(&black));
-        assert!(has_visible_shape(&arrow));
-    }
 
     #[test]
     fn parse_chord_and_double_and_none() {

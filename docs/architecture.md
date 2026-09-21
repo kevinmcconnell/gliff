@@ -38,13 +38,14 @@ video, cursor and pongs flow server→client.
 |---|---|---|
 | `gliff-proto` | wire messages, framing header, CPU reference for colour and the AVC444 split/recombine | none |
 | `gliff-transport` | `Framed` length-prefixed IO with out-of-band payloads (`write_vectored`), ssh spawn | none |
+| `gliff-client` | the platform-neutral client session: handshake, ack pacing, clipboard, stats; decode is a `Sink` the front end supplies | none |
 | `hypr-ipc` | Hyprland control socket (instance discovery, outputs, options) | none |
 | `hypr-wl` | shared Wayland plumbing (connect, globals, output/seat tracking, calloop runner) | none |
 | `hypr-capture` | output + cursor capture into GBM dmabufs on a calloop thread | none |
 | `hypr-input` | virtual keyboard (xkb state) + virtual pointer + text clipboard on calloop threads | none |
 | `gliff-vk` | Vulkan device, dmabuf import/export, split/recombine compute, H.264 encode/decode, header parser | **yes, isolated here** |
 | `gliff-server` | ties capture+input+encoder to the protocol; `--stdio`/`--listen` | none |
-| `gliff` | GTK4/libadwaita UI, decode worker | one block: hands GTK a dmabuf fd |
+| `gliff` | GTK4/libadwaita UI, Vulkan decode sink | one block: hands GTK a dmabuf fd |
 | `gliff-probe` | environment checks and the headless test client | none |
 
 `gliff-vk` wraps `ash`, whose every call is `unsafe` because Vulkan is a C API
