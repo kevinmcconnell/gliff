@@ -106,9 +106,12 @@ images arrive.
   `output remove` on a headless output unmaps its layer surfaces, which
   refocuses and re-renders the cursor; `CCursorshareSession::copy()` then
   renders into the vanishing monitor and `beginRender` aborts (SIGABRT, seen
-  twice on 0.56.2; Hyprland restarts in safe mode). The server ends the
-  capture thread, flushes its Wayland connection, and only then removes the
-  headless output.
+  three times on 0.56.2; Hyprland restarts in safe mode). The server ends the
+  capture thread and only then removes the headless output. Ending the
+  thread with a plain flush is not enough: the destroy requests sit in
+  Hyprland's queue while `output remove` arrives on the hyprctl socket, and
+  Hyprland can handle the remove first. The capture thread therefore ends
+  with a roundtrip, which blocks until Hyprland has processed the destroys.
 
 ## Hyprland with the Lua config (Omarchy)
 

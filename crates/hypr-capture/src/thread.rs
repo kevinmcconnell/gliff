@@ -213,7 +213,10 @@ fn run(
         state.emit(CaptureEvent::Error(e.to_string()));
     }
     state.teardown();
-    let _ = state.conn.flush();
+    // A flush only queues the destroy requests; the compositor may still
+    // process a later `output remove` first and crash rendering into the
+    // removed monitor (Hyprland 0.56). Block until it has handled them.
+    let _ = state.conn.roundtrip();
     std::mem::swap(&mut state.sink, sink);
     result
 }
