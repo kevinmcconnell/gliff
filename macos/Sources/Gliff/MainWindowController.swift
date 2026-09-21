@@ -230,6 +230,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, RemoteIn
     private func handle(_ status: SessionStatus) {
         switch status {
         case .connected(let width, let height, let scale):
+            statusLabel.toolTip = nil
             if options.verbose, let window {
                 let visible = window.occlusionState.contains(.visible)
                 FileHandle.standardError.write(Data("gliff: window \(Int(window.frame.width))x\(Int(window.frame.height)) at \(window.backingScaleFactor)x, \(visible ? "visible" : "not visible") on \(window.screen?.localizedName ?? "no screen")\n".utf8))
@@ -264,12 +265,53 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, RemoteIn
             }
         case .error(let message):
             FileHandle.standardError.write(Data("gliff: \(message)\n".utf8))
-            statusLabel.stringValue = "Error: \(message)"
-            scheduleReconnect()
+            statusLabel.stringValue = Self.explain(message, host: hostField.stringValue)
+            statusLabel.toolTip = message
+            FileHandle.standardError.write(Data("gliff: status: \(statusLabel.stringValue)\n".utf8))
+            // Retrying cannot fix a setup problem, only a dropped connection.
+            if Self.isSetupProblem(message) {
+                session?.stop()
+                session = nil
+            } else {
+                scheduleReconnect()
+            }
         case .closed:
             statusLabel.stringValue = "Disconnected"
             scheduleReconnect()
         }
+    }
+
+    /// ssh failures that need the user to change something, not a retry.
+    private static let setupProblems = [
+        "Host key verification failed", "Permission denied", "command not found",
+        "Could not resolve hostname", "unsupported", "No such file",
+    ]
+
+    private static func isSetupProblem(_ message: String) -> Bool {
+        setupProblems.contains { message.contains($0) }
+    }
+
+    /// Say what to do about the usual ways an ssh connection fails. The app
+    /// runs ssh without a terminal, so ssh cannot ask about a new host key or
+    /// a password itself.
+    static func explain(_ message: String, host: String) -> String {
+        let host = host.isEmpty ? "the host" : host
+        if message.contains("Host key verification failed") {
+            return "ssh does not know \(host)'s host key yet. Run `ssh \(host)` once in Terminal to check and accept it."
+        }
+        if message.contains("Permission denied") {
+            return "\(host) refused this Mac's ssh key. Gliff needs key-based ssh login (there is no password prompt)."
+        }
+        if message.contains("command not found") || message.contains("No such file") {
+            return "gliff-server is not installed or not on PATH on \(host) for ssh sessions."
+        }
+        if message.contains("Could not resolve hostname") {
+            return "Cannot find \(host). Check the name, or use its IP address."
+        }
+        if message.contains("unsupported") {
+            return "\(host) runs a gliff-server from a different version. Update both sides."
+        }
+        return "Error: \(message)"
     }
 
     private func scheduleReconnect() {
