@@ -218,6 +218,31 @@ Each phase ends with something runnable on nyc-m4.
   Do this as a spike before phase 1 (see "Order of work"): it retires the
   biggest risk with a few hundred lines of Swift.
 
+  **Spike result (2026-09-21).** Done: `gliff-probe roundtrip --dump` and
+  `macos/` (`GliffVideo`: `AnnexB`, `H264Decoder`, `Recombiner`). On
+  nyc-m4, VideoToolbox decodes the Vulkan encoder's streams, including the
+  cropped 1366x768 and 1856x1238 sizes and the forced keyframe mid-run.
+  The Metal recombine matches the Vulkan decoder's output to within ±1 on
+  every sample of every frame, and the synthetic frames' pure red, green and
+  blue stripes confirm the channel order. There was no reordering delay:
+  every access unit produced its picture at once, so the SPS needs no VUI.
+  Release build, both streams decoded one after the other, then the
+  recombine, waiting on the GPU, averaged over 8 frames:
+
+  | Stream | avg | worst |
+  |---|---|---|
+  | Dual420 1366x768 | 4.0 ms | 9.2 ms |
+  | Dual420 1920x1080 | 5.4 ms | 9.8 ms |
+  | Dual420 1856x1238 | 5.8 ms | 11.6 ms |
+  | Dual420 3840x2160 | 13.7 ms | 23.0 ms |
+  | Single420 1366x768 | 4.7 ms | 22.9 ms |
+
+  The worst cases are the first frame (session setup and allocations). To
+  make 4K Dual420 fit comfortably inside 16.7 ms, decode main and aux on
+  two threads at once and reuse a pool of output textures instead of
+  allocating one per frame. Run it with
+  `GLIFF_VT_FIXTURES=<dump dir> swift test -c release --no-parallel`.
+
 ### 5. Input
 
 - **Keys.** Build a static table from macOS virtual key codes (`kVK_*`) to
@@ -382,7 +407,7 @@ Each phase ends with something runnable on nyc-m4.
 
 ## Order of work
 
-1. Phase 0, then the **decode spike**: dump real main and aux streams with
+1. (Done.) Phase 0, then the **decode spike**: dump real main and aux streams with
    `gliff-probe`, and decode and recombine them in a bare Swift test on
    nyc-m4 (the verification part of phase 4). This retires the biggest
    risk, compatibility with the Vulkan encoder's streams, before any
