@@ -80,7 +80,11 @@ gliff user@host
 ```
 
 This mirrors the remote's focused screen: it spawns
-`ssh -T user@host gliff-server --stdio --output auto`. Other modes:
+`ssh -T user@host gliff-server --stdio --output auto`. The machine sits in an
+address bar in the title bar: type another one and press Enter to switch to
+it, or pick one of the six most recently used from the drop-down that appears
+while it has focus. They are kept in `~/.config/gliff/config.toml`. A bare
+`gliff` opens the window with the address bar focused. Other modes:
 
 ```
 gliff --output DP-1 user@host   # mirror a named remote screen

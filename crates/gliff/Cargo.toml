@@ -24,3 +24,5 @@ bytes.workspace = true
 drm-fourcc.workspace = true
 hypr-ipc.workspace = true
 hypr-input.workspace = true
+serde.workspace = true
+toml = "1"

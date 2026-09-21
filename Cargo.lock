@@ -731,7 +731,9 @@ dependencies = [
  "hypr-input",
  "hypr-ipc",
  "libadwaita",
+ "serde",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
 ]
