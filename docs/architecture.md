@@ -73,7 +73,8 @@ round-trip.
   per frame, keys handed over SSH) is the candidate, not raw UDP. To measure
   again: client `RUST_LOG=info,gliff_vk=debug`, server
   `--server-bin 'env RUST_LOG=info,gliff_server=debug gliff-server'`, compare
-  the `sent frame` and `decode + recombine` timestamps, and sample
+  the `queued frame`, `output write completed`, and `decode + recombine`
+  timestamps, and sample
   `ss -tin` on the server for retransmits.
 
 - **4:4:4 by two 4:2:0 streams (AVC444).** Hardware H.264 encoders only do
@@ -105,6 +106,10 @@ round-trip.
   frames allowed is derived from a smoothed ack RTT and clamped to 2..8, so the
   frame rate is not capped by latency and a slow client cannot build a backlog.
   Frames are captured on demand, so a static screen costs nothing.
+  A separate writer task owns the socket write half and keeps at most one
+  queued encoded frame; unsent cursor, clipboard and pong messages are
+  coalesced, and stream configuration stays ordered with its video frames.
+  The session keeps processing input while a video write is blocked.
 
 - **Threading.** Each pipeline lives on one thread: the server loop and the
   client decode worker are current-thread tokio runtimes that own their

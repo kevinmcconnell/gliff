@@ -3,6 +3,7 @@
 //! or `--listen` (dev, localhost).
 
 mod session;
+mod writer;
 
 use std::path::PathBuf;
 
