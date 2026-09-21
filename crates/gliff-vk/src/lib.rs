@@ -40,6 +40,6 @@ pub mod decoder;
 pub mod pipeline;
 
 pub use device::Gpu;
-pub use encoder::EncoderSettings;
+pub use encoder::{EncoderSettings, Reference, MAX_REFERENCES};
 pub use image::{DmabufPlane, ExportedDmabuf};
 pub use pipeline::{Decoder, DisplayFrame, EncodedFrame, Encoder};

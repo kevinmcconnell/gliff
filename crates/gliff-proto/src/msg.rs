@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// Chunk cap for clipboard payloads on the wire.
 pub const CLIPBOARD_CHUNK: usize = 256 * 1024;
@@ -50,6 +50,16 @@ pub struct ClientCaps {
     pub max_height: u32,
     /// Chroma modes the client can decode, preferred first.
     pub chroma: Vec<ChromaMode>,
+    /// The client will try to take video over UDP.
+    pub udp: bool,
+}
+
+/// The server's UDP video endpoint and the session key that seals it,
+/// handed over inside the SSH session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UdpOffer {
+    pub port: u16,
+    pub key: [u8; 32],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,6 +127,17 @@ pub enum ClientMsg {
         t: u64,
     },
     Bye,
+    /// The client could not decode a frame. It still holds `last_good`
+    /// (or nothing): the next frame must predict from that frame, or be a
+    /// keyframe.
+    Recover {
+        last_good: Option<u64>,
+    },
+    /// Where video goes from now on: over UDP once the client's probe was
+    /// answered, back over this connection when the path fails.
+    VideoPath {
+        udp: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -125,6 +146,7 @@ pub enum ServerMsg {
         version: u16,
         session: SessionInfo,
         outputs: Vec<OutputInfo>,
+        udp: Option<UdpOffer>,
     },
     StreamConfig {
         codec: Codec,
@@ -142,6 +164,9 @@ pub enum ServerMsg {
         frame_id: u64,
         pts_us: u64,
         keyframe: bool,
+        /// The frame this one predicts from; `None` for a keyframe. A
+        /// client that no longer has it cannot decode this frame.
+        reference: Option<u64>,
         damage: Vec<Rect>,
         data_len: u32,
         /// `aux_len > 0` iff `chroma == Dual420`; bytes follow the header.
@@ -198,6 +223,7 @@ mod tests {
                     max_width: 3840,
                     max_height: 2160,
                     chroma: vec![ChromaMode::Dual420, ChromaMode::Single420],
+                    udp: true,
                 },
             },
             ClientMsg::Key {
@@ -224,6 +250,7 @@ mod tests {
             frame_id: 1,
             pts_us: 2,
             keyframe: true,
+            reference: None,
             damage: vec![Rect {
                 x: 0,
                 y: 0,

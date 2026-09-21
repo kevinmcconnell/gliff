@@ -1,8 +1,10 @@
 //! H.264 encode through `VK_KHR_video_encode_h264`.
 //!
-//! Low-delay layout: IDR then P frames, one reference, no reordering. The DPB
-//! is one array image with two layers; each frame is reconstructed into one
-//! layer while it predicts from the other.
+//! Low-delay layout: IDR then P frames, one active reference, no reordering.
+//! The DPB is one array image with several layers, so a frame can predict
+//! from any of the last few reconstructed pictures, not only the previous
+//! one: after a loss the stream continues from the last picture the client
+//! still has instead of restarting with an IDR.
 
 use std::sync::Arc;
 
@@ -56,7 +58,25 @@ pub struct EncodedPacket {
     pub keyframe: bool,
     /// Annex B access unit; an IDR carries the SPS and PPS in front.
     pub data: Vec<u8>,
+    /// The id of the picture this one predicts from; `None` for an IDR.
+    pub reference: Option<u64>,
 }
+
+/// Which picture the next frame predicts from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reference {
+    /// The previous frame, as usual.
+    Latest,
+    /// The frame with this id, if the encoder still holds it; otherwise an
+    /// IDR.
+    Frame(u64),
+    /// An IDR.
+    Keyframe,
+}
+
+/// Reconstructed pictures the encoder keeps for prediction, at most. The
+/// device's DPB size and the H.264 level may lower it.
+pub const MAX_REFERENCES: usize = 8;
 
 const STD_ENCODE_NAME: &std::ffi::CStr = c"VK_STD_vulkan_video_codec_h264_encode";
 const STD_DECODE_NAME: &std::ffi::CStr = c"VK_STD_vulkan_video_codec_h264_decode";
@@ -240,6 +260,7 @@ impl Drop for SessionParameters {
 /// What the encoder knows about a reconstructed picture in a DPB slot.
 #[derive(Clone, Copy)]
 struct SlotPicture {
+    id: u64,
     frame_num: u32,
     poc: i32,
     idr: bool,
@@ -256,10 +277,11 @@ pub struct H264Encoder {
     commands: Commands,
     sps: Vec<u8>,
     pps: Vec<u8>,
-    /// Pictures currently held in the two DPB slots.
-    slots: [Option<SlotPicture>; 2],
-    /// Slot of the reference for the next P frame.
-    current_ref: Option<usize>,
+    /// Pictures currently held in the DPB slots; at most `refs` of them.
+    slots: Vec<Option<SlotPicture>>,
+    refs: usize,
+    /// Slot of the previous picture, the default reference.
+    latest: Option<usize>,
     frame_num: u32,
     idr_pic_id: u16,
     poc: i32,
@@ -271,6 +293,7 @@ pub struct H264Encoder {
 /// The encoder capabilities gliff reads, flattened out of the Vulkan chain.
 struct EncodeCaps {
     max_coded_extent: vk::Extent2D,
+    max_dpb_slots: u32,
     rate_control_modes: vk::VideoEncodeRateControlModeFlagsKHR,
     max_level_idc: std_video::StdVideoH264LevelIdc,
 }
@@ -290,6 +313,7 @@ fn query_caps(gpu: &Gpu, profile: &vk::VideoProfileInfoKHR) -> Result<EncodeCaps
     };
     Ok(EncodeCaps {
         max_coded_extent: caps.max_coded_extent,
+        max_dpb_slots: caps.max_dpb_slots,
         rate_control_modes: enc_caps.rate_control_modes,
         max_level_idc: h264_caps.max_level_idc,
     })
@@ -330,6 +354,13 @@ impl H264Encoder {
             {
                 return Err(Error::Unsupported("encoder has no CBR rate control".into()));
             }
+            let mbs = (coded.width / 16) * (coded.height / 16);
+            let (refs, level) = references_and_level(
+                MAX_REFERENCES.min(caps.max_dpb_slots.saturating_sub(1) as usize),
+                mbs,
+                caps.max_level_idc,
+            );
+            let dpb_slots = refs as u32 + 1;
             let header = std_header(true);
             let info = vk::VideoSessionCreateInfoKHR::default()
                 .queue_family_index(family)
@@ -337,12 +368,12 @@ impl H264Encoder {
                 .picture_format(NV12)
                 .max_coded_extent(coded)
                 .reference_picture_format(NV12)
-                .max_dpb_slots(2)
+                .max_dpb_slots(dpb_slots)
                 .max_active_reference_pictures(1)
                 .std_header_version(&header);
             let session = Session::new(gpu, &info)?;
 
-            let (sps, pps) = std_parameter_sets(&settings, caps.max_level_idc);
+            let (sps, pps) = std_parameter_sets(&settings, level, refs as u8);
             let spss = [sps];
             let ppss = [pps];
             let add = vk::VideoEncodeH264SessionParametersAddInfoKHR::default()
@@ -362,7 +393,7 @@ impl H264Encoder {
                 Role::EncodeDpb,
                 coded.width,
                 coded.height,
-                2,
+                dpb_slots,
                 Some(profile),
             )?;
             let size = (coded.width * coded.height * 2) as usize;
@@ -398,8 +429,9 @@ impl H264Encoder {
                 commands: Commands::new(gpu, family, queue)?,
                 sps: Vec::new(),
                 pps: Vec::new(),
-                slots: [None, None],
-                current_ref: None,
+                slots: vec![None; dpb_slots as usize],
+                refs,
+                latest: None,
                 frame_num: 0,
                 idr_pic_id: 0,
                 poc: 0,
@@ -411,6 +443,8 @@ impl H264Encoder {
             tracing::debug!(
                 sps = enc.sps.len(),
                 pps = enc.pps.len(),
+                refs,
+                level,
                 "encoder parameter sets"
             );
             Ok(enc)
@@ -492,37 +526,87 @@ impl H264Encoder {
         Ok(data)
     }
 
+    /// The slot holding the picture with this id, if it is still in the DPB.
+    fn slot_of(&self, id: u64) -> Option<usize> {
+        self.slots
+            .iter()
+            .position(|s| s.is_some_and(|p| p.id == id))
+    }
+
+    /// PicNum of a held picture relative to the current frame number
+    /// (FrameNumWrap, 8.2.4.1).
+    fn pic_num(&self, p: &SlotPicture) -> i64 {
+        if p.frame_num > self.frame_num {
+            p.frame_num as i64 - (1i64 << (LOG2_MAX_FRAME_NUM_MINUS4 + 4))
+        } else {
+            p.frame_num as i64
+        }
+    }
+
     /// Encode `input` (already in VIDEO_ENCODE_SRC layout, or transitioned
-    /// here) after the timeline reaches `wait`. Blocks until the bitstream
-    /// is ready.
+    /// here) after the timeline reaches `wait`, as picture `id` predicting
+    /// from `reference`. Blocks until the bitstream is ready.
     pub(crate) fn submit(
         &mut self,
         input: &Image,
         timeline: &Timeline,
         wait: Option<u64>,
-        force_keyframe: bool,
+        id: u64,
+        reference: Reference,
     ) -> Result<PendingEncode> {
         let bitrate_change = self.pending_bitrate.take();
-        let idr = force_keyframe || !self.started || self.current_ref.is_none();
+        let wanted = match reference {
+            Reference::Keyframe => None,
+            Reference::Latest => self.latest,
+            Reference::Frame(id) => self.slot_of(id),
+        };
+        let idr = !self.started || wanted.is_none();
         if idr {
             self.frame_num = 0;
             self.poc = 0;
             if self.started {
                 self.idr_pic_id = self.idr_pic_id.wrapping_add(1);
             }
-            self.current_ref = None;
+            self.slots.iter_mut().for_each(|s| *s = None);
+            self.latest = None;
         }
-        let setup_slot = match self.current_ref {
-            Some(r) => 1 - r,
-            None => 0,
-        };
-        let ref_slot = if idr { None } else { self.current_ref };
+        let ref_slot = if idr { None } else { wanted };
+        let setup_slot = self
+            .slots
+            .iter()
+            .position(Option::is_none)
+            .expect("the sliding window leaves a free slot");
         let (w, h) = (self.settings.width, self.settings.height);
         let current = SlotPicture {
+            id,
             frame_num: self.frame_num,
             poc: self.poc,
             idr,
         };
+        let held: Vec<(usize, SlotPicture)> = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| s.map(|p| (i, p)))
+            .collect();
+        // The default list puts the newest picture first; an older
+        // reference must be moved to the front by a modification.
+        let mut list_mod = None;
+        if let Some(r) = ref_slot {
+            let ref_pic = self.slots[r].expect("reference slot holds a picture");
+            let newest = held.iter().map(|(_, p)| self.pic_num(p)).max().unwrap_or(0);
+            let ref_num = self.pic_num(&ref_pic);
+            if ref_num != newest {
+                let diff = self.frame_num as i64 - ref_num;
+                debug_assert!(diff >= 1);
+                list_mod = Some(std_video::StdVideoEncodeH264RefListModEntry {
+                    modification_of_pic_nums_idc:
+                        std_video::StdVideoH264ModificationOfPicNumsIdc_STD_VIDEO_H264_MODIFICATION_OF_PIC_NUMS_IDC_SHORT_TERM_SUBTRACT,
+                    abs_diff_pic_num_minus1: (diff - 1) as u16,
+                    long_term_pic_num: 0,
+                });
+            }
+        }
 
         with_h264_profile(true, |_profile| {
             let dpb_resource = |slot: usize| {
@@ -552,28 +636,32 @@ impl H264Encoder {
                 }
             };
 
-            // Reference slots for the coding scope: the active reference (if
-            // any) and the setup slot's resource, listed as inactive (-1).
+            // Reference slots for the coding scope: every held picture stays
+            // active, and the setup slot's resource is listed as inactive
+            // (-1). Only the chosen reference is passed to the encode.
             let setup_res = dpb_resource(setup_slot);
-            let ref_res = ref_slot.map(dpb_resource);
+            let held_res: Vec<vk::VideoPictureResourceInfoKHR> =
+                held.iter().map(|(i, _)| dpb_resource(*i)).collect();
+            let held_std: Vec<std_video::StdVideoEncodeH264ReferenceInfo> =
+                held.iter().map(|(_, p)| ref_std(*p)).collect();
+            let mut held_dpb: Vec<vk::VideoEncodeH264DpbSlotInfoKHR> = held_std
+                .iter()
+                .map(|s| vk::VideoEncodeH264DpbSlotInfoKHR::default().std_reference_info(s))
+                .collect();
             let mut begin_slots = vec![vk::VideoReferenceSlotInfoKHR::default()
                 .slot_index(-1)
                 .picture_resource(&setup_res)];
-            let ref_std_info =
-                ref_slot.map(|r| ref_std(self.slots[r].expect("active reference has a picture")));
-            let mut ref_dpb_info = ref_std_info
-                .as_ref()
-                .map(|s| vk::VideoEncodeH264DpbSlotInfoKHR::default().std_reference_info(s));
-            if let (Some(r), Some(res), Some(dpb_info)) =
-                (ref_slot, ref_res.as_ref(), ref_dpb_info.as_mut())
-            {
+            for (((i, _), res), dpb) in held.iter().zip(&held_res).zip(held_dpb.iter_mut()) {
                 begin_slots.push(
                     vk::VideoReferenceSlotInfoKHR::default()
-                        .slot_index(r as i32)
+                        .slot_index(*i as i32)
                         .picture_resource(res)
-                        .push_next(dpb_info),
+                        .push_next(dpb),
                 );
             }
+            let ref_res = ref_slot.map(dpb_resource);
+            let ref_std_info =
+                ref_slot.map(|r| ref_std(self.slots[r].expect("active reference has a picture")));
 
             let setup_std = ref_std(current);
             let mut setup_dpb_info =
@@ -597,7 +685,7 @@ impl H264Encoder {
                 };
 
             let mut list_flags = zeroed::<std_video::StdVideoEncodeH264ReferenceListsInfoFlags>();
-            list_flags.set_ref_pic_list_modification_flag_l0(0);
+            list_flags.set_ref_pic_list_modification_flag_l0(list_mod.is_some() as u32);
             list_flags.set_ref_pic_list_modification_flag_l1(0);
             let mut ref_lists = std_video::StdVideoEncodeH264ReferenceListsInfo {
                 flags: list_flags,
@@ -605,11 +693,13 @@ impl H264Encoder {
                 num_ref_idx_l1_active_minus1: 0,
                 RefPicList0: [NO_REFERENCE; 32],
                 RefPicList1: [NO_REFERENCE; 32],
-                refList0ModOpCount: 0,
+                refList0ModOpCount: list_mod.is_some() as u8,
                 refList1ModOpCount: 0,
                 refPicMarkingOpCount: 0,
                 reserved1: [0; 7],
-                pRefList0ModOperations: std::ptr::null(),
+                pRefList0ModOperations: list_mod
+                    .as_ref()
+                    .map_or(std::ptr::null(), |m| m as *const _),
                 pRefList1ModOperations: std::ptr::null(),
                 pRefPicMarkingOperations: std::ptr::null(),
             };
@@ -730,18 +820,34 @@ impl H264Encoder {
             self.settings.bitrate = b;
         }
         // The DPB and counters describe the picture just recorded; the
-        // bitstream itself is collected by `finish`.
+        // bitstream itself is collected by `finish`. Sliding-window marking
+        // (8.2.5.3) drops the oldest picture once more than `refs` are held,
+        // as the decoder does.
         self.slots[setup_slot] = Some(current);
-        self.current_ref = Some(setup_slot);
+        self.latest = Some(setup_slot);
+        while self.slots.iter().flatten().count() > self.refs {
+            let oldest = self
+                .slots
+                .iter()
+                .enumerate()
+                .filter_map(|(i, s)| s.map(|p| (self.pic_num(&p), i)))
+                .min()
+                .map(|(_, i)| i)
+                .expect("the DPB is not empty");
+            self.slots[oldest] = None;
+        }
         self.frame_num = (self.frame_num + 1) % (1 << (LOG2_MAX_FRAME_NUM_MINUS4 + 4));
         self.poc += 2;
         self.started = true;
-        Ok(PendingEncode { idr })
+        Ok(PendingEncode {
+            idr,
+            reference: ref_slot.and_then(|r| self.slots[r]).map(|p| p.id),
+        })
     }
 
     /// Wait for a submitted encode and collect its access unit.
     pub(crate) fn finish(&mut self, pending: PendingEncode) -> Result<EncodedPacket> {
-        let idr = pending.idr;
+        let PendingEncode { idr, reference } = pending;
         self.commands.wait()?;
         // Feedback for the one query: [offset, bytes written, status].
         let mut results = [[0u32; 3]; 1];
@@ -776,6 +882,7 @@ impl H264Encoder {
         Ok(EncodedPacket {
             keyframe: idr,
             data,
+            reference,
         })
     }
 }
@@ -783,6 +890,46 @@ impl H264Encoder {
 /// An encode that has been submitted but not yet read back.
 pub(crate) struct PendingEncode {
     idr: bool,
+    reference: Option<u64>,
+}
+
+impl PendingEncode {
+    pub(crate) fn reference(&self) -> Option<u64> {
+        self.reference
+    }
+}
+
+/// How many reference pictures to keep and the level that allows it: the
+/// DPB of a level is bounded in macroblocks (A-1), so a large picture with
+/// many references needs a high level, and when the device's level cannot
+/// hold `wanted` references the count comes down instead.
+fn references_and_level(
+    wanted: usize,
+    picture_mbs: u32,
+    max_level: std_video::StdVideoH264LevelIdc,
+) -> (usize, std_video::StdVideoH264LevelIdc) {
+    use std_video::*;
+    const LEVELS: [(StdVideoH264LevelIdc, u32); 7] = [
+        (StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_4_0, 32768),
+        (StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_4_2, 34816),
+        (StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_5_0, 110400),
+        (StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_5_1, 184320),
+        (StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_5_2, 184320),
+        (StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_6_0, 696320),
+        (StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_6_2, 696320),
+    ];
+    let mut refs = wanted.max(1);
+    loop {
+        let need = picture_mbs as u64 * refs as u64;
+        let fit = LEVELS
+            .iter()
+            .find(|(level, max_mbs)| *level <= max_level && *max_mbs as u64 >= need);
+        match fit {
+            Some((level, _)) => return (refs, *level),
+            None if refs > 1 => refs -= 1,
+            None => return (1, max_level.min(LEVELS[3].0)),
+        }
+    }
 }
 
 /// Program CBR rate control (and the quality level) for `settings`; with
@@ -861,11 +1008,12 @@ impl RateControl {
     }
 }
 
-/// The SPS and PPS this encoder emits: High profile, CABAC, one reference,
-/// POC type 0, cropped to the display size.
+/// The SPS and PPS this encoder emits: High profile, CABAC, `refs`
+/// reference frames, POC type 0, cropped to the display size.
 fn std_parameter_sets(
     s: &EncoderSettings,
-    max_level: std_video::StdVideoH264LevelIdc,
+    level: std_video::StdVideoH264LevelIdc,
+    refs: u8,
 ) -> (
     std_video::StdVideoH264SequenceParameterSet,
     std_video::StdVideoH264PictureParameterSet,
@@ -879,7 +1027,7 @@ fn std_parameter_sets(
     let sps = std_video::StdVideoH264SequenceParameterSet {
         flags: sps_flags,
         profile_idc: std_video::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH,
-        level_idc: max_level.min(std_video::StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_5_1),
+        level_idc: level,
         chroma_format_idc:
             std_video::StdVideoH264ChromaFormatIdc_STD_VIDEO_H264_CHROMA_FORMAT_IDC_420,
         seq_parameter_set_id: 0,
@@ -891,7 +1039,7 @@ fn std_parameter_sets(
         offset_for_top_to_bottom_field: 0,
         log2_max_pic_order_cnt_lsb_minus4: LOG2_MAX_POC_LSB_MINUS4,
         num_ref_frames_in_pic_order_cnt_cycle: 0,
-        max_num_ref_frames: 1,
+        max_num_ref_frames: refs,
         reserved1: 0,
         pic_width_in_mbs_minus1: cw / 16 - 1,
         pic_height_in_map_units_minus1: ch / 16 - 1,
@@ -934,7 +1082,8 @@ impl Drop for H264Encoder {
 
 #[cfg(test)]
 mod tests {
-    use super::EncoderSettings;
+    use super::{references_and_level, EncoderSettings, MAX_REFERENCES};
+    use ash::vk::native as std_video;
 
     fn coded(v: u32) -> u32 {
         v.div_ceil(16) * 16
@@ -986,5 +1135,38 @@ mod tests {
                 "{w}x{h} -> {fw}x{fh}"
             );
         }
+    }
+
+    #[test]
+    fn small_pictures_keep_every_reference_at_a_low_level() {
+        let (refs, level) = references_and_level(
+            MAX_REFERENCES,
+            (1920 / 16) * (1088 / 16),
+            std_video::StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_6_2,
+        );
+        assert_eq!(refs, MAX_REFERENCES);
+        assert_eq!(level, std_video::StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_5_0);
+    }
+
+    #[test]
+    fn a_4k_picture_with_all_references_needs_level_6() {
+        let (refs, level) = references_and_level(
+            MAX_REFERENCES,
+            (3840 / 16) * (2160 / 16),
+            std_video::StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_6_2,
+        );
+        assert_eq!(refs, MAX_REFERENCES);
+        assert_eq!(level, std_video::StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_6_0);
+    }
+
+    #[test]
+    fn a_device_capped_at_level_5_1_gets_fewer_references_at_4k() {
+        let (refs, level) = references_and_level(
+            MAX_REFERENCES,
+            (3840 / 16) * (2160 / 16),
+            std_video::StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_5_1,
+        );
+        assert_eq!(refs, 5);
+        assert_eq!(level, std_video::StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_5_1);
     }
 }

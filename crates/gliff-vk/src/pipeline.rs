@@ -19,7 +19,7 @@ use ash::vk;
 use crate::compute::{Recombine, Split};
 use crate::decoder::H264Decoder;
 use crate::device::{Commands, Gpu, Timeline};
-use crate::encoder::{EncoderSettings, H264Encoder};
+use crate::encoder::{EncoderSettings, H264Encoder, Reference};
 use crate::image::{DmabufPlane, ExportedDmabuf, HostBuffer, Image};
 use crate::Result;
 
@@ -27,6 +27,8 @@ pub struct EncodedFrame {
     pub main: Vec<u8>,
     pub aux: Option<Vec<u8>>,
     pub keyframe: bool,
+    /// The frame this one predicts from; `None` for a keyframe.
+    pub reference: Option<u64>,
 }
 
 /// Server side: one encoder object per session.
@@ -86,13 +88,15 @@ impl Encoder {
         }
     }
 
-    /// Encode a captured dmabuf. `key` identifies the buffer so its import
-    /// is reused across frames; pass a new key when the buffer changes.
+    /// Encode a captured dmabuf as frame `id`, predicting from `reference`.
+    /// `key` identifies the buffer so its import is reused across frames;
+    /// pass a new key when the buffer changes.
     pub fn encode_dmabuf(
         &mut self,
         key: u64,
         plane: &DmabufPlane,
-        force_keyframe: bool,
+        id: u64,
+        reference: Reference,
     ) -> Result<EncodedFrame> {
         if !self.imports.contains_key(&key) {
             // A new capture ring means the old buffers are gone.
@@ -104,13 +108,18 @@ impl Encoder {
                 .insert(key, Image::import_dmabuf(&self.gpu, plane)?);
         }
         let src = self.imports.remove(&key).expect("inserted above");
-        let result = self.encode_image(&src, force_keyframe);
+        let result = self.encode_image(&src, id, reference);
         self.imports.insert(key, src);
         result
     }
 
     /// Encode packed BGRA pixels (tests and the probe; one extra upload).
-    pub fn encode_bgra(&mut self, bgra: &[u8], force_keyframe: bool) -> Result<EncodedFrame> {
+    pub fn encode_bgra(
+        &mut self,
+        bgra: &[u8],
+        id: u64,
+        reference: Reference,
+    ) -> Result<EncodedFrame> {
         let (w, h) = (self.settings.width, self.settings.height);
         let staging = HostBuffer::new(
             &self.gpu,
@@ -126,10 +135,10 @@ impl Encoder {
                 src.copy_rgba_from_buffer(cmd, &staging);
                 Ok(())
             })?;
-        self.encode_image(&src, force_keyframe)
+        self.encode_image(&src, id, reference)
     }
 
-    fn encode_image(&mut self, src: &Image, force_keyframe: bool) -> Result<EncodedFrame> {
+    fn encode_image(&mut self, src: &Image, id: u64, reference: Reference) -> Result<EncodedFrame> {
         let (w, h) = (self.settings.width, self.settings.height);
         let split_done = self.timeline.advance();
         let (split, main_in, aux_in) = (&self.split, &self.main_in, self.aux_in.as_ref());
@@ -151,15 +160,18 @@ impl Encoder {
         )?;
         // Submit both encodes, then wait: the main stream's readback overlaps
         // the aux encode on the GPU.
-        let main = self.main.submit(
-            &self.main_in,
-            &self.timeline,
-            Some(split_done),
-            force_keyframe,
-        )?;
+        let main = self
+            .main
+            .submit(&self.main_in, &self.timeline, Some(split_done), id, reference)?;
+        // Both streams must predict from the same picture: an aux encoder
+        // that lost the reference would fall back to an IDR on its own.
+        let aux_reference = match main.reference() {
+            Some(r) => Reference::Frame(r),
+            None => Reference::Keyframe,
+        };
         let aux = match (&mut self.aux, &self.aux_in) {
             (Some(enc), Some(input)) => {
-                Some(enc.submit(input, &self.timeline, Some(split_done), force_keyframe)?)
+                Some(enc.submit(input, &self.timeline, Some(split_done), id, aux_reference)?)
             }
             _ => None,
         };
@@ -170,6 +182,7 @@ impl Encoder {
         };
         Ok(EncodedFrame {
             keyframe: main.keyframe,
+            reference: main.reference,
             main: main.data,
             aux: aux.map(|a| a.data),
         })

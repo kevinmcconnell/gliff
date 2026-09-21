@@ -64,3 +64,6 @@ rustix = { version = "1", features = ["fs", "mm"] }
 
 gtk4 = { version = "0.11", features = ["v4_14"] }
 libadwaita = { version = "0.9", features = ["v1_5"] }
+chacha20poly1305 = "0.10"
+rand = "0.9"
+socket2 = "0.6"

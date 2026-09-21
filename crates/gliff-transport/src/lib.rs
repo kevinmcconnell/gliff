@@ -8,6 +8,8 @@
 //! returns them as a `Bytes` slice for the decoder.
 
 mod ssh;
+pub mod udp;
+pub mod udp_io;
 
 use bytes::{Bytes, BytesMut};
 use gliff_proto::frame::MAX_FRAME_BODY;
@@ -164,6 +166,7 @@ mod tests {
                 max_width: 1920,
                 max_height: 1080,
                 chroma: vec![ChromaMode::Dual420],
+                udp: false,
             },
         };
         let payload = vec![7u8; 5000];
