@@ -469,6 +469,58 @@ fn serve_test(node: &std::path::Path, addr: &str, frames: usize, video: VideoMod
         let mut got = 0usize;
         let mut keyframes = 0usize;
         let mut scaled = false;
+        // GLIFF_SEND_CLIP offers text; GLIFF_SEND_CLIP_FILE offers a file as
+        // application/octet-stream; GLIFF_SEND_CLIP_FILES (colon-separated
+        // paths) offers copied files. GLIFF_RECV_CLIP_FILE stores a received
+        // octet-stream and GLIFF_RECV_CLIP_DIR the received files. Text
+        // received is printed as CLIP-RECV.
+        use gliff_proto::clipboard::{is_text_mime, safe_relative_path, CHUNK, TEXT_MIME, TEXT_MIMES, WINDOW};
+        use gliff_proto::ClipboardItem;
+        const OCTET: &str = "application/octet-stream";
+        let send_clip = std::env::var("GLIFF_SEND_CLIP").ok();
+        let send_file = std::env::var("GLIFF_SEND_CLIP_FILE").ok().map(|p| std::fs::read(&p).with_context(|| format!("read {p}"))).transpose()?;
+        let send_files = match std::env::var("GLIFF_SEND_CLIP_FILES") {
+            Ok(list) => gliff_transport::clipboard::files::list_files(&list.split(':').map(PathBuf::from).collect::<Vec<_>>())?,
+            Err(_) => Default::default(),
+        };
+        let recv_file = std::env::var("GLIFF_RECV_CLIP_FILE").ok();
+        let recv_dir = std::env::var("GLIFF_RECV_CLIP_DIR").ok().map(PathBuf::from);
+        let mut clip_recv: Vec<u8> = Vec::new();
+        let mut recv_mime = String::new();
+        // The server's offered files and the index of the one being fetched.
+        let mut recv_files: Vec<gliff_proto::ClipboardFile> = Vec::new();
+        let mut recv_file_idx: Option<usize> = None;
+        // Serial of the server's current offer, echoed in every request.
+        let mut recv_serial = 0u32;
+        // Outgoing transfer: (id, bytes, next offset); at most WINDOW chunks unacked.
+        let mut serving: Option<(u32, Vec<u8>, usize, u32)> = None;
+        async fn push_chunks<W: tokio::io::AsyncWrite + Unpin>(writer: &mut Framed<W>, serving: &mut Option<(u32, Vec<u8>, usize, u32)>) -> Result<()> {
+            let Some((id, bytes, offset, unacked)) = serving.as_mut() else { return Ok(()) };
+            while *unacked < WINDOW {
+                let end = (*offset + CHUNK).min(bytes.len());
+                let done = end == bytes.len();
+                writer.write_msg_with_payloads(&ClientMsg::ClipboardData { id: *id, offset: *offset as u64, data_len: (end - *offset) as u32, done }, &[&bytes[*offset..end]]).await?;
+                *offset = end;
+                *unacked += 1;
+                if done { *serving = None; return Ok(()); }
+            }
+            Ok(())
+        }
+        fn spool_path(dir: &std::path::Path, f: &gliff_proto::ClipboardFile) -> Result<PathBuf> {
+            safe_relative_path(&f.path).map(|r| dir.join(r)).context("unsafe path")
+        }
+        /// Create directory entries from `from` on and request the next file; None when all are stored.
+        async fn request_next_file<W: tokio::io::AsyncWrite + Unpin>(writer: &mut Framed<W>, files: &[gliff_proto::ClipboardFile], serial: u32, dir: &std::path::Path, from: usize) -> Result<Option<usize>> {
+            for (i, f) in files.iter().enumerate().skip(from) {
+                let path = spool_path(dir, f)?;
+                if f.dir { std::fs::create_dir_all(&path)?; continue; }
+                if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
+                writer.write_msg(&ClientMsg::ClipboardRequest { id: 3 + 2 * i as u32, serial, item: ClipboardItem::File(i as u32) }).await?;
+                return Ok(Some(i));
+            }
+            eprintln!("CLIP-RECV-FILES: {} entries", files.len());
+            Ok(None)
+        }
         while got < frames {
             let msg = reader.read_msg::<ServerMsg>().await?;
             match msg {
@@ -481,11 +533,11 @@ fn serve_test(node: &std::path::Path, addr: &str, frames: usize, video: VideoMod
                     if got == 1 { eprintln!("  first decoded frame ok ({}x{}, main {} aux {} bytes, key {keyframe})", w, h, data_len, aux_len); }
                     writer.write_msg(&ClientMsg::FrameAck { frame_id, decoded_at_ms: 0 }).await?;
                     if got == 3 { writer.write_msg(&ClientMsg::Resize { width: 800, height: 600, scale: 2.0 }).await?; }
-                    if got == 4 {
-                        if let Ok(text) = std::env::var("GLIFF_SEND_CLIP") {
-                            let bytes = text.into_bytes();
-                            writer.write_msg_with_payloads(&ClientMsg::ClipboardData { mime_type: "text/plain;charset=utf-8".into(), offset: 0, total: bytes.len() as u64, data_len: bytes.len() as u32 }, &[&bytes]).await?;
-                        }
+                    if got == 4 && (send_clip.is_some() || send_file.is_some() || !send_files.entries.is_empty()) {
+                        let mut mime_types: Vec<String> = Vec::new();
+                        if send_clip.is_some() { mime_types.extend(TEXT_MIMES.iter().map(|m| m.to_string())); }
+                        if send_file.is_some() { mime_types.push(OCTET.into()); }
+                        writer.write_msg(&ClientMsg::ClipboardOffer { serial: 1, mime_types, files: send_files.entries.clone() }).await?;
                     }
                 }
                 ServerMsg::StreamConfig { width, height, chroma, scale_milli, .. } => {
@@ -495,9 +547,54 @@ fn serve_test(node: &std::path::Path, addr: &str, frames: usize, video: VideoMod
                     decoder = serve_decoder(&gpu, chroma != ChromaMode::Single420, w as u32, h as u32)?;
                 }
                 ServerMsg::CursorShape { argb_len, .. } => { let _ = reader.read_payload(argb_len).await?; }
-                ServerMsg::ClipboardData { data_len, .. } => {
+                // The server offers its selection; ask for one item and keep it once complete.
+                ServerMsg::ClipboardOffer { serial, mime_types, files } => {
+                    recv_serial = serial;
+                    eprintln!("  server offers {mime_types:?} and {} file entries", files.len());
+                    let want = if recv_file.is_some() && mime_types.iter().any(|m| m == OCTET) { Some(OCTET) }
+                        else if mime_types.iter().any(|m| is_text_mime(m)) { Some(TEXT_MIME) } else { None };
+                    if let (Some(dir), false) = (&recv_dir, files.is_empty()) {
+                        clip_recv.clear();
+                        recv_files = files;
+                        recv_file_idx = request_next_file(&mut writer, &recv_files, recv_serial, dir, 0).await?;
+                    } else if let Some(mime) = want {
+                        clip_recv.clear();
+                        recv_mime = mime.to_string();
+                        writer.write_msg(&ClientMsg::ClipboardRequest { id: 1, serial: recv_serial, item: ClipboardItem::Mime(mime.into()) }).await?;
+                    }
+                }
+                ServerMsg::ClipboardData { id, data_len, done, .. } => {
                     let bytes = reader.read_payload(data_len).await?;
-                    if let Ok(t) = String::from_utf8(bytes.to_vec()) { eprintln!("CLIP-RECV: {t}"); }
+                    clip_recv.extend_from_slice(&bytes);
+                    if done {
+                        let data = std::mem::take(&mut clip_recv);
+                        if let (Some(i), Some(dir)) = (recv_file_idx, &recv_dir) {
+                            std::fs::write(spool_path(dir, &recv_files[i])?, &data)?;
+                            recv_file_idx = request_next_file(&mut writer, &recv_files, recv_serial, dir, i + 1).await?;
+                        } else if recv_mime == OCTET {
+                            let path = recv_file.clone().unwrap_or_default();
+                            std::fs::write(&path, &data).with_context(|| format!("write {path}"))?;
+                            eprintln!("CLIP-RECV-FILE: {} bytes", data.len());
+                        } else if let Ok(t) = String::from_utf8(data) { eprintln!("CLIP-RECV: {t}"); }
+                    } else {
+                        writer.write_msg(&ClientMsg::ClipboardAck { id, received: clip_recv.len() as u64 }).await?;
+                    }
+                }
+                // The server pastes something we offered: stream it within the window.
+                ServerMsg::ClipboardRequest { id, serial: _, item } => {
+                    let bytes = match &item {
+                        ClipboardItem::Mime(m) if m == OCTET => send_file.clone().unwrap_or_default(),
+                        ClipboardItem::Mime(m) if is_text_mime(m) => send_clip.clone().unwrap_or_default().into_bytes(),
+                        ClipboardItem::File(_) if send_files.path_for(&item).is_some() => std::fs::read(send_files.path_for(&item).unwrap())?,
+                        _ => { writer.write_msg(&ClientMsg::ClipboardAbort { id }).await?; continue; }
+                    };
+                    eprintln!("  serving {} bytes for {item:?}", bytes.len());
+                    serving = Some((id, bytes, 0, 0));
+                    push_chunks(&mut writer, &mut serving).await?;
+                }
+                ServerMsg::ClipboardAck { .. } => {
+                    if let Some(s) = serving.as_mut() { s.3 = s.3.saturating_sub(1); }
+                    push_chunks(&mut writer, &mut serving).await?;
                 }
                 ServerMsg::CursorPos { .. } | ServerMsg::Pong { .. } | ServerMsg::Error { .. } => {}
                 _ => {}
@@ -516,7 +613,9 @@ fn serve_test(node: &std::path::Path, addr: &str, frames: usize, video: VideoMod
 }
 
 fn clipboard(target: &Target, set: Option<String>, secs: u64) -> Result<()> {
+    use gliff_proto::clipboard::{is_text_mime, TEXT_MIMES};
     use hypr_input::{Clipboard, ClipboardEvent};
+    use std::io::{Read, Write};
     use std::sync::mpsc;
     let (tx, rx) = mpsc::channel();
     let clip = Clipboard::start(
@@ -525,21 +624,37 @@ fn clipboard(target: &Target, set: Option<String>, secs: u64) -> Result<()> {
             let _ = tx.send(ev);
         }),
     )?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
     if let Some(text) = set {
-        clip.set_text(text.clone());
-        println!("  set selection to {text:?}; holding {secs}s");
-        std::thread::sleep(std::time::Duration::from_secs(secs));
-        status(true, "clipboard set");
-    } else {
-        println!("  watching selection for {secs}s");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
-        let mut got = false;
+        clip.offer(TEXT_MIMES.iter().map(|m| m.to_string()).collect());
+        println!("  offering {text:?} as text; holding {secs}s");
+        let mut pastes = 0;
         while std::time::Instant::now() < deadline {
-            if let Ok(ClipboardEvent::Text(t)) =
+            if let Ok(ClipboardEvent::Paste { mime_type, fd }) =
                 rx.recv_timeout(std::time::Duration::from_millis(200))
             {
-                println!("  selection: {t:?}");
+                let mut f = std::fs::File::from(fd);
+                let _ = f.write_all(text.as_bytes());
+                println!("  served a paste of {mime_type}");
+                pastes += 1;
+            }
+        }
+        status(true, &format!("clipboard offered ({pastes} pastes served)"));
+    } else {
+        println!("  watching selection for {secs}s");
+        let mut got = false;
+        while std::time::Instant::now() < deadline {
+            if let Ok(ClipboardEvent::Selection { mime_types }) =
+                rx.recv_timeout(std::time::Duration::from_millis(200))
+            {
+                println!("  selection offers {mime_types:?}");
                 got = true;
+                if let Some(m) = mime_types.iter().find(|m| is_text_mime(m)) {
+                    let fd = clip.receive(m.clone())?;
+                    let mut text = String::new();
+                    std::fs::File::from(fd).read_to_string(&mut text)?;
+                    println!("  text: {text:?}");
+                }
             }
         }
         status(got, "observed a clipboard selection");

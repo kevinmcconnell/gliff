@@ -53,17 +53,21 @@ impl Queue {
                     ServerMsg::CursorShape { .. } | ServerMsg::CursorPos { .. }
                 )
             }),
-            ServerMsg::CursorPos { .. }
-            | ServerMsg::ClipboardData { .. }
-            | ServerMsg::Pong { .. } => {
+            ServerMsg::CursorPos { .. } | ServerMsg::Pong { .. } => {
                 self.packets.retain(|(queued, _)| {
                     std::mem::discriminant(queued) != std::mem::discriminant(&msg)
                 });
             }
+            // Clipboard transfers are ordered and reliable: never coalesce.
+            // The transfer engine's ack window bounds how many can queue.
+            ServerMsg::ClipboardOffer { .. }
+            | ServerMsg::ClipboardRequest { .. }
+            | ServerMsg::ClipboardData { .. }
+            | ServerMsg::ClipboardAck { .. }
+            | ServerMsg::ClipboardAbort { .. } => {}
             _ => unreachable!("unsupported queued server message"),
         }
         self.packets.push_back((msg, payloads));
-        debug_assert!(self.packets.len() <= 7);
     }
 }
 
@@ -204,22 +208,13 @@ mod tests {
                 Vec::new(),
             );
             queue.push(
-                ServerMsg::ClipboardData {
-                    mime_type: "text/plain".into(),
-                    offset: 0,
-                    total: 1,
-                    data_len: 1,
-                },
-                vec![vec![0]],
-            );
-            queue.push(
                 ServerMsg::Pong {
                     t: id as u64,
                     server_now_ms: 0,
                 },
                 Vec::new(),
             );
-            assert_eq!(queue.packets.len(), 7);
+            assert_eq!(queue.packets.len(), 6);
         }
         assert!(matches!(
             queue.packets[0].0,
@@ -234,6 +229,28 @@ mod tests {
             ServerMsg::StreamConfig { width: 1799, .. }
         ));
         assert!(!queue.video_ready());
+    }
+
+    #[test]
+    fn clipboard_messages_queue_in_order_without_coalescing() {
+        let mut queue = Queue::default();
+        for id in 0..3 {
+            queue.push(
+                ServerMsg::ClipboardData {
+                    id,
+                    offset: 0,
+                    data_len: 1,
+                    done: false,
+                },
+                vec![vec![0]],
+            );
+        }
+        queue.push(ServerMsg::ClipboardAck { id: 9, received: 1 }, Vec::new());
+        assert_eq!(queue.packets.len(), 4);
+        assert!(matches!(
+            queue.packets[0].0,
+            ServerMsg::ClipboardData { id: 0, .. }
+        ));
     }
 
     #[tokio::test]
