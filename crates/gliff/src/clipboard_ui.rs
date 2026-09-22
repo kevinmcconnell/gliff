@@ -20,8 +20,8 @@ use tokio::sync::mpsc::{Sender, UnboundedSender};
 use tokio::sync::oneshot;
 
 use gliff_proto::clipboard::{
-    forwardable_mimes, local_mimes_for_offer, offers_files, parse_uri_list, resolve_mime, CHUNK,
-    URI_LIST_MIME,
+    forwardable_mimes, is_file_mime, local_mimes_for_offer, offers_files, parse_uri_list,
+    resolve_mime, CHUNK,
 };
 use gliff_proto::ClipboardFile;
 use gliff_transport::clipboard::files::{list_files, LocalFiles};
@@ -64,7 +64,7 @@ pub fn watch_local(sender: impl Fn() -> Option<UnboundedSender<ToWorker>> + 'sta
         let cb = cb.clone();
         glib::MainContext::default().spawn_local(async move {
             let files = if offers_files(&mimes) {
-                local_files(&cb).await
+                local_files(&cb, &mimes).await
             } else {
                 LocalFiles::default()
             };
@@ -79,12 +79,14 @@ pub fn watch_local(sender: impl Fn() -> Option<UnboundedSender<ToWorker>> + 'sta
     });
 }
 
-/// List the files behind the local clipboard's URI list, if readable.
-async fn local_files(cb: &gdk::Clipboard) -> LocalFiles {
-    let Ok((stream, _)) = cb
-        .read_future(&[URI_LIST_MIME], glib::Priority::DEFAULT)
-        .await
-    else {
+/// List the files behind the local clipboard's file list, if readable. The
+/// list is read as whichever file-list type the clipboard advertises; the
+/// parser handles both bodies.
+async fn local_files(cb: &gdk::Clipboard, mimes: &[String]) -> LocalFiles {
+    let Some(list_mime) = mimes.iter().find(|m| is_file_mime(m)) else {
+        return LocalFiles::default();
+    };
+    let Ok((stream, _)) = cb.read_future(&[list_mime], glib::Priority::DEFAULT).await else {
         return LocalFiles::default();
     };
     let mut body = Vec::new();

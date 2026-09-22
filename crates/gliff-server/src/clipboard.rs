@@ -22,8 +22,8 @@ use tokio::net::unix::pipe;
 use tokio::sync::OnceCell;
 
 use gliff_proto::clipboard::{
-    file_list_body, forwardable_mimes, is_file_mime, local_mimes_for_offer, offers_files,
-    parse_uri_list, resolve_mime, MAX_ITEM, URI_LIST_MIME,
+    file_list_body, forwardable_mimes, is_file_mime, local_mimes_for_offer, parse_uri_list,
+    resolve_mime, MAX_ITEM,
 };
 use gliff_proto::{ClipboardFile, ClipboardItem, ClipboardMsg};
 use gliff_transport::clipboard::files::{
@@ -176,17 +176,19 @@ impl Bridge {
             local.files = LocalFiles::default();
         }
         let offered = forwardable_mimes(&mime_types);
-        let wants_files = offers_files(&mime_types);
-        let uri_list = wants_files
-            .then_some(self.compositor.as_ref())
-            .flatten()
-            .and_then(|c| match c.receive(URI_LIST_MIME.into()) {
-                Ok(fd) => Some(fd),
-                Err(e) => {
-                    tracing::warn!(error = %e, "clipboard uri-list receive failed");
-                    None
-                }
-            });
+        // Read the file list as whichever file-list type the selection
+        // advertises; the parser handles both bodies.
+        let list_mime = mime_types.iter().find(|m| is_file_mime(m)).cloned();
+        let uri_list =
+            list_mime
+                .zip(self.compositor.as_ref())
+                .and_then(|(m, c)| match c.receive(m) {
+                    Ok(fd) => Some(fd),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "clipboard file-list receive failed");
+                        None
+                    }
+                });
         let transfers = self.transfers.clone();
         let local = self.local.clone();
         let selection_gen = self.selection_gen.clone();
