@@ -194,6 +194,7 @@ where
     let (writer, mut write_reports) = Writer::spawn(writer);
 
     capturer.request_frame().ok();
+    let mut clip_open = true;
     let mut session = Session {
         writer,
         video,
@@ -240,9 +241,12 @@ where
                 }
                 ControlFlow::Continue(())
             }
-            ev = clip_ev_rx.recv() => {
-                if let Some(ev) = ev {
-                    clipboard.on_compositor_event(ev);
+            // Disarmed once the sender is gone (clipboard bridge failed or
+            // ended), or a closed channel would keep this arm always ready.
+            ev = clip_ev_rx.recv(), if clip_open => {
+                match ev {
+                    Some(ev) => clipboard.on_compositor_event(ev),
+                    None => clip_open = false,
                 }
                 ControlFlow::Continue(())
             }
