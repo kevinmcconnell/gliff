@@ -107,8 +107,10 @@ round-trip.
   frame rate is not capped by latency and a slow client cannot build a backlog.
   Frames are captured on demand, so a static screen costs nothing.
   A separate writer task owns the socket write half and keeps at most one
-  queued encoded frame; unsent cursor, clipboard and pong messages are
-  coalesced, and stream configuration stays ordered with its video frames.
+  queued encoded frame; unsent cursor and pong messages are coalesced,
+  clipboard messages are never coalesced (transfers are ordered and
+  reliable, bounded by the engine's ack window), and stream configuration
+  stays ordered with its video frames.
   The session keeps processing input while a video write is blocked.
 
 - **Threading.** Each pipeline lives on one thread: the server loop and the
