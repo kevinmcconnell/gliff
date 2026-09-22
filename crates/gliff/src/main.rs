@@ -692,12 +692,15 @@ fn poll_status(ui: Rc<App>, rx: Receiver<Status>, session: u64) {
                     width,
                     height,
                     scale_milli,
+                    video,
                 } => {
                     ui.stream_size.set((width, height));
                     ui.stream_scale.set((scale_milli.max(1) as f32) / 1000.0);
                     ui.resize_requested.set((0, 0));
                     ui.retries.set(0);
                     ui.status.set_text(&format!("Connected — {width}x{height}"));
+                    // Visible before the first per-second stats arrive.
+                    ui.stats.set_text(&video);
                     remember_machine(&ui);
                     // A fresh server starts at its own default size; a
                     // reconnect must bring it back to the window.

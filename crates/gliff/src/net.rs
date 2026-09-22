@@ -21,6 +21,8 @@ pub enum Status {
         width: u32,
         height: u32,
         scale_milli: u32,
+        /// "server pipeline > client pipeline", e.g. "gpu > cpu".
+        video: String,
     },
     Stats {
         fps: f32,
@@ -205,13 +207,14 @@ where
         other => anyhow::bail!("expected StreamConfig, got {other:?}"),
     };
     let mut decoder = new_decoder(&gpu, chroma, width, height)?;
+    let local = if gpu.is_some() { "gpu" } else { "cpu" };
+    let mut video_label = format!("{} > {}", pipeline.label(), local);
     let _ = status.send(Status::Connected {
         width,
         height,
         scale_milli,
+        video: video_label.clone(),
     });
-    let local = if gpu.is_some() { "gpu" } else { "cpu" };
-    let mut video_label = format!("{} > {}", pipeline.label(), local);
     let decode_on = gpu.as_ref().map_or("cpu", |g| g.name.as_str());
     tracing::info!(width, height, scale_milli, decode_on, video = %video_label, "connected");
     let mut logged_first = false;
@@ -315,8 +318,6 @@ where
                 };
                 bytes_since += (data_len + aux_len) as u64;
                 drain_at = tokio::time::Instant::now() + IDLE_DRAIN;
-                // A live frame supersedes a drained one awaiting retry.
-                undelivered = None;
                 let t0 = std::time::Instant::now();
                 let decoded = match &mut decoder {
                     VideoDecoder::Gpu(d) => d
@@ -343,8 +344,16 @@ where
                             tracing::info!("first frame decoded");
                             logged_first = true;
                         }
-                        // Latest-wins: drop this frame if the UI hasn't drained.
-                        let _ = frames.try_send(frame);
+                        // Latest-wins: a frame the full UI channel rejects
+                        // waits in `undelivered` (superseding any drained
+                        // one) and is retried at the drain cadence.
+                        match frames.try_send(frame) {
+                            Ok(()) => undelivered = None,
+                            Err(std::sync::mpsc::TrySendError::Full(frame)) => {
+                                undelivered = Some(frame)
+                            }
+                            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {}
+                        }
                         frames_since += 1;
                         decode_ms_acc += dec_ms;
                     }
@@ -370,6 +379,7 @@ where
                     width,
                     height,
                     scale_milli,
+                    video: video_label.clone(),
                 });
             }
             ServerMsg::CursorShape {
