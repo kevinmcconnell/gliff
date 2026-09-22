@@ -117,11 +117,13 @@ pub enum ClientMsg {
     RequestKeyframe,
     /// The local selection changed; see [`ClipboardMsg::Offer`].
     ClipboardOffer {
+        serial: u32,
         mime_types: Vec<String>,
         files: Vec<ClipboardFile>,
     },
     ClipboardRequest {
         id: u32,
+        serial: u32,
         item: ClipboardItem,
     },
     /// `data_len` payload bytes follow the header.
@@ -189,11 +191,13 @@ pub enum ServerMsg {
         visible: bool,
     },
     ClipboardOffer {
+        serial: u32,
         mime_types: Vec<String>,
         files: Vec<ClipboardFile>,
     },
     ClipboardRequest {
         id: u32,
+        serial: u32,
         item: ClipboardItem,
     },
     ClipboardData {
@@ -226,10 +230,18 @@ macro_rules! clipboard_bridge {
         impl From<ClipboardMsg> for $msg {
             fn from(m: ClipboardMsg) -> Self {
                 match m {
-                    ClipboardMsg::Offer { mime_types, files } => {
-                        $msg::ClipboardOffer { mime_types, files }
+                    ClipboardMsg::Offer {
+                        serial,
+                        mime_types,
+                        files,
+                    } => $msg::ClipboardOffer {
+                        serial,
+                        mime_types,
+                        files,
+                    },
+                    ClipboardMsg::Request { id, serial, item } => {
+                        $msg::ClipboardRequest { id, serial, item }
                     }
-                    ClipboardMsg::Request { id, item } => $msg::ClipboardRequest { id, item },
                     ClipboardMsg::Data {
                         id,
                         offset,
@@ -251,10 +263,18 @@ macro_rules! clipboard_bridge {
             /// Split off a clipboard message; any other message is handed back.
             pub fn into_clipboard(self) -> Result<ClipboardMsg, Self> {
                 Ok(match self {
-                    $msg::ClipboardOffer { mime_types, files } => {
-                        ClipboardMsg::Offer { mime_types, files }
+                    $msg::ClipboardOffer {
+                        serial,
+                        mime_types,
+                        files,
+                    } => ClipboardMsg::Offer {
+                        serial,
+                        mime_types,
+                        files,
+                    },
+                    $msg::ClipboardRequest { id, serial, item } => {
+                        ClipboardMsg::Request { id, serial, item }
                     }
-                    $msg::ClipboardRequest { id, item } => ClipboardMsg::Request { id, item },
                     $msg::ClipboardData {
                         id,
                         offset,
@@ -336,6 +356,7 @@ mod tests {
     fn clipboard_messages_bridge_both_directions() {
         let msgs = vec![
             ClipboardMsg::Offer {
+                serial: 4,
                 mime_types: vec!["image/png".into()],
                 files: vec![ClipboardFile {
                     path: "a/b.txt".into(),
@@ -345,6 +366,7 @@ mod tests {
             },
             ClipboardMsg::Request {
                 id: 7,
+                serial: 4,
                 item: ClipboardItem::File(0),
             },
             ClipboardMsg::Data {

@@ -228,6 +228,7 @@ fn default_base() -> PathBuf {
 pub async fn fetch_files(
     transfers: &Transfers,
     files: &[ClipboardFile],
+    serial: u32,
     spool: &Spool,
     meter: &Meter,
 ) -> Result<Vec<PathBuf>, TransferError> {
@@ -246,6 +247,7 @@ pub async fn fetch_files(
         transfers
             .fetch(
                 ClipboardItem::File(i as u32),
+                serial,
                 meter.wrap(WriteSink(file)),
                 Some(f.size),
             )

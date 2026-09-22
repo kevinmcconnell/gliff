@@ -146,7 +146,11 @@ round-trip.
   rules and `gliff_transport::clipboard` the engine both peers run. A new
   selection is announced as an `Offer` of mime types (plus a file list when it
   holds a `text/uri-list`); the peer advertises the same on its own clipboard
-  and sends a `Request` only when an application there pastes. The item then
+  and sends a `Request` only when an application there pastes. Each offer
+  carries a serial that requests must echo, so a request racing a clipboard
+  change is refused rather than resolved against the wrong file list; the
+  client allocates odd transfer ids and the server even ones, so an `Abort`
+  is never ambiguous between directions. The item then
   streams as `Data` chunks of at most 256 KiB with four chunks in flight per
   `Ack`, so a large payload cannot stall video or buffer without bound; an
   in-memory item is capped at 32 MiB, a file at its declared size, and either

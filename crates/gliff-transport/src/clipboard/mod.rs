@@ -41,11 +41,13 @@ pub fn outbound_channel() -> (Outbound, mpsc::Receiver<(ClipboardMsg, Bytes)>) {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     Offer {
+        serial: u32,
         mime_types: Vec<String>,
         files: Vec<ClipboardFile>,
     },
     Request {
         id: u32,
+        serial: u32,
         item: ClipboardItem,
     },
 }
@@ -155,11 +157,30 @@ struct Outgoing {
     task: AbortHandle,
 }
 
+/// Which peer this engine runs on. Each side allocates request ids of its
+/// own parity (client odd, server even), so concurrent transfers in
+/// opposite directions never share an id and an `Abort` is unambiguous.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    Client,
+    Server,
+}
+
 struct Inner {
     out: Outbound,
+    side: Side,
     next_id: u32,
     incoming: HashMap<u32, Incoming>,
     outgoing: HashMap<u32, Outgoing>,
+}
+
+impl Inner {
+    fn our_parity(&self) -> u32 {
+        match self.side {
+            Side::Client => 1,
+            Side::Server => 0,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -168,11 +189,15 @@ pub struct Transfers {
 }
 
 impl Transfers {
-    pub fn new(out: Outbound) -> Self {
+    pub fn new(out: Outbound, side: Side) -> Self {
         Self {
             inner: Rc::new(RefCell::new(Inner {
                 out,
-                next_id: 1,
+                side,
+                next_id: match side {
+                    Side::Client => 1,
+                    Side::Server => 2,
+                },
                 incoming: HashMap::new(),
                 outgoing: HashMap::new(),
             })),
@@ -183,10 +208,25 @@ impl Transfers {
     /// followed the header (empty for other messages).
     pub fn on_msg(&self, msg: ClipboardMsg, payload: Bytes) -> Option<Event> {
         match msg {
-            ClipboardMsg::Offer { mime_types, files } => {
-                return Some(Event::Offer { mime_types, files })
+            ClipboardMsg::Offer {
+                serial,
+                mime_types,
+                files,
+            } => {
+                return Some(Event::Offer {
+                    serial,
+                    mime_types,
+                    files,
+                })
             }
-            ClipboardMsg::Request { id, item } => return Some(Event::Request { id, item }),
+            ClipboardMsg::Request { id, serial, item } => {
+                if id % 2 == self.inner.borrow().our_parity() {
+                    tracing::warn!(id, "clipboard request with our own id parity refused");
+                    self.send_later(ClipboardMsg::Abort { id });
+                    return None;
+                }
+                return Some(Event::Request { id, serial, item });
+            }
             ClipboardMsg::Data {
                 id,
                 offset,
@@ -281,6 +321,7 @@ impl Transfers {
     pub async fn fetch<S: ChunkSink>(
         &self,
         item: ClipboardItem,
+        serial: u32,
         mut sink: S,
         cap: Option<u64>,
     ) -> Result<u64, TransferError> {
@@ -289,7 +330,10 @@ impl Transfers {
         let (id, out) = {
             let mut inner = self.inner.borrow_mut();
             let id = inner.next_id;
-            inner.next_id = inner.next_id.wrapping_add(1).max(1);
+            inner.next_id = inner.next_id.wrapping_add(2);
+            if inner.next_id == 0 {
+                inner.next_id = 2;
+            }
             inner.incoming.insert(
                 id,
                 Incoming {
@@ -303,7 +347,7 @@ impl Transfers {
             transfers: self.clone(),
             id,
         };
-        out.send((ClipboardMsg::Request { id, item }, Bytes::new()))
+        out.send((ClipboardMsg::Request { id, serial, item }, Bytes::new()))
             .await
             .map_err(|_| TransferError::PeerGone)?;
         let mut received = 0u64;
@@ -490,8 +534,8 @@ mod tests {
     fn pair() -> (Transfers, Transfers, Events, Events) {
         let (a_out, a_rx) = outbound_channel();
         let (b_out, b_rx) = outbound_channel();
-        let a = Transfers::new(a_out);
-        let b = Transfers::new(b_out);
+        let a = Transfers::new(a_out, Side::Client);
+        let b = Transfers::new(b_out, Side::Server);
         let a_events = Rc::new(RefCell::new(Vec::new()));
         let b_events = Rc::new(RefCell::new(Vec::new()));
         pump(a_rx, b.clone(), b_events.clone());
@@ -539,6 +583,7 @@ mod tests {
             let got = a
                 .fetch(
                     ClipboardItem::Mime("image/png".into()),
+                    0,
                     MemorySink::default(),
                     Some(MAX_ITEM_FOR_TEST),
                 )
@@ -567,7 +612,7 @@ mod tests {
                 }
                 v
             });
-            a.fetch(ClipboardItem::Mime("x".into()), tx, None)
+            a.fetch(ClipboardItem::Mime("x".into()), 0, tx, None)
                 .await
                 .unwrap();
             assert_eq!(collect.await.unwrap(), data);
@@ -578,7 +623,7 @@ mod tests {
     fn a_sender_waits_for_acks_after_a_window() {
         run(async {
             let (b_out, mut b_rx) = outbound_channel();
-            let b = Transfers::new(b_out);
+            let b = Transfers::new(b_out, Side::Server);
             let data = vec![1u8; (WINDOW as usize + 3) * CHUNK];
             b.serve(9, ReadSource(Cursor::new(data)));
             let mut chunks = 0;
@@ -611,6 +656,56 @@ mod tests {
     }
 
     #[test]
+    fn sides_allocate_ids_of_their_own_parity() {
+        run(async {
+            for (side, parity) in [(Side::Client, 1), (Side::Server, 0)] {
+                let (out, _rx) = outbound_channel();
+                let engine = Transfers::new(out, side);
+                for _ in 0..3 {
+                    let e = engine.clone();
+                    tokio::task::spawn_local(async move {
+                        let _ = e
+                            .fetch(
+                                ClipboardItem::Mime("x".into()),
+                                0,
+                                MemorySink::default(),
+                                None,
+                            )
+                            .await;
+                    });
+                }
+                for _ in 0..5 {
+                    tokio::task::yield_now().await;
+                }
+                let inner = engine.inner.borrow();
+                assert_eq!(inner.incoming.len(), 3);
+                assert!(inner.incoming.keys().all(|id| id % 2 == parity));
+            }
+        });
+    }
+
+    #[test]
+    fn a_request_with_our_own_parity_is_refused() {
+        run(async {
+            let (b_out, mut b_rx) = outbound_channel();
+            let server = Transfers::new(b_out, Side::Server);
+            let ev = server.on_msg(
+                ClipboardMsg::Request {
+                    id: 2,
+                    serial: 0,
+                    item: ClipboardItem::Mime("x".into()),
+                },
+                Bytes::new(),
+            );
+            assert!(ev.is_none());
+            let sent = tokio::time::timeout(Duration::from_millis(200), b_rx.recv())
+                .await
+                .unwrap();
+            assert!(matches!(sent, Some((ClipboardMsg::Abort { id: 2 }, _))));
+        });
+    }
+
+    #[test]
     fn a_refused_request_fails_the_fetch() {
         run(async {
             let (a, b, _ae, be) = pair();
@@ -625,7 +720,12 @@ mod tests {
                 }
             });
             let r = a
-                .fetch(ClipboardItem::Mime("x".into()), MemorySink::default(), None)
+                .fetch(
+                    ClipboardItem::Mime("x".into()),
+                    0,
+                    MemorySink::default(),
+                    None,
+                )
                 .await;
             assert!(matches!(r, Err(TransferError::Aborted)), "{r:?}");
             assert!(a.inner.borrow().incoming.is_empty());
@@ -640,6 +740,7 @@ mod tests {
             let r = a
                 .fetch(
                     ClipboardItem::Mime("x".into()),
+                    0,
                     MemorySink::default(),
                     Some(CHUNK as u64),
                 )
@@ -682,7 +783,7 @@ mod tests {
                 v
             });
             let n = a
-                .fetch(ClipboardItem::Mime("x".into()), tx, None)
+                .fetch(ClipboardItem::Mime("x".into()), 0, tx, None)
                 .await
                 .unwrap();
             assert_eq!(n as usize, CHUNK * 2 + 2);
@@ -726,7 +827,7 @@ mod tests {
             tokio::task::spawn_local(async move {
                 loop {
                     let req = be.borrow_mut().pop();
-                    if let Some(Event::Request { id, item }) = req {
+                    if let Some(Event::Request { id, item, .. }) = req {
                         let path = serving.path_for(&item).unwrap().to_path_buf();
                         b2.serve(id, open_source(&path).await.unwrap());
                     }
@@ -735,7 +836,7 @@ mod tests {
             });
             let base = tempfile::tempdir().unwrap();
             let spool = Spool::create_in(base.path()).unwrap();
-            let tops = fetch_files(&a, &local.entries, &spool, &Meter::default())
+            let tops = fetch_files(&a, &local.entries, 0, &spool, &Meter::default())
                 .await
                 .unwrap();
             assert_eq!(
@@ -797,7 +898,7 @@ mod tests {
                 size: 1,
                 dir: false,
             }];
-            let r = fetch_files(&a, &files, &spool, &Meter::default()).await;
+            let r = fetch_files(&a, &files, 0, &spool, &Meter::default()).await;
             assert!(
                 matches!(r, Err(TransferError::Chunk(ChunkError::OverCap(1)))),
                 "{r:?}"
@@ -832,7 +933,7 @@ mod tests {
                 size: 1,
                 dir: false,
             }];
-            let r = fetch_files(&a, &files, &spool, &Meter::default()).await;
+            let r = fetch_files(&a, &files, 0, &spool, &Meter::default()).await;
             assert!(matches!(r, Err(TransferError::Io(_))), "{r:?}");
             assert!(!base.path().join("escape").exists());
         });

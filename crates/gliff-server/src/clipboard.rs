@@ -38,6 +38,9 @@ const URI_LIST_MAX: usize = 1024 * 1024;
 
 #[derive(Default)]
 struct LocalOffer {
+    /// Serial of the offer this selection was (or will be) sent as; a
+    /// request against a replaced offer is refused.
+    serial: u32,
     /// Mime types the compositor's current selection advertises.
     mime_types: Vec<String>,
     files: LocalFiles,
@@ -45,6 +48,7 @@ struct LocalOffer {
 
 #[derive(Default)]
 struct RemoteOffer {
+    serial: u32,
     files: Vec<ClipboardFile>,
     /// The files once spooled for a paste; filled at most once per offer.
     spooled: Rc<OnceCell<Vec<PathBuf>>>,
@@ -76,8 +80,12 @@ impl Bridge {
     /// A message from the client.
     pub fn on_peer_msg(&self, msg: ClipboardMsg, payload: Bytes) {
         match self.transfers.on_msg(msg, payload) {
-            Some(Event::Offer { mime_types, files }) => self.on_remote_offer(mime_types, files),
-            Some(Event::Request { id, item }) => self.on_request(id, item),
+            Some(Event::Offer {
+                serial,
+                mime_types,
+                files,
+            }) => self.on_remote_offer(serial, mime_types, files),
+            Some(Event::Request { id, serial, item }) => self.on_request(id, serial, item),
             None => {}
         }
     }
@@ -90,11 +98,12 @@ impl Bridge {
         }
     }
 
-    fn on_remote_offer(&self, mime_types: Vec<String>, files: Vec<ClipboardFile>) {
+    fn on_remote_offer(&self, serial: u32, mime_types: Vec<String>, files: Vec<ClipboardFile>) {
         let advertise = local_mimes_for_offer(&mime_types, !files.is_empty());
         let previous = std::mem::replace(
             &mut *self.remote.borrow_mut(),
             RemoteOffer {
+                serial,
                 files,
                 ..RemoteOffer::default()
             },
@@ -107,11 +116,16 @@ impl Bridge {
         }
     }
 
-    fn on_request(&self, id: u32, item: ClipboardItem) {
+    fn on_request(&self, id: u32, serial: u32, item: ClipboardItem) {
         let Some(compositor) = &self.compositor else {
             self.transfers.refuse(id);
             return;
         };
+        if serial != self.local.borrow().serial {
+            tracing::debug!(id, serial, "clipboard request against a replaced offer");
+            self.transfers.refuse(id);
+            return;
+        }
         match item {
             ClipboardItem::Mime(requested) => {
                 let local = self.local.borrow();
@@ -157,6 +171,7 @@ impl Bridge {
         self.selection_gen.set(gen);
         {
             let mut local = self.local.borrow_mut();
+            local.serial = gen as u32;
             local.mime_types = mime_types.clone();
             local.files = LocalFiles::default();
         }
@@ -187,6 +202,7 @@ impl Bridge {
             local.borrow_mut().files = files;
             let _ = transfers
                 .send(ClipboardMsg::Offer {
+                    serial: gen as u32,
                     mime_types: offered,
                     files: entries,
                 })
@@ -204,7 +220,7 @@ impl Bridge {
         };
         let transfers = self.transfers.clone();
         if is_file_mime(&mime_type) {
-            let (files, spooled, spool) = {
+            let (serial, files, spooled, spool) = {
                 let mut remote = self.remote.borrow_mut();
                 if remote.files.is_empty() {
                     return;
@@ -219,6 +235,7 @@ impl Bridge {
                     }
                 }
                 (
+                    remote.serial,
                     remote.files.clone(),
                     remote.spooled.clone(),
                     remote.spool.clone().expect("just created"),
@@ -227,7 +244,7 @@ impl Bridge {
             let (label, total) = describe_files(&files);
             self.jobs.run(label, total, |meter| async move {
                 let paths = spooled
-                    .get_or_try_init(|| fetch_files(&transfers, &files, &spool, &meter))
+                    .get_or_try_init(|| fetch_files(&transfers, &files, serial, &spool, &meter))
                     .await?;
                 let body = file_list_body(&mime_type, paths).unwrap_or_default();
                 if let Err(e) = write_body(WriteSink(target), body).await {
@@ -236,10 +253,12 @@ impl Bridge {
                 Ok(())
             });
         } else {
+            let serial = self.remote.borrow().serial;
             self.jobs.run(mime_type.clone(), None, |meter| async move {
                 transfers
                     .fetch(
                         ClipboardItem::Mime(mime_type),
+                        serial,
                         meter.wrap(WriteSink(target)),
                         Some(MAX_ITEM),
                     )

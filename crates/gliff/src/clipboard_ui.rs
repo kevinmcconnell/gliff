@@ -166,6 +166,7 @@ pub fn read_local(mime_type: String, reply: Sender<std::io::Result<Bytes>>) {
 /// offer.
 pub fn set_remote_offer(
     tx: UnboundedSender<ToWorker>,
+    serial: u32,
     mime_types: Vec<String>,
     files: Vec<ClipboardFile>,
 ) {
@@ -179,7 +180,7 @@ pub fn set_remote_offer(
         }
         return;
     }
-    let provider = RemoteProvider::new(tx, mimes);
+    let provider = RemoteProvider::new(tx, serial, mimes);
     if let Err(e) = cb.set_content(Some(&provider)) {
         tracing::warn!(error = %e, "clipboard proxy not set");
     }
@@ -193,10 +194,11 @@ glib::wrapper! {
 }
 
 impl RemoteProvider {
-    fn new(tx: UnboundedSender<ToWorker>, mime_types: Vec<String>) -> Self {
+    fn new(tx: UnboundedSender<ToWorker>, serial: u32, mime_types: Vec<String>) -> Self {
         let obj: Self = glib::Object::new();
         let imp = obj.imp();
         *imp.tx.borrow_mut() = Some(tx);
+        imp.serial.set(serial);
         *imp.mime_types.borrow_mut() = mime_types;
         obj
     }
@@ -211,6 +213,10 @@ mod imp {
     #[derive(Default)]
     pub struct RemoteProvider {
         pub tx: RefCell<Option<UnboundedSender<ToWorker>>>,
+        /// Serial of the offer this provider proxies. A paste echoes it, so
+        /// one racing a newer offer is refused instead of served the wrong
+        /// item.
+        pub serial: Cell<u32>,
         pub mime_types: RefCell<Vec<String>>,
     }
 
@@ -237,6 +243,7 @@ mod imp {
             io_priority: glib::Priority,
         ) -> Pin<Box<dyn Future<Output = Result<(), glib::Error>> + 'static>> {
             let tx = self.tx.borrow().clone();
+            let serial = self.serial.get();
             let mime_type = mime_type.to_string();
             let stream = stream.clone();
             Box::pin(async move {
@@ -246,6 +253,7 @@ mod imp {
                 let (result_tx, result_rx) = oneshot::channel();
                 tx.send(ToWorker::Fetch {
                     mime_type,
+                    serial,
                     sink,
                     result: result_tx,
                 })

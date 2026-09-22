@@ -19,7 +19,7 @@ use gliff_proto::{
 };
 use gliff_sw::VideoMode;
 use gliff_transport::clipboard::progress::Jobs;
-use gliff_transport::clipboard::{outbound_channel, Transfers};
+use gliff_transport::clipboard::{outbound_channel, Side, Transfers};
 use gliff_transport::Framed;
 use gliff_vk::{DmabufPlane, EncodedFrame, Encoder, EncoderSettings, Gpu};
 
@@ -173,7 +173,11 @@ where
         let _ = report_tx.send((id, progress));
     });
     notify::forward_cancels(cancel_rx, jobs.clone());
-    let clipboard = Bridge::new(Transfers::new(clip_out_tx), jobs, compositor_clipboard);
+    let clipboard = Bridge::new(
+        Transfers::new(clip_out_tx, Side::Server),
+        jobs,
+        compositor_clipboard,
+    );
 
     let bitrate_ctl = match cfg.bitrate {
         Some(fixed) => BitrateController::new(fixed, true),

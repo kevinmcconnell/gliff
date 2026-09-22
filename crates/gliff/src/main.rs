@@ -699,9 +699,13 @@ fn poll_status(ui: Rc<App>, rx: Receiver<Status>, session: u64) {
                     hot_y,
                     argb,
                 } => set_remote_cursor(&ui, width, height, hot_x, hot_y, &argb),
-                Status::ClipboardOffer { mime_types, files } => {
+                Status::ClipboardOffer {
+                    serial,
+                    mime_types,
+                    files,
+                } => {
                     if let Some(tx) = ui.input_tx.borrow().clone() {
-                        clipboard_ui::set_remote_offer(tx, mime_types, files);
+                        clipboard_ui::set_remote_offer(tx, serial, mime_types, files);
                     }
                 }
                 Status::ClipboardRead { mime_type, reply } => {

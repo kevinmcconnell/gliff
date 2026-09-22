@@ -13,7 +13,7 @@
 //! asked to read it ([`Status::ClipboardRead`]) into a channel that is served
 //! to the engine; a file is served from disk here.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::io;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -40,10 +40,11 @@ pub enum ToWorker {
         mime_types: Vec<String>,
         files: LocalFiles,
     },
-    /// An application pastes `mime_type` from the server's offer: stream it
-    /// into `sink`, then report the outcome.
+    /// An application pastes `mime_type` from the server's offer with
+    /// `serial`: stream it into `sink`, then report the outcome.
     Fetch {
         mime_type: String,
+        serial: u32,
         sink: mpsc::Sender<Bytes>,
         result: oneshot::Sender<Result<(), String>>,
     },
@@ -53,6 +54,7 @@ pub enum ToWorker {
 
 #[derive(Default)]
 struct RemoteOffer {
+    serial: u32,
     files: Vec<ClipboardFile>,
     spooled: Rc<OnceCell<Vec<PathBuf>>>,
     spool: Option<Rc<Spool>>,
@@ -62,6 +64,9 @@ pub struct Bridge {
     transfers: Transfers,
     jobs: Jobs,
     status: StdSender<Status>,
+    /// Serial of the last offer sent for the local selection; a request
+    /// against a replaced offer is refused.
+    local_serial: Cell<u32>,
     local_files: RefCell<LocalFiles>,
     remote: RefCell<RemoteOffer>,
 }
@@ -75,6 +80,7 @@ impl Bridge {
                 let _ = report_to.send(Status::ClipboardTransfer { id, progress });
             }),
             status,
+            local_serial: Cell::new(0),
             local_files: RefCell::default(),
             remote: RefCell::default(),
         }
@@ -82,10 +88,15 @@ impl Bridge {
 
     pub fn on_peer_msg(&self, msg: ClipboardMsg, payload: Bytes) {
         match self.transfers.on_msg(msg, payload) {
-            Some(Event::Offer { mime_types, files }) => {
+            Some(Event::Offer {
+                serial,
+                mime_types,
+                files,
+            }) => {
                 let previous = std::mem::replace(
                     &mut *self.remote.borrow_mut(),
                     RemoteOffer {
+                        serial,
                         files: files.clone(),
                         ..RemoteOffer::default()
                     },
@@ -93,16 +104,23 @@ impl Bridge {
                 if let Some(spool) = previous.spool {
                     retire(spool);
                 }
-                let _ = self
-                    .status
-                    .send(Status::ClipboardOffer { mime_types, files });
+                let _ = self.status.send(Status::ClipboardOffer {
+                    serial,
+                    mime_types,
+                    files,
+                });
             }
-            Some(Event::Request { id, item }) => self.on_request(id, item),
+            Some(Event::Request { id, serial, item }) => self.on_request(id, serial, item),
             None => {}
         }
     }
 
-    fn on_request(&self, id: u32, item: ClipboardItem) {
+    fn on_request(&self, id: u32, serial: u32, item: ClipboardItem) {
+        if serial != self.local_serial.get() {
+            tracing::debug!(id, serial, "clipboard request against a replaced offer");
+            self.transfers.refuse(id);
+            return;
+        }
         match item {
             ClipboardItem::Mime(mime_type) => {
                 let (reply, rx) = mpsc::channel::<io::Result<Bytes>>(2);
@@ -141,12 +159,15 @@ impl Bridge {
         match cmd {
             ToWorker::Send(_) => {}
             ToWorker::LocalOffer { mime_types, files } => {
+                let serial = self.local_serial.get().wrapping_add(1);
+                self.local_serial.set(serial);
                 let entries = files.entries.clone();
                 *self.local_files.borrow_mut() = files;
                 let transfers = self.transfers.clone();
                 tokio::task::spawn_local(async move {
                     let _ = transfers
                         .send(ClipboardMsg::Offer {
+                            serial,
                             mime_types,
                             files: entries,
                         })
@@ -155,9 +176,10 @@ impl Bridge {
             }
             ToWorker::Fetch {
                 mime_type,
+                serial,
                 sink,
                 result,
-            } => self.fetch(mime_type, sink, result),
+            } => self.fetch(mime_type, serial, sink, result),
             ToWorker::CancelTransfer(id) => self.jobs.cancel(id),
         }
     }
@@ -165,6 +187,7 @@ impl Bridge {
     fn fetch(
         &self,
         mime_type: String,
+        serial: u32,
         sink: mpsc::Sender<Bytes>,
         result: oneshot::Sender<Result<(), String>>,
     ) {
@@ -174,6 +197,7 @@ impl Bridge {
                 let r = transfers
                     .fetch(
                         ClipboardItem::Mime(mime_type),
+                        serial,
                         meter.wrap(sink),
                         Some(MAX_ITEM),
                     )
@@ -185,6 +209,10 @@ impl Bridge {
         }
         let (files, spooled, spool) = {
             let mut remote = self.remote.borrow_mut();
+            if remote.serial != serial {
+                let _ = result.send(Err("the offer was replaced".into()));
+                return;
+            }
             if remote.files.is_empty() {
                 let _ = result.send(Err("no files offered".into()));
                 return;
@@ -207,7 +235,7 @@ impl Bridge {
         let (label, total) = describe_files(&files);
         self.jobs.run(label, total, |meter| async move {
             let r = match spooled
-                .get_or_try_init(|| fetch_files(&transfers, &files, &spool, &meter))
+                .get_or_try_init(|| fetch_files(&transfers, &files, serial, &spool, &meter))
                 .await
             {
                 Ok(paths) => {
@@ -218,6 +246,54 @@ impl Bridge {
             };
             let _ = result.send(r.as_ref().map(|_| ()).map_err(|e| e.to_string()));
             r
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gliff_transport::clipboard::{outbound_channel, Side};
+
+    #[test]
+    fn a_request_against_a_replaced_offer_is_refused() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        tokio::task::LocalSet::new().block_on(&rt, async {
+            let (out, mut rx) = outbound_channel();
+            let (status_tx, status_rx) = std::sync::mpsc::channel();
+            let bridge = Bridge::new(Transfers::new(out, Side::Client), status_tx);
+            bridge.on_ui(ToWorker::LocalOffer {
+                mime_types: vec!["text/plain".into()],
+                files: LocalFiles::default(),
+            });
+            let offered = rx.recv().await.unwrap();
+            assert!(matches!(offered.0, ClipboardMsg::Offer { serial: 1, .. }));
+            bridge.on_peer_msg(
+                ClipboardMsg::Request {
+                    id: 2,
+                    serial: 0,
+                    item: ClipboardItem::Mime("text/plain".into()),
+                },
+                Bytes::new(),
+            );
+            let refused = rx.recv().await.unwrap();
+            assert!(matches!(refused.0, ClipboardMsg::Abort { id: 2 }));
+            assert!(status_rx.try_recv().is_err());
+            bridge.on_peer_msg(
+                ClipboardMsg::Request {
+                    id: 4,
+                    serial: 1,
+                    item: ClipboardItem::Mime("text/plain".into()),
+                },
+                Bytes::new(),
+            );
+            assert!(matches!(
+                status_rx.try_recv().unwrap(),
+                Status::ClipboardRead { .. }
+            ));
         });
     }
 }

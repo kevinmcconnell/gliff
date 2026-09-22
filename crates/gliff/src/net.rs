@@ -17,7 +17,7 @@ use gliff_proto::{
 };
 use gliff_sw::VideoMode;
 use gliff_transport::clipboard::progress::Progress;
-use gliff_transport::clipboard::{outbound_channel, Transfers};
+use gliff_transport::clipboard::{outbound_channel, Side, Transfers};
 use gliff_transport::{spawn_ssh, Framed, SshTarget};
 use gliff_vk::{Decoder, DisplayFrame, Gpu};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -50,8 +50,10 @@ pub enum Status {
         argb: Vec<u8>,
     },
     /// The remote selection changed: put a proxy for these on the local
-    /// clipboard, or clear ours when both lists are empty.
+    /// clipboard, or clear ours when both lists are empty. Pastes from the
+    /// proxy echo `serial`, so one racing a newer offer is refused.
     ClipboardOffer {
+        serial: u32,
         mime_types: Vec<String>,
         files: Vec<ClipboardFile>,
     },
@@ -262,7 +264,10 @@ where
     });
     // Clipboard transfers write through the same channel, in chunks.
     let (clip_out_tx, mut clip_out_rx) = outbound_channel();
-    let clipboard = Rc::new(Bridge::new(Transfers::new(clip_out_tx), status.clone()));
+    let clipboard = Rc::new(Bridge::new(
+        Transfers::new(clip_out_tx, Side::Client),
+        status.clone(),
+    ));
     {
         let out_tx = out_tx.clone();
         tokio::task::spawn_local(async move {

@@ -78,13 +78,21 @@ pub enum ClipboardItem {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClipboardMsg {
     /// The sender's selection changed to something it can serve. Empty lists
-    /// mean the selection was cleared or holds nothing forwardable.
+    /// mean the selection was cleared or holds nothing forwardable. `serial`
+    /// identifies this offer; requests must echo it.
     Offer {
+        serial: u32,
         mime_types: Vec<String>,
         files: Vec<ClipboardFile>,
     },
-    /// Stream `item` from the current offer. `id` is chosen by the requester.
-    Request { id: u32, item: ClipboardItem },
+    /// Stream `item` from the offer with `serial`. `id` is chosen by the
+    /// requester. A request against a replaced offer is refused, so a file
+    /// index can never resolve against the wrong file list.
+    Request {
+        id: u32,
+        serial: u32,
+        item: ClipboardItem,
+    },
     /// One chunk; the payload of `data_len` bytes follows on the wire.
     Data {
         id: u32,
