@@ -7,7 +7,7 @@ arch=('x86_64')
 url="https://github.com/kevinmcconnell/gliff"
 license=('MIT')
 depends=('wayland' 'libxkbcommon' 'libdrm' 'mesa' 'gtk4' 'libadwaita' 'vulkan-icd-loader')
-makedepends=('rust' 'cargo' 'pkgconf')
+makedepends=('rust' 'cargo' 'pkgconf' 'gcc' 'nasm')
 optdepends=('vulkan-radeon: Vulkan on AMD'
             'vulkan-intel: Vulkan on Intel'
             'vulkan-tools: vulkaninfo for debugging'

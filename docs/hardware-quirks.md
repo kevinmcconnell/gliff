@@ -1,8 +1,11 @@
 # Hardware and driver quirks
 
-gliff targets Vulkan Video on both ends. Driver behaviour differs, so this
-file records what we have found and where more testing is needed. Findings so
-far come from **two** machines:
+gliff targets Vulkan Video on both ends, with a CPU fallback (OpenH264 in
+`gliff-sw`) for machines without it: in the default `--video gpu` mode a
+failed device open or a missing encode/decode queue drops to the CPU tier
+with a log line, and `--video cpu` / `GLIFF_VIDEO=cpu` forces it. Driver
+behaviour differs, so this file records what we have found and where more
+testing is needed. Findings so far come from **two** machines:
 
 - GPU: AMD Granite Ridge iGPU (Ryzen 9 9955HX), VCN 4 class.
   Driver: Mesa RADV 26.2 (Vulkan 1.4), kernel 7.2.
@@ -125,10 +128,10 @@ the request took effect.
 ## Confirmed on Intel ANV
 
 ### Vulkan Video stays hidden until `ANV_DEBUG` asks for it
-ANV compiles video support in but gates it off, so every gliff binary exits
-with `no suitable GPU: no Vulkan device with a compute queue, dmabuf import
-and video queues` until the environment carries
-`ANV_DEBUG=video-decode,video-encode`. With it set ANV advertises
+ANV compiles video support in but gates it off, so every gliff binary
+reports `no suitable GPU: no Vulkan device with a compute queue, dmabuf
+import and video queues` and falls back to the CPU tier until the
+environment carries `ANV_DEBUG=video-decode,video-encode`. With it set ANV advertises
 `VK_KHR_video_queue`, `VK_KHR_video_decode_queue`, `VK_KHR_video_encode_queue`,
 `VK_KHR_video_decode_h264` and `VK_KHR_video_encode_h264`, plus a second queue
 family carrying `VIDEO_DECODE_KHR | VIDEO_ENCODE_KHR`, and `gliff-probe vulkan`

@@ -1,0 +1,15 @@
+[package]
+name = "gliff-sw"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+gliff-proto.workspace = true
+openh264.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

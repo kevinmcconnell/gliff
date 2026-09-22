@@ -9,6 +9,13 @@ the client). The whole media path stays on the GPU: the captured dmabuf is
 imported into Vulkan, split by a compute shader, encoded, and on the client
 decoded, recombined by a compute shader and handed to GTK as a dmabuf.
 
+Machines without Vulkan Video fall back to a CPU pipeline (OpenH264), so
+gliff runs anywhere Hyprland runs; `--video cpu` (or `GLIFF_VIDEO=cpu`)
+forces it for testing. The CPU tier streams a single 4:2:0 stream by default
+(`--full-chroma` on the server keeps 4:4:4). Server and client pick their
+tiers independently, so a hardware server can feed a software client and the
+reverse.
+
 ## Status
 
 Working and validated on AMD (Ryzen Granite Ridge, Mesa RADV):
@@ -56,15 +63,17 @@ To build from source:
 cargo build --release
 ```
 
-Needs Rust and the runtime libraries in the PKGBUILD `depends`: a Vulkan
-loader and a driver with Vulkan Video (Mesa RADV 24+ on AMD). No C toolchain
-is needed; the compute shaders are committed as SPIR-V
+Needs Rust, a C++ toolchain (the vendored OpenH264 build; nasm speeds it up),
+and the runtime libraries in the PKGBUILD `depends`. The GPU tier needs a
+Vulkan loader and a driver with Vulkan Video (Mesa RADV 24+ on AMD); without
+one, gliff uses the CPU tier. The compute shaders are committed as SPIR-V
 (`crates/gliff-vk/shaders/build.sh` rebuilds them with `glslc`). Verify the
 machine first:
 
 ```
-gliff-probe all          # protocols, outputs, Vulkan, GPU encode/decode round-trip
-gliff-probe pipeline     # capture one frame and run the whole GPU 4:4:4 path
+gliff-probe all                  # protocols, outputs, Vulkan, GPU + CPU round-trips
+gliff-probe pipeline             # capture one frame and run the whole 4:4:4 path
+gliff-probe --video cpu roundtrip  # the CPU (OpenH264) tier alone
 ```
 
 To run under the Khronos validation layer during development:
@@ -117,7 +126,9 @@ cargo fmt --all --check    # formatting (rustfmt defaults)
 `scripts/e2e.sh` must run inside a Hyprland session; it boots a nested Hyprland
 and asserts the probe checks, the 4:4:4 capture pipeline, and both Dual420 and
 Single420 server-plus-client streams, including continued decoding after a
-mirrored output changes size.
+mirrored output changes size. It also runs the CPU tier matrix (cpu<->cpu and
+each mixed pairing); on a machine without Vulkan Video the GPU cases are
+skipped and the CPU cases still run.
 
 ## Layout
 
@@ -130,4 +141,6 @@ mirrored output changes size.
 - `crates/gliff-vk` the Vulkan media pipeline: device, dmabuf import/export,
   split and recombine compute shaders, H.264 encode/decode, header parser.
   The only crate with `unsafe`.
+- `crates/gliff-sw` the CPU fallback pipeline: OpenH264 encode/decode around
+  the `gliff-proto` colour and chroma reference code.
 - `crates/gliff` the GTK client, `crates/gliff-server`, `crates/gliff-probe`.

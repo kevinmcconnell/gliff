@@ -9,6 +9,7 @@ use std::sync::mpsc::{Sender as StdSender, SyncSender};
 use std::sync::Arc;
 
 use gliff_proto::{ChromaMode, ClientCaps, ClientMsg, Codec, ServerMsg, PROTOCOL_VERSION};
+use gliff_sw::VideoMode;
 use gliff_transport::{spawn_ssh, Framed, SshTarget};
 use gliff_vk::{Decoder, DisplayFrame, Gpu};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -47,11 +48,19 @@ pub enum Endpoint {
     Ssh(SshTarget),
 }
 
+/// A decoded frame for the GTK thread: a dmabuf from the GPU tier, or plain
+/// BGRA pixels from the CPU tier.
+pub enum Frame {
+    Dmabuf(DisplayFrame),
+    Bgra(gliff_sw::BgraFrame),
+}
+
 pub struct Worker {
     pub endpoint: Endpoint,
+    pub video: VideoMode,
     /// Bounded so a stalled UI thread cannot make the decoder buffer frames
     /// without limit; when full, the newest frame is dropped (latest-wins).
-    pub frames: SyncSender<DisplayFrame>,
+    pub frames: SyncSender<Frame>,
     pub status: StdSender<Status>,
     pub input: UnboundedReceiver<(ClientMsg, Vec<u8>)>,
 }
@@ -77,11 +86,19 @@ impl Worker {
                     let stream = tokio::net::TcpStream::connect(addr).await?;
                     stream.set_nodelay(true)?;
                     let (rd, wr) = tokio::io::split(stream);
-                    session(rd, wr, self.frames, self.status, self.input).await
+                    session(rd, wr, self.video, self.frames, self.status, self.input).await
                 }
                 Endpoint::Ssh(ref target) => {
                     let ssh = spawn_ssh(target)?;
-                    session(ssh.stdout, ssh.stdin, self.frames, self.status, self.input).await
+                    session(
+                        ssh.stdout,
+                        ssh.stdin,
+                        self.video,
+                        self.frames,
+                        self.status,
+                        self.input,
+                    )
+                    .await
                 }
             }
         });
@@ -93,24 +110,50 @@ impl Worker {
     }
 }
 
+/// The decode pipeline: Vulkan Video on the GPU, or OpenH264 on the CPU.
+enum VideoDecoder {
+    Gpu(Box<Decoder>),
+    Cpu(Box<gliff_sw::Decoder>),
+}
+
+/// Open the GPU for decoding, or `None` for the CPU tier. In `Gpu` mode a
+/// machine without a usable Vulkan Video decoder falls back to the CPU.
+fn open_gpu(mode: VideoMode) -> Option<Arc<Gpu>> {
+    if mode == VideoMode::Cpu {
+        tracing::info!("using the CPU video pipeline as requested");
+        return None;
+    }
+    match Gpu::open(Some(&hypr_capture::render_node(None))) {
+        Ok(gpu) if gpu.can_decode() => Some(gpu),
+        Ok(gpu) => {
+            tracing::warn!(gpu = %gpu.name, "no Vulkan H.264 decode queue; falling back to the CPU pipeline");
+            None
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "no usable Vulkan device; falling back to the CPU pipeline");
+            None
+        }
+    }
+}
+
 fn new_decoder(
-    gpu: &Arc<Gpu>,
+    gpu: &Option<Arc<Gpu>>,
     chroma: ChromaMode,
     width: u32,
     height: u32,
-) -> anyhow::Result<Decoder> {
-    Ok(Decoder::new(
-        gpu,
-        chroma != ChromaMode::Single420,
-        width,
-        height,
-    )?)
+) -> anyhow::Result<VideoDecoder> {
+    let dual = chroma != ChromaMode::Single420;
+    Ok(match gpu {
+        Some(gpu) => VideoDecoder::Gpu(Box::new(Decoder::new(gpu, dual, width, height)?)),
+        None => VideoDecoder::Cpu(Box::new(gliff_sw::Decoder::new(dual)?)),
+    })
 }
 
 async fn session<R, W>(
     rd: R,
     wr: W,
-    frames: SyncSender<DisplayFrame>,
+    video: VideoMode,
+    frames: SyncSender<Frame>,
     status: StdSender<Status>,
     mut input: UnboundedReceiver<(ClientMsg, Vec<u8>)>,
 ) -> anyhow::Result<()>
@@ -121,11 +164,18 @@ where
     let mut reader = Framed::new(rd);
     let mut writer = Framed::new(wr);
 
+    let gpu = open_gpu(video);
     let caps = ClientCaps {
         codecs: vec![Codec::H264],
         max_width: 3840,
         max_height: 2160,
-        chroma: vec![ChromaMode::Dual420, ChromaMode::Single420],
+        // The CPU tier asks for one 4:2:0 stream so it decodes one stream,
+        // not two; the recombine also costs CPU on this side.
+        chroma: if gpu.is_some() {
+            vec![ChromaMode::Dual420, ChromaMode::Single420]
+        } else {
+            vec![ChromaMode::Single420]
+        },
     };
     let keymap = crate::keymap::local_keymap();
     writer
@@ -151,14 +201,14 @@ where
         } => (width, height, chroma, scale_milli),
         other => anyhow::bail!("expected StreamConfig, got {other:?}"),
     };
-    let gpu = Gpu::open(Some(&hypr_capture::render_node(None)))?;
     let mut decoder = new_decoder(&gpu, chroma, width, height)?;
     let _ = status.send(Status::Connected {
         width,
         height,
         scale_milli,
     });
-    tracing::info!(width, height, scale_milli, gpu = %gpu.name, "connected");
+    let decode_on = gpu.as_ref().map_or("cpu", |g| g.name.as_str());
+    tracing::info!(width, height, scale_milli, decode_on, "connected");
     let mut logged_first = false;
 
     // Writes run on their own task, fed by `out_tx`, so reads (draining video)
@@ -224,7 +274,16 @@ where
                 };
                 bytes_since += (data_len + aux_len) as u64;
                 let t0 = std::time::Instant::now();
-                let decoded = decoder.decode(&main, &aux);
+                let decoded = match &mut decoder {
+                    VideoDecoder::Gpu(d) => d
+                        .decode(&main, &aux)
+                        .map(|f| f.map(Frame::Dmabuf))
+                        .map_err(anyhow::Error::from),
+                    VideoDecoder::Cpu(d) => d
+                        .decode(&main, &aux)
+                        .map(|f| f.map(Frame::Bgra))
+                        .map_err(anyhow::Error::from),
+                };
                 let dec_ms = t0.elapsed().as_secs_f32() * 1000.0;
                 // Ack immediately so the server keeps pacing.
                 let _ = out_tx.send((

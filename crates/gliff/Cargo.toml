@@ -19,6 +19,7 @@ libadwaita.workspace = true
 gliff-proto.workspace = true
 gliff-transport.workspace = true
 gliff-vk.workspace = true
+gliff-sw.workspace = true
 hypr-capture.workspace = true
 bytes.workspace = true
 drm-fourcc.workspace = true

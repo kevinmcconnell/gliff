@@ -17,6 +17,7 @@ tokio = { workspace = true }
 gliff-proto.workspace = true
 gliff-transport.workspace = true
 gliff-vk.workspace = true
+gliff-sw.workspace = true
 drm-fourcc.workspace = true
 hypr-capture.workspace = true
 hypr-input.workspace = true
