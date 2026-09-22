@@ -140,7 +140,7 @@ impl Drop for Writer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gliff_proto::{ChromaMode, Codec};
+    use gliff_proto::{ChromaMode, Codec, VideoPipeline};
     use tokio::task::LocalSet;
 
     fn video(id: u64) -> (ServerMsg, Vec<Vec<u8>>) {
@@ -162,6 +162,7 @@ mod tests {
             ServerMsg::StreamConfig {
                 codec: Codec::H264,
                 chroma: ChromaMode::Single420,
+                pipeline: VideoPipeline::Gpu,
                 width,
                 height: 480,
                 scale_milli: 1000,

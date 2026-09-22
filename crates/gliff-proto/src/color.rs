@@ -64,6 +64,36 @@ pub fn yuv444_to_bgra(src: &Yuv444) -> Vec<u8> {
     out
 }
 
+/// Area-average a BGRA image down to `dw`x`dh`.
+pub fn downscale_bgra(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<u8> {
+    let mut out = vec![0u8; dw * dh * 4];
+    out.par_chunks_mut(dw * 4)
+        .enumerate()
+        .for_each(|(y, line)| {
+            let y0 = y * sh / dh;
+            let y1 = ((y + 1) * sh / dh).max(y0 + 1);
+            for x in 0..dw {
+                let x0 = x * sw / dw;
+                let x1 = ((x + 1) * sw / dw).max(x0 + 1);
+                let mut sum = [0u64; 4];
+                for sy in y0..y1 {
+                    for sx in x0..x1 {
+                        let p = &src[(sy * sw + sx) * 4..(sy * sw + sx) * 4 + 4];
+                        for c in 0..4 {
+                            sum[c] += p[c] as u64;
+                        }
+                    }
+                }
+                let n = ((y1 - y0) * (x1 - x0)) as u64;
+                let o = &mut line[x * 4..x * 4 + 4];
+                for c in 0..4 {
+                    o[c] = ((sum[c] + n / 2) / n) as u8;
+                }
+            }
+        });
+    out
+}
+
 /// Peak signal-to-noise ratio between two equal-length byte buffers.
 pub fn psnr(a: &[u8], b: &[u8]) -> f64 {
     let n = a.len().min(b.len());

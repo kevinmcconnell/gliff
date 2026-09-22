@@ -40,7 +40,8 @@ pub struct Instance {
 
 impl Instance {
     /// Locate an instance. Order: explicit signature, `HYPRLAND_INSTANCE_SIGNATURE`,
-    /// then the newest instance directory under `$XDG_RUNTIME_DIR/hypr`.
+    /// then the newest instance under `$XDG_RUNTIME_DIR/hypr` whose socket
+    /// answers (a crashed compositor leaves its directory and socket behind).
     pub fn discover(explicit: Option<&str>) -> Result<Self> {
         let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
@@ -79,8 +80,12 @@ impl Instance {
             ));
         }
         candidates.sort();
-        let (_, signature, dir) = candidates.pop().ok_or(Error::NoInstance(hypr_dir))?;
-        Ok(Self { signature, dir })
+        candidates
+            .into_iter()
+            .rev()
+            .find(|(_, _, dir)| UnixStream::connect(dir.join(".socket.sock")).is_ok())
+            .map(|(_, signature, dir)| Self { signature, dir })
+            .ok_or(Error::NoInstance(hypr_dir))
     }
 
     pub fn socket_path(&self) -> PathBuf {
@@ -224,20 +229,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn discovers_newest_instance() {
+    fn discovers_newest_live_instance() {
         let tmp = tempfile::tempdir().unwrap();
         let hypr = tmp.path().join("hypr");
-        for (name, age) in [("old_1_1", 20), ("new_2_2", 1)] {
+        let make = |name: &str, age: u64| {
             let dir = hypr.join(name);
             std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(dir.join(".socket.sock"), "").unwrap();
+            let listener =
+                std::os::unix::net::UnixListener::bind(dir.join(".socket.sock")).unwrap();
             std::fs::write(dir.join("hyprland.lock"), format!("123\nwayland-{age}\n")).unwrap();
             let t = std::time::SystemTime::now() - Duration::from_secs(age);
             std::fs::File::open(&dir).unwrap().set_modified(t).unwrap();
-        }
+            listener
+        };
+        let _old = make("old_1_1", 20);
+        let live = make("live_2_2", 10);
+        // A dead instance keeps its socket file, but nothing answers it.
+        drop(make("dead_3_3", 1));
+
         let inst = Instance::discover_in(tmp.path(), None).unwrap();
-        assert_eq!(inst.signature, "new_2_2");
-        assert_eq!(inst.wayland_display().unwrap(), "wayland-1");
+        assert_eq!(inst.signature, "live_2_2");
+        assert_eq!(inst.wayland_display().unwrap(), "wayland-10");
+        drop(live);
         let explicit = Instance::discover_in(tmp.path(), Some("old_1_1")).unwrap();
         assert_eq!(explicit.signature, "old_1_1");
         assert!(Instance::discover_in(tmp.path(), Some("missing")).is_err());

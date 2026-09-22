@@ -47,6 +47,15 @@ struct Cli {
     /// server adapts below it when the link shows queueing.
     #[arg(long)]
     bitrate: Option<u32>,
+    /// Video pipeline: `gpu` (Vulkan Video, falling back to the CPU when
+    /// unavailable) or `cpu` (force OpenH264 on the CPU). Overrides the
+    /// GLIFF_VIDEO environment variable.
+    #[arg(long, value_parser = ["gpu", "cpu"])]
+    video: Option<String>,
+    /// Keep dual-stream 4:4:4 colour on the CPU pipeline, which defaults to
+    /// a single 4:2:0 stream to halve the encode work.
+    #[arg(long)]
+    full_chroma: bool,
 }
 
 fn main() -> Result<()> {
@@ -75,6 +84,8 @@ fn main() -> Result<()> {
         render_node: hypr_capture::render_node(cli.render_node.as_deref()),
         low_bandwidth: cli.low_bandwidth,
         bitrate: cli.bitrate,
+        video: gliff_sw::VideoMode::resolve(cli.video.as_deref()),
+        full_chroma: cli.full_chroma,
     };
 
     let rt = tokio::runtime::Builder::new_current_thread()

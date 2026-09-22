@@ -13,10 +13,11 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use gliff_proto::{
     ChromaMode, ClientCaps, ClientMsg, Codec, OutputInfo as ProtoOutput, Rect, ServerMsg,
-    SessionInfo, PROTOCOL_VERSION,
+    SessionInfo, VideoPipeline, PROTOCOL_VERSION,
 };
+use gliff_sw::VideoMode;
 use gliff_transport::Framed;
-use gliff_vk::{DmabufPlane, Encoder, EncoderSettings, Gpu};
+use gliff_vk::{DmabufPlane, EncodedFrame, Encoder, EncoderSettings, Gpu};
 
 use crate::writer::Writer;
 use hypr_capture::{CaptureConfig, CaptureEvent, CapturedFrame, Capturer};
@@ -29,6 +30,9 @@ pub struct Config {
     pub render_node: PathBuf,
     pub low_bandwidth: bool,
     pub bitrate: Option<u32>,
+    pub video: VideoMode,
+    /// Dual-stream 4:4:4 on the CPU tier too (it defaults to Single420).
+    pub full_chroma: bool,
 }
 
 const TEXT_MIME: &str = "text/plain;charset=utf-8";
@@ -73,7 +77,24 @@ where
     let output = setup_output(&instance, &cfg, &caps)?;
     tracing::info!(output = %output.name, output.width, output.height, headless = output.is_headless(), "session output ready");
 
-    let chroma = if cfg.low_bandwidth || !caps.chroma.contains(&ChromaMode::Dual420) {
+    let video = VideoTier::open(cfg.video, &cfg.render_node);
+    if !caps.chroma.contains(&ChromaMode::Dual420) && !caps.chroma.contains(&ChromaMode::Single420)
+    {
+        writer
+            .write_msg(&ServerMsg::Error {
+                code: 2,
+                message: "no common chroma mode".into(),
+            })
+            .await?;
+        anyhow::bail!("client advertises no chroma mode this server speaks");
+    }
+    // The CPU tier defaults to one 4:2:0 stream: dual-stream 4:4:4 doubles
+    // the encode work, which the CPU pays for where the GPU does not. A
+    // preference only applies when the client advertises the mode.
+    let prefer_single = cfg.low_bandwidth || (matches!(video, VideoTier::Cpu) && !cfg.full_chroma);
+    let chroma = if !caps.chroma.contains(&ChromaMode::Dual420)
+        || (prefer_single && caps.chroma.contains(&ChromaMode::Single420))
+    {
         ChromaMode::Single420
     } else {
         ChromaMode::Dual420
@@ -94,8 +115,7 @@ where
             }],
         })
         .await?;
-    let gpu = Gpu::open(Some(&cfg.render_node)).context("open Vulkan device")?;
-    let encoder_max = Encoder::max_size(&gpu).context("query encoder limits")?;
+    let encoder_max = video.encoder_max().context("query encoder limits")?;
     let stream = EncoderSettings::fit_extent(output.width, output.height, encoder_max);
     if stream != (output.width, output.height) {
         tracing::info!(
@@ -105,7 +125,13 @@ where
         );
     }
     writer
-        .write_msg(&stream_config(codec, chroma, &output, stream))
+        .write_msg(&stream_config(
+            codec,
+            chroma,
+            video.pipeline(),
+            &output,
+            stream,
+        ))
         .await?;
 
     let (cap_tx, mut cap_rx) = mpsc::unbounded_channel();
@@ -145,7 +171,7 @@ where
         ),
     };
     let settings = encoder_settings(stream.0, stream.1, bitrate_ctl.current());
-    let encoder = Encoder::new(&gpu, settings.clone(), chroma == ChromaMode::Dual420)
+    let encoder = VideoEncoder::new(&video, &settings, chroma == ChromaMode::Dual420)
         .context("create encoder")?;
 
     let (mut msg_rx, mut clip_in_rx) = spawn_reader(reader);
@@ -154,7 +180,7 @@ where
     capturer.request_frame().ok();
     let mut session = Session {
         writer,
-        gpu,
+        video,
         instance,
         output,
         stream,
@@ -299,7 +325,7 @@ where
 
 struct Session {
     writer: Writer,
-    gpu: Arc<Gpu>,
+    video: VideoTier,
     instance: hypr_ipc::Instance,
     output: SessionOutput,
     /// Encoded size. Equals the output size, except for a mirrored screen
@@ -316,7 +342,7 @@ struct Session {
     codec: Codec,
     chroma: ChromaMode,
     settings: EncoderSettings,
-    encoder: Encoder,
+    encoder: VideoEncoder,
     input: Input,
     capturer: Capturer,
     /// The newest captured frame not yet encoded.
@@ -458,11 +484,7 @@ impl Session {
             self.bitrate_ctl
                 .retarget(EncoderSettings::default_bitrate(stream.0, stream.1, 60));
             let settings = encoder_settings(stream.0, stream.1, self.bitrate_ctl.current());
-            match Encoder::new(
-                &self.gpu,
-                settings.clone(),
-                self.chroma == ChromaMode::Dual420,
-            ) {
+            match VideoEncoder::new(&self.video, &settings, self.chroma == ChromaMode::Dual420) {
                 Ok(encoder) => {
                     self.encoder = encoder;
                     self.settings = settings;
@@ -488,7 +510,13 @@ impl Session {
         self.output.scale = applied;
         self.inject(self.output.logical_extent());
         self.writer.send(
-            stream_config(self.codec, self.chroma, &self.output, self.stream),
+            stream_config(
+                self.codec,
+                self.chroma,
+                self.video.pipeline(),
+                &self.output,
+                self.stream,
+            ),
             Vec::new(),
         );
         Ok(())
@@ -511,11 +539,7 @@ impl Session {
         self.bitrate_ctl
             .retarget(EncoderSettings::default_bitrate(stream.0, stream.1, 60));
         let settings = encoder_settings(stream.0, stream.1, self.bitrate_ctl.current());
-        match Encoder::new(
-            &self.gpu,
-            settings.clone(),
-            self.chroma == ChromaMode::Dual420,
-        ) {
+        match VideoEncoder::new(&self.video, &settings, self.chroma == ChromaMode::Dual420) {
             Ok(encoder) => {
                 tracing::info!(
                     width = stream.0,
@@ -528,7 +552,13 @@ impl Session {
                 self.pending = None;
                 self.want_keyframe = true;
                 self.writer.send(
-                    stream_config(self.codec, self.chroma, &self.output, self.stream),
+                    stream_config(
+                        self.codec,
+                        self.chroma,
+                        self.video.pipeline(),
+                        &self.output,
+                        self.stream,
+                    ),
                     Vec::new(),
                 );
                 Ok(())
@@ -595,7 +625,13 @@ impl Session {
                     self.fit_mirror(self.client_extent.0, self.client_extent.1)?;
                     if self.stream == previous_stream {
                         self.writer.send(
-                            stream_config(self.codec, self.chroma, &self.output, self.stream),
+                            stream_config(
+                                self.codec,
+                                self.chroma,
+                                self.video.pipeline(),
+                                &self.output,
+                                self.stream,
+                            ),
                             Vec::new(),
                         );
                         self.want_keyframe = true;
@@ -681,25 +717,9 @@ impl Session {
 
     fn encode_and_send(&mut self, frame: &CapturedFrame) -> Result<()> {
         let (width, height) = self.stream;
-        let info = &frame.buffer.info;
-        let fourcc = drm_fourcc::DrmFourcc::try_from(info.fourcc).map_err(|_| {
-            anyhow::anyhow!("capture fourcc {:#x} is not a DRM format", info.fourcc)
-        })?;
-        let plane = DmabufPlane {
-            fd: info.fd.as_fd(),
-            width: info.width,
-            height: info.height,
-            offset: info.planes[0].offset,
-            stride: info.planes[0].stride,
-            fourcc,
-            modifier: info.modifier,
-        };
-        // The import is cached per ring buffer; the generation changes when
-        // the ring is reallocated (resize), so old imports are never reused.
-        let buffer_key = (frame.buffer.generation << 32) | frame.buffer.index as u64;
         let key = std::mem::take(&mut self.want_keyframe);
         let t0 = Instant::now();
-        let encoded = self.encoder.encode_dmabuf(buffer_key, &plane, key)?;
+        let encoded = self.encoder.encode(frame, self.stream, key)?;
         let enc_us = t0.elapsed().as_micros();
         let aux = encoded.aux.unwrap_or_default();
         let msg = ServerMsg::VideoFrame {
@@ -731,6 +751,139 @@ impl Session {
         self.frame_id += 1;
         self.in_flight += 1;
         Ok(())
+    }
+}
+
+/// The selected video pipeline: Vulkan Video on the GPU, or OpenH264 on the
+/// CPU for machines without it.
+enum VideoTier {
+    Gpu(Arc<Gpu>),
+    Cpu,
+}
+
+impl VideoTier {
+    /// Open the requested tier. In `Gpu` mode a machine without a usable
+    /// Vulkan Video encoder falls back to the CPU instead of failing.
+    fn open(mode: VideoMode, render_node: &std::path::Path) -> Self {
+        if mode == VideoMode::Cpu {
+            tracing::info!("using the CPU video pipeline as requested");
+            return Self::Cpu;
+        }
+        match Gpu::open(Some(render_node)) {
+            Ok(gpu) if gpu.can_encode() => {
+                tracing::info!(gpu = %gpu.name, "using the GPU video pipeline");
+                Self::Gpu(gpu)
+            }
+            Ok(gpu) => {
+                tracing::warn!(gpu = %gpu.name, "no Vulkan H.264 encode queue; falling back to the CPU pipeline");
+                Self::Cpu
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "no usable Vulkan device; falling back to the CPU pipeline");
+                Self::Cpu
+            }
+        }
+    }
+
+    fn encoder_max(&self) -> Result<(u32, u32)> {
+        match self {
+            Self::Gpu(gpu) => Ok(Encoder::max_size(gpu)?),
+            Self::Cpu => Ok(gliff_sw::Encoder::MAX_SIZE),
+        }
+    }
+
+    fn pipeline(&self) -> VideoPipeline {
+        match self {
+            Self::Gpu(_) => VideoPipeline::Gpu,
+            Self::Cpu => VideoPipeline::Cpu,
+        }
+    }
+}
+
+enum VideoEncoder {
+    Gpu(Box<Encoder>),
+    Cpu(Box<gliff_sw::Encoder>),
+}
+
+impl VideoEncoder {
+    fn new(tier: &VideoTier, settings: &EncoderSettings, dual: bool) -> Result<Self> {
+        match tier {
+            VideoTier::Gpu(gpu) => Ok(Self::Gpu(Box::new(Encoder::new(
+                gpu,
+                settings.clone(),
+                dual,
+            )?))),
+            VideoTier::Cpu => Ok(Self::Cpu(Box::new(gliff_sw::Encoder::new(
+                gliff_sw::EncoderSettings {
+                    width: settings.width,
+                    height: settings.height,
+                    bitrate: settings.bitrate,
+                    framerate: settings.framerate,
+                },
+                dual,
+            )?))),
+        }
+    }
+
+    fn set_bitrate(&mut self, bitrate: u32) {
+        match self {
+            Self::Gpu(enc) => enc.set_bitrate(bitrate),
+            Self::Cpu(enc) => enc.set_bitrate(bitrate),
+        }
+    }
+
+    /// Encode a captured frame at `stream` size: the GPU imports the dmabuf
+    /// and scales in its split shader; the CPU maps the buffer and scales
+    /// the pixels before converting.
+    fn encode(
+        &mut self,
+        frame: &CapturedFrame,
+        stream: (u32, u32),
+        force_keyframe: bool,
+    ) -> Result<EncodedFrame> {
+        match self {
+            Self::Gpu(enc) => {
+                let info = &frame.buffer.info;
+                let fourcc = drm_fourcc::DrmFourcc::try_from(info.fourcc).map_err(|_| {
+                    anyhow::anyhow!("capture fourcc {:#x} is not a DRM format", info.fourcc)
+                })?;
+                let plane = DmabufPlane {
+                    fd: info.fd.as_fd(),
+                    width: info.width,
+                    height: info.height,
+                    offset: info.planes[0].offset,
+                    stride: info.planes[0].stride,
+                    fourcc,
+                    modifier: info.modifier,
+                };
+                // The import is cached per ring buffer; the generation changes
+                // when the ring is reallocated (resize), so old imports are
+                // never reused.
+                let buffer_key = (frame.buffer.generation << 32) | frame.buffer.index as u64;
+                Ok(enc.encode_dmabuf(buffer_key, &plane, force_keyframe)?)
+            }
+            Self::Cpu(enc) => {
+                let image = frame.buffer.read_bgra()?;
+                let (w, h) = (stream.0 as usize, stream.1 as usize);
+                let pixels = if (image.width, image.height) == (w, h) {
+                    image.pixels
+                } else {
+                    gliff_proto::color::downscale_bgra(
+                        &image.pixels,
+                        image.width,
+                        image.height,
+                        w,
+                        h,
+                    )
+                };
+                let f = enc.encode_bgra(&pixels, force_keyframe)?;
+                Ok(EncodedFrame {
+                    main: f.main,
+                    aux: f.aux,
+                    keyframe: f.keyframe,
+                })
+            }
+        }
     }
 }
 
@@ -772,6 +925,7 @@ impl Drop for SessionOutput {
 fn stream_config(
     codec: Codec,
     chroma: ChromaMode,
+    pipeline: VideoPipeline,
     output: &SessionOutput,
     stream: (u32, u32),
 ) -> ServerMsg {
@@ -782,6 +936,7 @@ fn stream_config(
     ServerMsg::StreamConfig {
         codec,
         chroma,
+        pipeline,
         width: stream.0,
         height: stream.1,
         scale_milli: (effective_scale * 1000.0).round() as u32,

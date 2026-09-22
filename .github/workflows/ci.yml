@@ -86,9 +86,11 @@ jobs:
 
           The binaries are dynamically linked. Runtime requirements:
 
-          - `gliff`: GTK >= 4.14, libadwaita >= 1.0, glibc >= 2.39, plus a Vulkan loader.
-          - `gliff-server`, `gliff-probe`: glibc >= 2.34, libxkbcommon, libgbm, libdrm,
-            plus a Vulkan loader and a driver with Vulkan Video.
+          - `gliff`: GTK >= 4.14, libadwaita >= 1.0, glibc >= 2.39.
+          - `gliff-server`, `gliff-probe`: glibc >= 2.34, libxkbcommon, libgbm, libdrm.
+
+          Video runs on the GPU with a Vulkan loader and a driver with Vulkan
+          Video; without one, gliff falls back to a CPU (OpenH264) pipeline.
 
           To build from source or make an Arch package, use the `PKGBUILD` in the repo.
           NOTES

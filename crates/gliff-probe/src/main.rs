@@ -12,8 +12,9 @@ use wayland_client::globals::GlobalListContents;
 use wayland_client::protocol::wl_registry::WlRegistry;
 use wayland_client::{Connection, Dispatch, QueueHandle};
 
-use gliff_proto::color::{bgra_to_yuv444, psnr, yuv444_to_bgra};
-use gliff_vk::{Decoder, DmabufPlane, Encoder, EncoderSettings, Gpu};
+use gliff_proto::color::{bgra_to_yuv444, downscale_bgra, psnr, yuv444_to_bgra};
+use gliff_sw::VideoMode;
+use gliff_vk::{Decoder, DmabufPlane, EncodedFrame, Encoder, EncoderSettings, Gpu};
 use hypr_capture::{CaptureConfig, CaptureEvent, Capturer};
 use hypr_input::{keys, Input, InputConfig, InputEvent};
 use hypr_wl::Target;
@@ -30,6 +31,10 @@ struct Cli {
     /// DRM render node for GBM and Vulkan
     #[arg(long, global = true)]
     render_node: Option<PathBuf>,
+    /// Video pipeline to probe: `gpu` (Vulkan Video) or `cpu` (OpenH264).
+    /// Overrides the GLIFF_VIDEO environment variable.
+    #[arg(long, global = true, value_parser = ["gpu", "cpu"])]
+    video: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -126,6 +131,7 @@ fn main() -> Result<()> {
         instance: cli.instance.clone(),
     };
     let node = hypr_capture::render_node(cli.render_node.as_deref());
+    let video = VideoMode::resolve(cli.video.as_deref());
     match cli.cmd {
         Cmd::Protocols => protocols(&target)?,
         Cmd::Outputs => outputs(&target)?,
@@ -138,7 +144,7 @@ fn main() -> Result<()> {
             single,
             bitrate,
             adapt,
-        } => roundtrip(&node, width, height, frames, !single, bitrate, adapt)?,
+        } => roundtrip(&node, width, height, frames, !single, bitrate, adapt, video)?,
         Cmd::Capture {
             output,
             png,
@@ -149,16 +155,28 @@ fn main() -> Result<()> {
             text,
             click,
         } => input(&target, output, &text, click)?,
-        Cmd::Pipeline { output } => pipeline(&target, &node, output)?,
-        Cmd::ServeTest { connect, frames } => serve_test(&node, &connect, frames)?,
+        Cmd::Pipeline { output } => pipeline(&target, &node, output, video)?,
+        Cmd::ServeTest { connect, frames } => serve_test(&node, &connect, frames, video)?,
         Cmd::Clipboard { set, secs } => clipboard(&target, set, secs)?,
         Cmd::Bench { iters } => bench(iters)?,
         Cmd::All => {
             protocols(&target)?;
             outputs(&target)?;
             permissions(&target)?;
-            vulkan_info(&node)?;
-            roundtrip(&node, 640, 360, 10, true, None, false)?;
+            let gpu_ok = match vulkan_info(&node) {
+                Ok(()) => true,
+                Err(e) => {
+                    status(
+                        false,
+                        &format!("Vulkan Video unavailable ({e}); the CPU pipeline will be used"),
+                    );
+                    false
+                }
+            };
+            if gpu_ok && video == VideoMode::Gpu {
+                roundtrip(&node, 640, 360, 10, true, None, false, VideoMode::Gpu)?;
+            }
+            roundtrip(&node, 640, 360, 10, true, None, false, VideoMode::Cpu)?;
         }
     }
     Ok(())
@@ -422,7 +440,7 @@ fn input(target: &Target, output: Option<String>, text: &str, click: bool) -> Re
     Ok(())
 }
 
-fn serve_test(node: &std::path::Path, addr: &str, frames: usize) -> Result<()> {
+fn serve_test(node: &std::path::Path, addr: &str, frames: usize, video: VideoMode) -> Result<()> {
     use gliff_proto::{ChromaMode, ClientCaps, ClientMsg, Codec, ServerMsg};
     use gliff_transport::Framed;
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -443,8 +461,11 @@ fn serve_test(node: &std::path::Path, addr: &str, frames: usize) -> Result<()> {
         let cfg = reader.read_msg::<ServerMsg>().await?;
         let (mut w, mut h, chroma) = match cfg { ServerMsg::StreamConfig { width, height, chroma, .. } => (width as usize, height as usize, chroma), o => bail!("expected StreamConfig, got {o:?}") };
         eprintln!("  StreamConfig: {w}x{h} chroma {chroma:?}");
-        let gpu = Gpu::open(Some(node))?;
-        let mut decoder = Decoder::new(&gpu, chroma != ChromaMode::Single420, w as u32, h as u32)?;
+        let gpu = match video {
+            VideoMode::Gpu => Some(Gpu::open(Some(node))?),
+            VideoMode::Cpu => None,
+        };
+        let mut decoder = serve_decoder(&gpu, chroma != ChromaMode::Single420, w as u32, h as u32)?;
         let mut got = 0usize;
         let mut keyframes = 0usize;
         let mut scaled = false;
@@ -471,7 +492,7 @@ fn serve_test(node: &std::path::Path, addr: &str, frames: usize) -> Result<()> {
                     w = width as usize; h = height as usize;
                     eprintln!("  reconfig to {w}x{h} scale {scale_milli}");
                     scaled = if session.headless { scale_milli == 2000 } else { w <= 800 && h <= 600 && scale_milli < 1000 };
-                    decoder = Decoder::new(&gpu, chroma != ChromaMode::Single420, w as u32, h as u32)?;
+                    decoder = serve_decoder(&gpu, chroma != ChromaMode::Single420, w as u32, h as u32)?;
                 }
                 ServerMsg::CursorShape { argb_len, .. } => { let _ = reader.read_payload(argb_len).await?; }
                 ServerMsg::ClipboardData { data_len, .. } => {
@@ -624,6 +645,7 @@ fn synthetic_bgra(w: usize, h: usize, t: usize) -> Vec<u8> {
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn roundtrip(
     node: &std::path::Path,
     width: u32,
@@ -632,9 +654,8 @@ fn roundtrip(
     dual: bool,
     bitrate: Option<u32>,
     adapt: bool,
+    video: VideoMode,
 ) -> Result<()> {
-    let gpu = Gpu::open(Some(node))?;
-    println!("  {} ({}) dual={dual}", gpu.name, gpu.driver);
     let bitrate = bitrate.unwrap_or(4 * EncoderSettings::default_bitrate(width, height, 60));
     let settings = EncoderSettings {
         width,
@@ -642,12 +663,39 @@ fn roundtrip(
         bitrate,
         framerate: 60,
     };
-    let mut encoder = Encoder::new(&gpu, settings, dual).context("vulkan encoder")?;
-    let mut decoder = Decoder::new(&gpu, dual, width, height).context("vulkan decoder")?;
+    let (mut encoder, mut decoder) = match video {
+        VideoMode::Gpu => {
+            let gpu = Gpu::open(Some(node))?;
+            println!("  {} ({}) dual={dual}", gpu.name, gpu.driver);
+            (
+                ProbeEncoder::Gpu(Box::new(
+                    Encoder::new(&gpu, settings, dual).context("vulkan encoder")?,
+                )),
+                ProbeDecoder::Gpu(Box::new(
+                    Decoder::new(&gpu, dual, width, height).context("vulkan decoder")?,
+                )),
+            )
+        }
+        VideoMode::Cpu => {
+            println!("  cpu (OpenH264) dual={dual}");
+            (
+                ProbeEncoder::Cpu(Box::new(
+                    gliff_sw::Encoder::new(sw_settings(width, height, bitrate), dual)
+                        .context("cpu encoder")?,
+                )),
+                ProbeDecoder::Cpu(Box::new(
+                    gliff_sw::Decoder::new(dual).context("cpu decoder")?,
+                )),
+            )
+        }
+    };
     let (w, h) = (width as usize, height as usize);
     let mut min_psnr = f64::MAX;
     let mut decoded = 0;
     let mut total_bytes = 0;
+    // The CPU decoder outputs pictures in order but one access unit late, so
+    // sources are queued and each output is compared with the oldest one.
+    let mut pending: std::collections::VecDeque<Vec<u8>> = std::collections::VecDeque::new();
     let start = std::time::Instant::now();
     for i in 0..frames {
         let src = synthetic_bgra(w, h, i);
@@ -678,23 +726,14 @@ fn roundtrip(
         if force && !packet.keyframe {
             bail!("forced keyframe was not honoured");
         }
+        pending.push_back(src);
         let Some(out) = out else {
-            println!("  frame {i}: no output");
+            println!("  frame {i}: no output yet");
             continue;
         };
+        let src = pending.pop_front().expect("a source per output");
         decoded += 1;
-        // Compare against what the CPU reference path yields for the same
-        // chroma mode, so 4:2:0's inherent loss is not counted against the GPU.
-        let reference = {
-            let yuv = bgra_to_yuv444(&src, w * 4, w, h);
-            if dual {
-                yuv444_to_bgra(&yuv)
-            } else {
-                yuv444_to_bgra(&gliff_proto::chroma::nv12_to_yuv444(
-                    &gliff_proto::chroma::yuv444_to_nv12(&yuv),
-                ))
-            }
-        };
+        let reference = reference_for(&src, w, h, dual);
         let p = psnr(&rgb_channels(&reference), &rgb_channels(&out));
         min_psnr = min_psnr.min(p);
         if let Some(dir) = std::env::var_os("GLIFF_VK_DUMP") {
@@ -717,6 +756,11 @@ fn roundtrip(
         }
         println!("  frame {i}: main {} aux {} bytes key={} enc {enc_ms:.2} ms dec {dec_ms:.2} ms rgb psnr {p:.1} dB", packet.main.len(), aux.len(), packet.keyframe);
     }
+    if let (Some(out), Some(src)) = (decoder.flush()?, pending.pop_front()) {
+        decoded += 1;
+        let reference = reference_for(&src, w, h, dual);
+        min_psnr = min_psnr.min(psnr(&rgb_channels(&reference), &rgb_channels(&out)));
+    }
     let elapsed = start.elapsed().as_secs_f64();
     println!(
         "  {frames} frames, {total_bytes} bytes, {:.1} fps end to end",
@@ -728,15 +772,106 @@ fn roundtrip(
     );
     status(min_psnr > 30.0, &format!("min RGB PSNR {min_psnr:.1} dB"));
     if decoded != frames || min_psnr <= 30.0 {
-        bail!("vulkan round-trip failed");
+        bail!("codec round-trip failed");
     }
     Ok(())
+}
+
+fn sw_settings(width: u32, height: u32, bitrate: u32) -> gliff_sw::EncoderSettings {
+    gliff_sw::EncoderSettings {
+        width,
+        height,
+        bitrate,
+        framerate: 60,
+    }
+}
+
+/// Either tier's encoder behind the shape the probe loops use.
+enum ProbeEncoder {
+    Gpu(Box<Encoder>),
+    Cpu(Box<gliff_sw::Encoder>),
+}
+
+impl ProbeEncoder {
+    fn encode_bgra(&mut self, bgra: &[u8], force_keyframe: bool) -> Result<EncodedFrame> {
+        match self {
+            Self::Gpu(e) => Ok(e.encode_bgra(bgra, force_keyframe)?),
+            Self::Cpu(e) => {
+                let f = e.encode_bgra(bgra, force_keyframe)?;
+                Ok(EncodedFrame {
+                    main: f.main,
+                    aux: f.aux,
+                    keyframe: f.keyframe,
+                })
+            }
+        }
+    }
+
+    fn set_bitrate(&mut self, bitrate: u32) {
+        match self {
+            Self::Gpu(e) => e.set_bitrate(bitrate),
+            Self::Cpu(e) => e.set_bitrate(bitrate),
+        }
+    }
+}
+
+enum ProbeDecoder {
+    Gpu(Box<Decoder>),
+    Cpu(Box<gliff_sw::Decoder>),
+}
+
+fn serve_decoder(
+    gpu: &Option<std::sync::Arc<Gpu>>,
+    dual: bool,
+    width: u32,
+    height: u32,
+) -> Result<ProbeDecoder> {
+    Ok(match gpu {
+        Some(gpu) => ProbeDecoder::Gpu(Box::new(Decoder::new(gpu, dual, width, height)?)),
+        None => ProbeDecoder::Cpu(Box::new(gliff_sw::Decoder::new(dual)?)),
+    })
+}
+
+impl ProbeDecoder {
+    fn decode_to_bgra(&mut self, main: &[u8], aux: &[u8]) -> Result<Option<Vec<u8>>> {
+        match self {
+            Self::Gpu(d) => Ok(d.decode_to_bgra(main, aux)?),
+            Self::Cpu(d) => Ok(d.decode(main, aux)?.map(|f| f.pixels)),
+        }
+    }
+
+    /// Drain the picture the CPU decoder still buffers; the GPU decoder
+    /// outputs every picture immediately and has nothing to drain.
+    fn flush(&mut self) -> Result<Option<Vec<u8>>> {
+        match self {
+            Self::Gpu(_) => Ok(None),
+            Self::Cpu(d) => Ok(d.flush()?.map(|f| f.pixels)),
+        }
+    }
+}
+
+/// The CPU reference result for `src` in the same chroma mode, so 4:2:0's
+/// inherent loss is not counted against the codec under test.
+fn reference_for(src: &[u8], w: usize, h: usize, dual: bool) -> Vec<u8> {
+    let yuv = bgra_to_yuv444(src, w * 4, w, h);
+    if dual {
+        yuv444_to_bgra(&yuv)
+    } else {
+        yuv444_to_bgra(&gliff_proto::chroma::nv12_to_yuv444(
+            &gliff_proto::chroma::yuv444_to_nv12(&yuv),
+        ))
+    }
 }
 
 /// Capture one frame and push it through the exact server and client
 /// pipelines: dmabuf import, GPU split, two encodes, two decodes, GPU
 /// recombine. Compares the result with the CPU 4:4:4 reference.
-fn pipeline(target: &Target, node: &std::path::Path, output: Option<String>) -> Result<()> {
+fn pipeline(
+    target: &Target,
+    node: &std::path::Path,
+    output: Option<String>,
+    video: VideoMode,
+) -> Result<()> {
     let output = pick_output(target, output)?;
     let mut cfg = CaptureConfig::new(output.clone());
     cfg.target = target.clone();
@@ -788,8 +923,14 @@ fn pipeline(target: &Target, node: &std::path::Path, output: Option<String>) -> 
         modifier: info.modifier,
     };
 
-    let gpu = Gpu::open(Some(node))?;
-    let encoder_max = Encoder::max_size(&gpu).context("encoder limits")?;
+    let gpu = match video {
+        VideoMode::Gpu => Some(Gpu::open(Some(node))?),
+        VideoMode::Cpu => None,
+    };
+    let encoder_max = match &gpu {
+        Some(gpu) => Encoder::max_size(gpu).context("encoder limits")?,
+        None => gliff_sw::Encoder::MAX_SIZE,
+    };
     let (sw, sh) = EncoderSettings::fit_extent(w, h, encoder_max);
     let scaled = (sw, sh) != (w, h);
     if scaled {
@@ -804,10 +945,46 @@ fn pipeline(target: &Target, node: &std::path::Path, output: Option<String>) -> 
         bitrate: EncoderSettings::default_bitrate(sw, sh, 60),
         framerate: 60,
     };
-    let mut encoder = Encoder::new(&gpu, settings, true).context("encoder")?;
-    let mut decoder = Decoder::new(&gpu, true, sw, sh).context("decoder")?;
+    let (mut encoder, mut decoder) = match &gpu {
+        Some(gpu) => (
+            ProbeEncoder::Gpu(Box::new(
+                Encoder::new(gpu, settings, true).context("encoder")?,
+            )),
+            ProbeDecoder::Gpu(Box::new(
+                Decoder::new(gpu, true, sw, sh).context("decoder")?,
+            )),
+        ),
+        None => (
+            ProbeEncoder::Cpu(Box::new(
+                gliff_sw::Encoder::new(sw_settings(sw, sh, settings.bitrate), true)
+                    .context("encoder")?,
+            )),
+            ProbeDecoder::Cpu(Box::new(gliff_sw::Decoder::new(true).context("decoder")?)),
+        ),
+    };
     let t0 = std::time::Instant::now();
-    let packet = encoder.encode_dmabuf(1, &plane, true).context("encode")?;
+    let packet = match &mut encoder {
+        ProbeEncoder::Gpu(enc) => enc.encode_dmabuf(1, &plane, true).context("encode")?,
+        ProbeEncoder::Cpu(enc) => {
+            let pixels = if scaled {
+                downscale_bgra(
+                    &reference.pixels,
+                    reference.width,
+                    reference.height,
+                    sw as usize,
+                    sh as usize,
+                )
+            } else {
+                reference.pixels.clone()
+            };
+            let f = enc.encode_bgra(&pixels, true).context("encode")?;
+            EncodedFrame {
+                main: f.main,
+                aux: f.aux,
+                keyframe: f.keyframe,
+            }
+        }
+    };
     let enc_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let aux = packet.aux.as_deref().unwrap_or(&[]);
     println!(
@@ -817,10 +994,18 @@ fn pipeline(target: &Target, node: &std::path::Path, output: Option<String>) -> 
         packet.keyframe
     );
     let t1 = std::time::Instant::now();
-    let out = decoder
+    let out = match decoder
         .decode_to_bgra(&packet.main, aux)
         .context("decode")?
-        .ok_or_else(|| anyhow!("decode produced no frame"))?;
+    {
+        Some(out) => out,
+        // The CPU decoder holds its only picture until the next unit or a
+        // drain; this is the last unit, so drain.
+        None => decoder
+            .flush()
+            .context("flush")?
+            .ok_or_else(|| anyhow!("decode produced no frame"))?,
+    };
     let dec_ms = t1.elapsed().as_secs_f64() * 1000.0;
     drop(frame);
     drop(capturer);
@@ -849,37 +1034,13 @@ fn pipeline(target: &Target, node: &std::path::Path, output: Option<String>) -> 
     let rgb_psnr = psnr(&rgb_channels(&cpu), &rgb_channels(&out));
     println!("  decoded {dec_ms:.1} ms; end-to-end RGB PSNR vs CPU reference {rgb_psnr:.1} dB");
     let ok = scaled || rgb_psnr > 35.0;
-    status(ok, "Dual420 4:4:4 GPU pipeline on a captured frame");
+    let tier = if gpu.is_some() { "GPU" } else { "CPU" };
+    status(
+        ok,
+        &format!("Dual420 4:4:4 {tier} pipeline on a captured frame"),
+    );
     if !ok {
         bail!("pipeline PSNR too low");
     }
     Ok(())
-}
-
-/// Area-average a BGRA image down to `dw`x`dh`.
-fn downscale_bgra(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<u8> {
-    let mut out = vec![0u8; dw * dh * 4];
-    for y in 0..dh {
-        let y0 = y * sh / dh;
-        let y1 = ((y + 1) * sh / dh).max(y0 + 1);
-        for x in 0..dw {
-            let x0 = x * sw / dw;
-            let x1 = ((x + 1) * sw / dw).max(x0 + 1);
-            let mut sum = [0u64; 4];
-            for sy in y0..y1 {
-                for sx in x0..x1 {
-                    let p = &src[(sy * sw + sx) * 4..(sy * sw + sx) * 4 + 4];
-                    for c in 0..4 {
-                        sum[c] += p[c] as u64;
-                    }
-                }
-            }
-            let n = ((y1 - y0) * (x1 - x0)) as u64;
-            let o = &mut out[(y * dw + x) * 4..(y * dw + x) * 4 + 4];
-            for c in 0..4 {
-                o[c] = ((sum[c] + n / 2) / n) as u8;
-            }
-        }
-    }
-    out
 }

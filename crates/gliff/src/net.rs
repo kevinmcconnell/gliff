@@ -9,6 +9,7 @@ use std::sync::mpsc::{Sender as StdSender, SyncSender};
 use std::sync::Arc;
 
 use gliff_proto::{ChromaMode, ClientCaps, ClientMsg, Codec, ServerMsg, PROTOCOL_VERSION};
+use gliff_sw::VideoMode;
 use gliff_transport::{spawn_ssh, Framed, SshTarget};
 use gliff_vk::{Decoder, DisplayFrame, Gpu};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -20,11 +21,15 @@ pub enum Status {
         width: u32,
         height: u32,
         scale_milli: u32,
+        /// "server pipeline > client pipeline", e.g. "gpu > cpu".
+        video: String,
     },
     Stats {
         fps: f32,
         mbit: f32,
         decode_ms: f32,
+        /// "server pipeline > client pipeline", e.g. "gpu > cpu".
+        video: String,
     },
     /// The remote cursor image, for the client to set as its widget cursor.
     Cursor {
@@ -47,11 +52,19 @@ pub enum Endpoint {
     Ssh(SshTarget),
 }
 
+/// A decoded frame for the GTK thread: a dmabuf from the GPU tier, or plain
+/// BGRA pixels from the CPU tier.
+pub enum Frame {
+    Dmabuf(DisplayFrame),
+    Bgra(gliff_sw::BgraFrame),
+}
+
 pub struct Worker {
     pub endpoint: Endpoint,
+    pub video: VideoMode,
     /// Bounded so a stalled UI thread cannot make the decoder buffer frames
     /// without limit; when full, the newest frame is dropped (latest-wins).
-    pub frames: SyncSender<DisplayFrame>,
+    pub frames: SyncSender<Frame>,
     pub status: StdSender<Status>,
     pub input: UnboundedReceiver<(ClientMsg, Vec<u8>)>,
 }
@@ -77,11 +90,19 @@ impl Worker {
                     let stream = tokio::net::TcpStream::connect(addr).await?;
                     stream.set_nodelay(true)?;
                     let (rd, wr) = tokio::io::split(stream);
-                    session(rd, wr, self.frames, self.status, self.input).await
+                    session(rd, wr, self.video, self.frames, self.status, self.input).await
                 }
                 Endpoint::Ssh(ref target) => {
                     let ssh = spawn_ssh(target)?;
-                    session(ssh.stdout, ssh.stdin, self.frames, self.status, self.input).await
+                    session(
+                        ssh.stdout,
+                        ssh.stdin,
+                        self.video,
+                        self.frames,
+                        self.status,
+                        self.input,
+                    )
+                    .await
                 }
             }
         });
@@ -93,24 +114,50 @@ impl Worker {
     }
 }
 
+/// The decode pipeline: Vulkan Video on the GPU, or OpenH264 on the CPU.
+enum VideoDecoder {
+    Gpu(Box<Decoder>),
+    Cpu(Box<gliff_sw::Decoder>),
+}
+
+/// Open the GPU for decoding, or `None` for the CPU tier. In `Gpu` mode a
+/// machine without a usable Vulkan Video decoder falls back to the CPU.
+fn open_gpu(mode: VideoMode) -> Option<Arc<Gpu>> {
+    if mode == VideoMode::Cpu {
+        tracing::info!("using the CPU video pipeline as requested");
+        return None;
+    }
+    match Gpu::open(Some(&hypr_capture::render_node(None))) {
+        Ok(gpu) if gpu.can_decode() => Some(gpu),
+        Ok(gpu) => {
+            tracing::warn!(gpu = %gpu.name, "no Vulkan H.264 decode queue; falling back to the CPU pipeline");
+            None
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "no usable Vulkan device; falling back to the CPU pipeline");
+            None
+        }
+    }
+}
+
 fn new_decoder(
-    gpu: &Arc<Gpu>,
+    gpu: &Option<Arc<Gpu>>,
     chroma: ChromaMode,
     width: u32,
     height: u32,
-) -> anyhow::Result<Decoder> {
-    Ok(Decoder::new(
-        gpu,
-        chroma != ChromaMode::Single420,
-        width,
-        height,
-    )?)
+) -> anyhow::Result<VideoDecoder> {
+    let dual = chroma != ChromaMode::Single420;
+    Ok(match gpu {
+        Some(gpu) => VideoDecoder::Gpu(Box::new(Decoder::new(gpu, dual, width, height)?)),
+        None => VideoDecoder::Cpu(Box::new(gliff_sw::Decoder::new(dual)?)),
+    })
 }
 
 async fn session<R, W>(
     rd: R,
     wr: W,
-    frames: SyncSender<DisplayFrame>,
+    video: VideoMode,
+    frames: SyncSender<Frame>,
     status: StdSender<Status>,
     mut input: UnboundedReceiver<(ClientMsg, Vec<u8>)>,
 ) -> anyhow::Result<()>
@@ -121,11 +168,18 @@ where
     let mut reader = Framed::new(rd);
     let mut writer = Framed::new(wr);
 
+    let gpu = open_gpu(video);
     let caps = ClientCaps {
         codecs: vec![Codec::H264],
         max_width: 3840,
         max_height: 2160,
-        chroma: vec![ChromaMode::Dual420, ChromaMode::Single420],
+        // The CPU tier asks for one 4:2:0 stream so it decodes one stream,
+        // not two; the recombine also costs CPU on this side.
+        chroma: if gpu.is_some() {
+            vec![ChromaMode::Dual420, ChromaMode::Single420]
+        } else {
+            vec![ChromaMode::Single420]
+        },
     };
     let keymap = crate::keymap::local_keymap();
     writer
@@ -141,24 +195,28 @@ where
         anyhow::bail!("expected HelloAck, got {ack:?}");
     };
     let cfg = reader.read_msg::<ServerMsg>().await?;
-    let (width, height, chroma, scale_milli) = match cfg {
+    let (width, height, chroma, scale_milli, pipeline) = match cfg {
         ServerMsg::StreamConfig {
             width,
             height,
             chroma,
             scale_milli,
+            pipeline,
             ..
-        } => (width, height, chroma, scale_milli),
+        } => (width, height, chroma, scale_milli, pipeline),
         other => anyhow::bail!("expected StreamConfig, got {other:?}"),
     };
-    let gpu = Gpu::open(Some(&hypr_capture::render_node(None)))?;
     let mut decoder = new_decoder(&gpu, chroma, width, height)?;
+    let local = if gpu.is_some() { "gpu" } else { "cpu" };
+    let mut video_label = format!("{} > {}", pipeline.label(), local);
     let _ = status.send(Status::Connected {
         width,
         height,
         scale_milli,
+        video: video_label.clone(),
     });
-    tracing::info!(width, height, scale_milli, gpu = %gpu.name, "connected");
+    let decode_on = gpu.as_ref().map_or("cpu", |g| g.name.as_str());
+    tracing::info!(width, height, scale_milli, decode_on, video = %video_label, "connected");
     let mut logged_first = false;
 
     // Writes run on their own task, fed by `out_tx`, so reads (draining video)
@@ -198,10 +256,46 @@ where
     let mut decode_ms_acc = 0f32;
     let mut last_report = std::time::Instant::now();
 
+    // The CPU decoder holds the newest picture of a High-profile
+    // (GPU-encoded) stream until the next access unit arrives. When no video
+    // frame has arrived for a while, drain it so the screen shows the latest
+    // state. The deadline follows video frames only — cursor and other
+    // messages must not postpone it — and a frame the full UI channel
+    // rejected is retried at the same cadence.
+    const IDLE_DRAIN: std::time::Duration = std::time::Duration::from_millis(150);
+    let mut drain_at = tokio::time::Instant::now() + IDLE_DRAIN;
+    let mut undelivered: Option<Frame> = None;
     loop {
         let read = tokio::select! {
             read = reader.read_msg::<ServerMsg>() => read,
             _ = &mut ui_gone => return Ok(()),
+            _ = tokio::time::sleep_until(drain_at),
+                if undelivered.is_some()
+                    || matches!(&decoder, VideoDecoder::Cpu(d) if d.has_pending()) =>
+            {
+                drain_at = tokio::time::Instant::now() + IDLE_DRAIN;
+                let frame = match undelivered.take() {
+                    Some(frame) => Some(frame),
+                    None => match &mut decoder {
+                        VideoDecoder::Cpu(d) => match d.flush() {
+                            Ok(frame) => frame.map(Frame::Bgra),
+                            Err(e) => {
+                                tracing::warn!(error = %e, "idle drain failed");
+                                None
+                            }
+                        },
+                        VideoDecoder::Gpu(_) => None,
+                    },
+                };
+                if let Some(frame) = frame {
+                    if let Err(std::sync::mpsc::TrySendError::Full(frame)) =
+                        frames.try_send(frame)
+                    {
+                        undelivered = Some(frame);
+                    }
+                }
+                continue;
+            }
         };
         let msg = match read {
             Ok(m) => m,
@@ -223,8 +317,18 @@ where
                     bytes::Bytes::new()
                 };
                 bytes_since += (data_len + aux_len) as u64;
+                drain_at = tokio::time::Instant::now() + IDLE_DRAIN;
                 let t0 = std::time::Instant::now();
-                let decoded = decoder.decode(&main, &aux);
+                let decoded = match &mut decoder {
+                    VideoDecoder::Gpu(d) => d
+                        .decode(&main, &aux)
+                        .map(|f| f.map(Frame::Dmabuf))
+                        .map_err(anyhow::Error::from),
+                    VideoDecoder::Cpu(d) => d
+                        .decode(&main, &aux)
+                        .map(|f| f.map(Frame::Bgra))
+                        .map_err(anyhow::Error::from),
+                };
                 let dec_ms = t0.elapsed().as_secs_f32() * 1000.0;
                 // Ack immediately so the server keeps pacing.
                 let _ = out_tx.send((
@@ -240,8 +344,16 @@ where
                             tracing::info!("first frame decoded");
                             logged_first = true;
                         }
-                        // Latest-wins: drop this frame if the UI hasn't drained.
-                        let _ = frames.try_send(frame);
+                        // Latest-wins: a frame the full UI channel rejects
+                        // waits in `undelivered` (superseding any drained
+                        // one) and is retried at the drain cadence.
+                        match frames.try_send(frame) {
+                            Ok(()) => undelivered = None,
+                            Err(std::sync::mpsc::TrySendError::Full(frame)) => {
+                                undelivered = Some(frame)
+                            }
+                            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {}
+                        }
                         frames_since += 1;
                         decode_ms_acc += dec_ms;
                     }
@@ -257,13 +369,17 @@ where
                 height,
                 chroma,
                 scale_milli,
+                pipeline,
                 ..
             } => {
                 decoder = new_decoder(&gpu, chroma, width, height)?;
+                video_label = format!("{} > {}", pipeline.label(), local);
+                undelivered = None;
                 let _ = status.send(Status::Connected {
                     width,
                     height,
                     scale_milli,
+                    video: video_label.clone(),
                 });
             }
             ServerMsg::CursorShape {
@@ -308,6 +424,7 @@ where
                 } else {
                     0.0
                 },
+                video: video_label.clone(),
             });
             frames_since = 0;
             bytes_since = 0;

@@ -1,8 +1,11 @@
 # Hardware and driver quirks
 
-gliff targets Vulkan Video on both ends. Driver behaviour differs, so this
-file records what we have found and where more testing is needed. Findings so
-far come from **two** machines:
+gliff targets Vulkan Video on both ends, with a CPU fallback (OpenH264 in
+`gliff-sw`) for machines without it: in the default `--video gpu` mode a
+failed device open or a missing encode/decode queue drops to the CPU tier
+with a log line, and `--video cpu` / `GLIFF_VIDEO=cpu` forces it. Driver
+behaviour differs, so this file records what we have found and where more
+testing is needed. Findings so far come from **two** machines:
 
 - GPU: AMD Granite Ridge iGPU (Ryzen 9 9955HX), VCN 4 class.
   Driver: Mesa RADV 26.2 (Vulkan 1.4), kernel 7.2.
@@ -69,6 +72,23 @@ through `HOST_CACHED` memory it takes ~1 ms. `HostBuffer` prefers cached
 memory and falls back to write-combined. The encoder's bitstream buffer uses
 the same path.
 
+## OpenH264 (the CPU tier)
+
+- **The decoder holds one picture for non-Baseline streams.** OpenH264
+  skips its reorder buffer only for Baseline-profile streams, so the CPU
+  encoder emits Baseline and its streams display with no delay. A
+  GPU-encoded (High-profile) stream comes out one access unit late; the
+  client drains the held picture after 150 ms of stream silence
+  (`Decoder::flush`), which does not disturb later decoding.
+- **Per-decode flushing breaks the reference chain.** The `openh264`
+  crate's default `Flush::Flush` ejects the reference picture of a
+  low-delay stream (dsOutOfMemory on the fourth frame of a RADV-encoded
+  stream); the decoder runs with `Flush::NoFlush`.
+- **CBR is soft without frame skipping.** The encoder disables
+  `skip_frames` so every capture yields a frame (the AVC444 pair must stay
+  in step), which OpenH264 says weakens its bitrate cap. The server's own
+  `BitrateController` adapts the target from ack timing on top.
+
 ## Hyprland cursor capture (0.56.2, and upstream main as of 2026-09-02)
 
 The server captures the remote cursor with an `ext-image-copy-capture-v1`
@@ -125,10 +145,10 @@ the request took effect.
 ## Confirmed on Intel ANV
 
 ### Vulkan Video stays hidden until `ANV_DEBUG` asks for it
-ANV compiles video support in but gates it off, so every gliff binary exits
-with `no suitable GPU: no Vulkan device with a compute queue, dmabuf import
-and video queues` until the environment carries
-`ANV_DEBUG=video-decode,video-encode`. With it set ANV advertises
+ANV compiles video support in but gates it off, so every gliff binary
+reports `no suitable GPU: no Vulkan device with a compute queue, dmabuf
+import and video queues` and falls back to the CPU tier until the
+environment carries `ANV_DEBUG=video-decode,video-encode`. With it set ANV advertises
 `VK_KHR_video_queue`, `VK_KHR_video_decode_queue`, `VK_KHR_video_encode_queue`,
 `VK_KHR_video_decode_h264` and `VK_KHR_video_encode_h264`, plus a second queue
 family carrying `VIDEO_DECODE_KHR | VIDEO_ENCODE_KHR`, and `gliff-probe vulkan`
@@ -151,6 +171,9 @@ pictures that are not references.
 ## Not yet tested anywhere
 - NVIDIA (proprietary and NVK) for every item above, and Intel ANV for every
   item not listed under "Confirmed on Intel ANV".
+- Baseline-profile streams (the CPU tier's output) through Vulkan decode
+  sessions created with the fixed High decode profile: RADV accepts them
+  (the e2e cpu-server -> gpu-client case), other drivers are unverified.
 - Native 4:4:4 encode (HEVC 4:4:4 / AV1) to retire the dual-stream split.
 - `VK_VALVE_video_encode_rgb_conversion` (exposed by RADV here): the encoder
   converts RGB itself, which would remove the split pass for `Single420`.
@@ -161,9 +184,10 @@ pictures that are not references.
 
 ## Known limitations recorded from code review (not yet fixed)
 
-- **Instance discovery tie-break.** `hypr-ipc` picks the newest instance by
-  directory mtime; two Hyprland instances started within the same coarse
-  filesystem timestamp are tie-broken by name, which could pick the older one.
+- **Instance discovery tie-break.** `hypr-ipc` picks the newest instance
+  whose socket answers, so dead leftovers (a killed nested Hyprland) are
+  skipped; two live instances started within the same coarse filesystem
+  timestamp are still tie-broken by name, which could pick the older one.
 - **`wl_output` bound at version 4.** A compositor offering an older `wl_output`
   would fail to bind. Hyprland always offers v4.
 - **Capture dmabuf uses one buffer-object fd for all planes.** Correct for the

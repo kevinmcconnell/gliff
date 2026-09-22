@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// Chunk cap for clipboard payloads on the wire.
 pub const CLIPBOARD_CHUNK: usize = 256 * 1024;
@@ -16,6 +16,23 @@ pub enum Codec {
     H264,
     H265,
     Av1,
+}
+
+/// Which pipeline encodes or decodes on one end, reported for the stats
+/// display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VideoPipeline {
+    Gpu,
+    Cpu,
+}
+
+impl VideoPipeline {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Gpu => "gpu",
+            Self::Cpu => "cpu",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,6 +146,8 @@ pub enum ServerMsg {
     StreamConfig {
         codec: Codec,
         chroma: ChromaMode,
+        /// Which pipeline encodes on the server, for the client's stats.
+        pipeline: VideoPipeline,
         /// Stream size in physical pixels.
         width: u32,
         height: u32,

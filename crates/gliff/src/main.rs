@@ -28,6 +28,7 @@ use gtk::gdk;
 use gtk::glib;
 use gtk4 as gtk;
 use libadwaita as adw;
+use net::Frame;
 use net::{Endpoint, Status, Worker};
 use recent::Config;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
@@ -62,6 +63,11 @@ struct Cli {
     /// click it again.
     #[arg(long, default_value = "shift+escape")]
     release_hotkey: String,
+    /// Video pipeline: `gpu` (Vulkan Video, falling back to the CPU when
+    /// unavailable) or `cpu` (force OpenH264 on the CPU). Overrides the
+    /// GLIFF_VIDEO environment variable.
+    #[arg(long, value_parser = ["gpu", "cpu"])]
+    video: Option<String>,
 }
 
 /// Everything the UI shares with its callbacks.
@@ -531,7 +537,7 @@ fn show_disconnected(ui: &App) {
 /// Start a worker for `endpoint`. Each call is a new session generation;
 /// pollers and reconnects from an older generation stop themselves.
 fn start_session(ui: Rc<App>, endpoint: Endpoint) {
-    let (frame_tx, frame_rx) = sync_channel::<DisplayFrame>(2);
+    let (frame_tx, frame_rx) = sync_channel::<Frame>(2);
     let (status_tx, status_rx) = channel::<Status>();
     let (input_tx, input_rx) = unbounded_channel::<(ClientMsg, Vec<u8>)>();
     // Replacing the sender closes the old worker's input, which ends it.
@@ -541,11 +547,13 @@ fn start_session(ui: Rc<App>, endpoint: Endpoint) {
     ui.session.set(session);
     ui.status.set_text("Connecting…");
 
+    let video = gliff_sw::VideoMode::resolve(ui.cli.video.as_deref());
     std::thread::Builder::new()
         .name("gliff-net".into())
         .spawn(move || {
             Worker {
                 endpoint,
+                video,
                 frames: frame_tx,
                 status: status_tx,
                 input: input_rx,
@@ -601,7 +609,7 @@ fn schedule_reconnect(ui: Rc<App>, session: u64) {
 }
 
 /// Pull decoded frames on the GTK main loop, latest-wins, and paint them.
-fn poll_frames(ui: Rc<App>, rx: Receiver<DisplayFrame>, session: u64) {
+fn poll_frames(ui: Rc<App>, rx: Receiver<Frame>, session: u64) {
     glib::timeout_add_local(Duration::from_millis(8), move || {
         if ui.session.get() != session {
             return glib::ControlFlow::Break;
@@ -619,13 +627,32 @@ fn poll_frames(ui: Rc<App>, rx: Receiver<DisplayFrame>, session: u64) {
             }
         }
         if let Some(f) = latest {
-            match dmabuf_texture(f) {
+            match frame_texture(f) {
                 Ok(texture) => ui.frame.set_frame(texture, ui.video.scale_factor()),
-                Err(e) => tracing::warn!(error = %e, "dmabuf texture import failed"),
+                Err(e) => tracing::warn!(error = %e, "frame texture import failed"),
             }
         }
         glib::ControlFlow::Continue
     });
+}
+
+/// Wrap a decoded frame as a GDK texture: a dmabuf import for the GPU tier,
+/// a plain memory texture for the CPU tier.
+fn frame_texture(f: Frame) -> Result<gdk::Texture, glib::Error> {
+    match f {
+        Frame::Dmabuf(f) => dmabuf_texture(f),
+        Frame::Bgra(f) => {
+            let bytes = glib::Bytes::from_owned(f.pixels);
+            Ok(gdk::MemoryTexture::new(
+                f.width as i32,
+                f.height as i32,
+                gdk::MemoryFormat::B8g8r8x8,
+                &bytes,
+                f.width as usize * 4,
+            )
+            .upcast())
+        }
+    }
 }
 
 /// Wrap a decoded frame's dmabuf as a GDK texture. The frame (and its fd)
@@ -665,12 +692,15 @@ fn poll_status(ui: Rc<App>, rx: Receiver<Status>, session: u64) {
                     width,
                     height,
                     scale_milli,
+                    video,
                 } => {
                     ui.stream_size.set((width, height));
                     ui.stream_scale.set((scale_milli.max(1) as f32) / 1000.0);
                     ui.resize_requested.set((0, 0));
                     ui.retries.set(0);
                     ui.status.set_text(&format!("Connected — {width}x{height}"));
+                    // Visible before the first per-second stats arrive.
+                    ui.stats.set_text(&video);
                     remember_machine(&ui);
                     // A fresh server starts at its own default size; a
                     // reconnect must bring it back to the window.
@@ -680,9 +710,10 @@ fn poll_status(ui: Rc<App>, rx: Receiver<Status>, session: u64) {
                     fps,
                     mbit,
                     decode_ms,
+                    video,
                 } => {
                     ui.stats.set_text(&format!(
-                        "{fps:.0} fps  {mbit:.1} Mbit/s  decode {decode_ms:.1} ms"
+                        "{video}  {fps:.0} fps  {mbit:.1} Mbit/s  decode {decode_ms:.1} ms"
                     ));
                 }
                 Status::Cursor {
