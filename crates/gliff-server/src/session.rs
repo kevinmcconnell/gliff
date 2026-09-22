@@ -13,7 +13,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use gliff_proto::{
     ChromaMode, ClientCaps, ClientMsg, Codec, OutputInfo as ProtoOutput, Rect, ServerMsg,
-    SessionInfo, PROTOCOL_VERSION,
+    SessionInfo, VideoPipeline, PROTOCOL_VERSION,
 };
 use gliff_sw::VideoMode;
 use gliff_transport::Framed;
@@ -125,7 +125,13 @@ where
         );
     }
     writer
-        .write_msg(&stream_config(codec, chroma, &output, stream))
+        .write_msg(&stream_config(
+            codec,
+            chroma,
+            video.pipeline(),
+            &output,
+            stream,
+        ))
         .await?;
 
     let (cap_tx, mut cap_rx) = mpsc::unbounded_channel();
@@ -504,7 +510,13 @@ impl Session {
         self.output.scale = applied;
         self.inject(self.output.logical_extent());
         self.writer.send(
-            stream_config(self.codec, self.chroma, &self.output, self.stream),
+            stream_config(
+                self.codec,
+                self.chroma,
+                self.video.pipeline(),
+                &self.output,
+                self.stream,
+            ),
             Vec::new(),
         );
         Ok(())
@@ -540,7 +552,13 @@ impl Session {
                 self.pending = None;
                 self.want_keyframe = true;
                 self.writer.send(
-                    stream_config(self.codec, self.chroma, &self.output, self.stream),
+                    stream_config(
+                        self.codec,
+                        self.chroma,
+                        self.video.pipeline(),
+                        &self.output,
+                        self.stream,
+                    ),
                     Vec::new(),
                 );
                 Ok(())
@@ -607,7 +625,13 @@ impl Session {
                     self.fit_mirror(self.client_extent.0, self.client_extent.1)?;
                     if self.stream == previous_stream {
                         self.writer.send(
-                            stream_config(self.codec, self.chroma, &self.output, self.stream),
+                            stream_config(
+                                self.codec,
+                                self.chroma,
+                                self.video.pipeline(),
+                                &self.output,
+                                self.stream,
+                            ),
                             Vec::new(),
                         );
                         self.want_keyframe = true;
@@ -767,6 +791,13 @@ impl VideoTier {
             Self::Cpu => Ok(gliff_sw::Encoder::MAX_SIZE),
         }
     }
+
+    fn pipeline(&self) -> VideoPipeline {
+        match self {
+            Self::Gpu(_) => VideoPipeline::Gpu,
+            Self::Cpu => VideoPipeline::Cpu,
+        }
+    }
 }
 
 enum VideoEncoder {
@@ -894,6 +925,7 @@ impl Drop for SessionOutput {
 fn stream_config(
     codec: Codec,
     chroma: ChromaMode,
+    pipeline: VideoPipeline,
     output: &SessionOutput,
     stream: (u32, u32),
 ) -> ServerMsg {
@@ -904,6 +936,7 @@ fn stream_config(
     ServerMsg::StreamConfig {
         codec,
         chroma,
+        pipeline,
         width: stream.0,
         height: stream.1,
         scale_milli: (effective_scale * 1000.0).round() as u32,

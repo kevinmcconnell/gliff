@@ -26,6 +26,8 @@ pub enum Status {
         fps: f32,
         mbit: f32,
         decode_ms: f32,
+        /// "server pipeline > client pipeline", e.g. "gpu > cpu".
+        video: String,
     },
     /// The remote cursor image, for the client to set as its widget cursor.
     Cursor {
@@ -191,14 +193,15 @@ where
         anyhow::bail!("expected HelloAck, got {ack:?}");
     };
     let cfg = reader.read_msg::<ServerMsg>().await?;
-    let (width, height, chroma, scale_milli) = match cfg {
+    let (width, height, chroma, scale_milli, pipeline) = match cfg {
         ServerMsg::StreamConfig {
             width,
             height,
             chroma,
             scale_milli,
+            pipeline,
             ..
-        } => (width, height, chroma, scale_milli),
+        } => (width, height, chroma, scale_milli, pipeline),
         other => anyhow::bail!("expected StreamConfig, got {other:?}"),
     };
     let mut decoder = new_decoder(&gpu, chroma, width, height)?;
@@ -207,8 +210,10 @@ where
         height,
         scale_milli,
     });
+    let local = if gpu.is_some() { "gpu" } else { "cpu" };
+    let mut video_label = format!("{} > {}", pipeline.label(), local);
     let decode_on = gpu.as_ref().map_or("cpu", |g| g.name.as_str());
-    tracing::info!(width, height, scale_milli, decode_on, "connected");
+    tracing::info!(width, height, scale_milli, decode_on, video = %video_label, "connected");
     let mut logged_first = false;
 
     // Writes run on their own task, fed by `out_tx`, so reads (draining video)
@@ -355,9 +360,11 @@ where
                 height,
                 chroma,
                 scale_milli,
+                pipeline,
                 ..
             } => {
                 decoder = new_decoder(&gpu, chroma, width, height)?;
+                video_label = format!("{} > {}", pipeline.label(), local);
                 undelivered = None;
                 let _ = status.send(Status::Connected {
                     width,
@@ -407,6 +414,7 @@ where
                 } else {
                     0.0
                 },
+                video: video_label.clone(),
             });
             frames_since = 0;
             bytes_since = 0;

@@ -707,9 +707,10 @@ fn poll_status(ui: Rc<App>, rx: Receiver<Status>, session: u64) {
                     fps,
                     mbit,
                     decode_ms,
+                    video,
                 } => {
                     ui.stats.set_text(&format!(
-                        "{fps:.0} fps  {mbit:.1} Mbit/s  decode {decode_ms:.1} ms"
+                        "{video}  {fps:.0} fps  {mbit:.1} Mbit/s  decode {decode_ms:.1} ms"
                     ));
                 }
                 Status::Cursor {

@@ -68,19 +68,22 @@ $PROBE --video cpu roundtrip 2>/dev/null | grep -q "^PASS min RGB PSNR" || fail 
 echo "   probe checks PASS"
 
 echo "== 2. capture->4:4:4 pipeline =="
-hyprctl output create headless e2ecap >/dev/null 2>&1
-sleep 1
-HN=$(hyprctl monitors -j | python3 -c "import sys,json;print(next((m['name'] for m in json.load(sys.stdin) if 'e2ecap' in m['name'] or m['name']=='e2ecap'),''))")
+# A fresh output per run: an idle headless output does not render again, so
+# a second capture on the same output can wait past the probe's deadline.
 run_pipeline() {
     local video=$1
+    hyprctl output create headless e2ecap >/dev/null 2>&1
+    sleep 1
+    local HN
+    HN=$(hyprctl monitors -j | python3 -c "import sys,json;print(next((m['name'] for m in json.load(sys.stdin) if 'e2ecap' in m['name'] or m['name']=='e2ecap'),''))")
     local pipe
     pipe=$($PROBE --instance "$NEST_SIG" --video "$video" pipeline --output "${HN:-e2ecap}" 2>/dev/null)
+    hyprctl output remove "${HN:-e2ecap}" >/dev/null 2>&1
     echo "$pipe" | grep -q "^PASS" || fail "4:4:4 pipeline ($video)"
     echo "$pipe" | grep -q "^FAIL" && fail "4:4:4 pipeline ($video) ($(echo "$pipe" | grep '^FAIL' | head -1))"
 }
 [ "$HAS_GPU" = 1 ] && run_pipeline gpu
 run_pipeline cpu
-hyprctl output remove "${HN:-e2ecap}" >/dev/null 2>&1
 echo "   pipeline PASS"
 
 run_server_test() {
