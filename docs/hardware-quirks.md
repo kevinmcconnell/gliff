@@ -184,9 +184,10 @@ pictures that are not references.
 
 ## Known limitations recorded from code review (not yet fixed)
 
-- **Instance discovery tie-break.** `hypr-ipc` picks the newest instance by
-  directory mtime; two Hyprland instances started within the same coarse
-  filesystem timestamp are tie-broken by name, which could pick the older one.
+- **Instance discovery tie-break.** `hypr-ipc` picks the newest instance
+  whose socket answers, so dead leftovers (a killed nested Hyprland) are
+  skipped; two live instances started within the same coarse filesystem
+  timestamp are still tie-broken by name, which could pick the older one.
 - **`wl_output` bound at version 4.** A compositor offering an older `wl_output`
   would fail to bind. Hyprland always offers v4.
 - **Capture dmabuf uses one buffer-object fd for all planes.** Correct for the
