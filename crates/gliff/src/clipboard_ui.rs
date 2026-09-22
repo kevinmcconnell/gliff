@@ -16,7 +16,7 @@ use gtk::glib;
 use gtk::prelude::*;
 use gtk::subclass::prelude::*;
 use gtk4 as gtk;
-use tokio::sync::mpsc::{Sender, UnboundedSender};
+use tokio::sync::mpsc::{Sender, UnboundedSender, WeakUnboundedSender};
 use tokio::sync::oneshot;
 
 use gliff_proto::clipboard::{
@@ -46,7 +46,9 @@ pub fn watch_local(sender: impl Fn() -> Option<UnboundedSender<ToWorker>> + 'sta
     // Bumped per change so a slow file listing for a stale one is dropped.
     let selection_gen = Rc::new(Cell::new(0u64));
     cb.connect_changed(move |cb| {
-        if cb.is_local() {
+        // Only our own proxy for the server's offer must not echo back;
+        // a copy from another gliff widget is a real local change.
+        if cb.content().is_some_and(|p| p.is::<RemoteProvider>()) {
             return;
         }
         let Some(tx) = sender() else {
@@ -107,12 +109,19 @@ async fn local_files(cb: &gdk::Clipboard, mimes: &[String]) -> LocalFiles {
     if paths.is_empty() {
         return LocalFiles::default();
     }
-    match list_files(&paths) {
-        Ok(files) => files,
-        Err(e) => {
+    // The walk reads metadata for up to 10,000 entries, so it runs on its
+    // own thread; blocking here would freeze rendering and input.
+    let (tx, rx) = oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(list_files(&paths));
+    });
+    match rx.await {
+        Ok(Ok(files)) => files,
+        Ok(Err(e)) => {
             tracing::warn!(error = %e, "clipboard files not offered");
             LocalFiles::default()
         }
+        Err(_) => LocalFiles::default(),
     }
 }
 
@@ -165,9 +174,11 @@ pub fn read_local(mime_type: String, reply: Sender<std::io::Result<Bytes>>) {
 }
 
 /// Make the server's offer the local selection, or clear ours for an empty
-/// offer.
+/// offer. The provider holds the session's sender weakly: it must not keep
+/// a replaced session's input channel open, or that session never learns
+/// the UI has moved on.
 pub fn set_remote_offer(
-    tx: UnboundedSender<ToWorker>,
+    tx: &UnboundedSender<ToWorker>,
     serial: u32,
     mime_types: Vec<String>,
     files: Vec<ClipboardFile>,
@@ -182,7 +193,7 @@ pub fn set_remote_offer(
         }
         return;
     }
-    let provider = RemoteProvider::new(tx, serial, mimes);
+    let provider = RemoteProvider::new(tx.downgrade(), serial, mimes);
     if let Err(e) = cb.set_content(Some(&provider)) {
         tracing::warn!(error = %e, "clipboard proxy not set");
     }
@@ -196,7 +207,7 @@ glib::wrapper! {
 }
 
 impl RemoteProvider {
-    fn new(tx: UnboundedSender<ToWorker>, serial: u32, mime_types: Vec<String>) -> Self {
+    fn new(tx: WeakUnboundedSender<ToWorker>, serial: u32, mime_types: Vec<String>) -> Self {
         let obj: Self = glib::Object::new();
         let imp = obj.imp();
         *imp.tx.borrow_mut() = Some(tx);
@@ -214,7 +225,7 @@ mod imp {
 
     #[derive(Default)]
     pub struct RemoteProvider {
-        pub tx: RefCell<Option<UnboundedSender<ToWorker>>>,
+        pub tx: RefCell<Option<WeakUnboundedSender<ToWorker>>>,
         /// Serial of the offer this provider proxies. A paste echoes it, so
         /// one racing a newer offer is refused instead of served the wrong
         /// item.
@@ -250,7 +261,9 @@ mod imp {
             let stream = stream.clone();
             Box::pin(async move {
                 let failed = |m: String| glib::Error::new(gio::IOErrorEnum::Failed, &m);
-                let tx = tx.ok_or_else(|| failed("not connected".into()))?;
+                let tx = tx
+                    .and_then(|w| w.upgrade())
+                    .ok_or_else(|| failed("not connected".into()))?;
                 let (sink, mut rx) = tokio::sync::mpsc::channel::<Bytes>(2);
                 let (result_tx, result_rx) = oneshot::channel();
                 tx.send(ToWorker::Fetch {

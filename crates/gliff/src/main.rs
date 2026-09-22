@@ -704,7 +704,7 @@ fn poll_status(ui: Rc<App>, rx: Receiver<Status>, session: u64) {
                     mime_types,
                     files,
                 } => {
-                    if let Some(tx) = ui.input_tx.borrow().clone() {
+                    if let Some(tx) = ui.input_tx.borrow().as_ref() {
                         clipboard_ui::set_remote_offer(tx, serial, mime_types, files);
                     }
                 }
