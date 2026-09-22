@@ -146,10 +146,15 @@ impl Spool {
     pub fn create_in(base: &Path) -> io::Result<Self> {
         std::fs::create_dir_all(base)?;
         sweep_stale(base);
+        // Pasted files can be private; the spool must not be readable by
+        // other local users, whatever the umask.
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
         let pid = std::process::id();
         for n in 0u32.. {
             let dir = base.join(format!("{pid}-{n}"));
-            match std::fs::create_dir(&dir) {
+            match builder.create(&dir) {
                 Ok(()) => return Ok(Self { dir }),
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(e),
@@ -244,7 +249,7 @@ pub async fn fetch_files(
             tokio::fs::create_dir_all(parent).await?;
         }
         let file = tokio::fs::File::create(&dest).await?;
-        transfers
+        let got = transfers
             .fetch(
                 ClipboardItem::File(i as u32),
                 serial,
@@ -252,6 +257,13 @@ pub async fn fetch_files(
                 Some(f.size),
             )
             .await?;
+        if got != f.size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{}: got {got} of {} bytes", f.path, f.size),
+            )
+            .into());
+        }
     }
     Ok(top_level(files)
         .map(|f| {

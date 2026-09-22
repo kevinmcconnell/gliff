@@ -346,6 +346,7 @@ impl Transfers {
         let guard = FetchGuard {
             transfers: self.clone(),
             id,
+            armed: true,
         };
         out.send((ClipboardMsg::Request { id, serial, item }, Bytes::new()))
             .await
@@ -495,16 +496,20 @@ impl<S: ChunkSource> Chunked<S> {
 struct FetchGuard {
     transfers: Transfers,
     id: u32,
+    armed: bool,
 }
 
 impl FetchGuard {
-    fn disarm(self) {
-        std::mem::forget(self);
+    fn disarm(mut self) {
+        self.armed = false;
     }
 }
 
 impl Drop for FetchGuard {
     fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
         let removed = self
             .transfers
             .inner
@@ -578,6 +583,7 @@ mod tests {
     fn fetch_streams_a_large_item_in_chunks() {
         run(async {
             let (a, b, _ae, be) = pair();
+            let baseline = Rc::strong_count(&a.inner);
             let data: Vec<u8> = (0..(3 * CHUNK + 17)).map(|i| (i % 251) as u8).collect();
             tokio::task::spawn_local(serve_requests(b.clone(), be, data.clone()));
             let got = a
@@ -591,6 +597,8 @@ mod tests {
                 .unwrap();
             assert_eq!(got, data.len() as u64);
             assert!(a.inner.borrow().incoming.is_empty());
+            // A completed fetch releases its engine reference.
+            assert_eq!(Rc::strong_count(&a.inner), baseline);
             tokio::task::yield_now().await;
             assert!(b.inner.borrow().outgoing.is_empty());
         });
@@ -862,6 +870,16 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_spool_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().unwrap();
+        let spool = Spool::create_in(base.path()).unwrap();
+        let mode = std::fs::metadata(spool.dir()).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+    }
+
     #[test]
     fn a_new_spool_sweeps_those_of_dead_processes() {
         let base = tempfile::tempdir().unwrap();
@@ -903,6 +921,31 @@ mod tests {
                 matches!(r, Err(TransferError::Chunk(ChunkError::OverCap(1)))),
                 "{r:?}"
             );
+        });
+    }
+
+    #[test]
+    fn a_file_shorter_than_declared_is_refused() {
+        run(async {
+            let (a, b, _ae, be) = pair();
+            let b2 = b.clone();
+            tokio::task::spawn_local(async move {
+                loop {
+                    if let Some(Event::Request { id, .. }) = be.borrow_mut().pop() {
+                        b2.serve(id, ReadSource(&b"x"[..]));
+                    }
+                    tokio::task::yield_now().await;
+                }
+            });
+            let base = tempfile::tempdir().unwrap();
+            let spool = Spool::create_in(base.path()).unwrap();
+            let files = vec![ClipboardFile {
+                path: "short".into(),
+                size: 5,
+                dir: false,
+            }];
+            let r = fetch_files(&a, &files, 0, &spool, &Meter::default()).await;
+            assert!(matches!(r, Err(TransferError::Io(_))), "{r:?}");
         });
     }
 
