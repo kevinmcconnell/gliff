@@ -41,6 +41,9 @@ pub const MAX_PAYLOAD: u32 = 64 * 1024 * 1024;
 pub struct Framed<S> {
     stream: S,
     read_buf: BytesMut,
+    /// Body length of a frame whose prefix is consumed but whose body has
+    /// not arrived, so a cancelled `read_msg` resumes where it stopped.
+    pending_len: Option<u32>,
 }
 
 impl<S> Framed<S> {
@@ -48,6 +51,7 @@ impl<S> Framed<S> {
         Self {
             stream,
             read_buf: BytesMut::with_capacity(64 * 1024),
+            pending_len: None,
         }
     }
 
@@ -85,12 +89,24 @@ impl<S: AsyncWrite + Unpin> Framed<S> {
 impl<S: AsyncRead + Unpin> Framed<S> {
     /// Read one message body. Payloads (if any) must then be read with
     /// [`read_payload`] according to the message's declared lengths.
+    ///
+    /// Cancel-safe: a caller may race this in a `select!`. A parsed length
+    /// prefix is kept across a cancellation, and buffered stream bytes are
+    /// only consumed once the full item is present.
     pub async fn read_msg<M: DeserializeOwned>(&mut self) -> Result<M> {
-        let len = self.read_u32().await?;
-        if len as usize > MAX_FRAME_BODY {
-            return Err(Error::BodyTooLarge(len));
-        }
+        let len = match self.pending_len {
+            Some(len) => len,
+            None => {
+                let len = self.read_u32().await?;
+                if len as usize > MAX_FRAME_BODY {
+                    return Err(Error::BodyTooLarge(len));
+                }
+                self.pending_len = Some(len);
+                len
+            }
+        };
         let body = self.read_exact_bytes(len as usize).await?;
+        self.pending_len = None;
         Ok(postcard::from_bytes(&body)?)
     }
 

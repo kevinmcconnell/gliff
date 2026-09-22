@@ -78,6 +78,16 @@ where
     tracing::info!(output = %output.name, output.width, output.height, headless = output.is_headless(), "session output ready");
 
     let video = VideoTier::open(cfg.video, &cfg.render_node);
+    if !caps.chroma.contains(&ChromaMode::Dual420) && !caps.chroma.contains(&ChromaMode::Single420)
+    {
+        writer
+            .write_msg(&ServerMsg::Error {
+                code: 2,
+                message: "no common chroma mode".into(),
+            })
+            .await?;
+        anyhow::bail!("client advertises no chroma mode this server speaks");
+    }
     // The CPU tier defaults to one 4:2:0 stream: dual-stream 4:4:4 doubles
     // the encode work, which the CPU pays for where the GPU does not. A
     // preference only applies when the client advertises the mode.

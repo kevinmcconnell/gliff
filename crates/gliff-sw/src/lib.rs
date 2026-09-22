@@ -314,13 +314,16 @@ impl Decoder {
         let main = flush_nv12(&mut self.main)?;
         let yuv = match &mut self.aux {
             Some(dec) => match (main, flush_nv12(dec)?) {
-                (Some(m), Some(a)) => recombine_yuv444(&m, &a),
-                _ => return Ok(None),
+                (Some(m), Some(a)) => Some(recombine_yuv444(&m, &a)),
+                _ => None,
             },
-            None => match main {
-                Some(m) => nv12_to_yuv444(&m),
-                None => return Ok(None),
-            },
+            None => main.map(|m| nv12_to_yuv444(&m)),
+        };
+        let Some(yuv) = yuv else {
+            // Nothing came out, so nothing is drainable: correct any drift
+            // the counter picked up from failed decodes.
+            self.held = 0;
+            return Ok(None);
         };
         self.held = self.held.saturating_sub(1);
         Ok(Some(BgraFrame {

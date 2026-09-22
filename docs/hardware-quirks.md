@@ -171,6 +171,9 @@ pictures that are not references.
 ## Not yet tested anywhere
 - NVIDIA (proprietary and NVK) for every item above, and Intel ANV for every
   item not listed under "Confirmed on Intel ANV".
+- Baseline-profile streams (the CPU tier's output) through Vulkan decode
+  sessions created with the fixed High decode profile: RADV accepts them
+  (the e2e cpu-server -> gpu-client case), other drivers are unverified.
 - Native 4:4:4 encode (HEVC 4:4:4 / AV1) to retire the dual-stream split.
 - `VK_VALVE_video_encode_rgb_conversion` (exposed by RADV here): the encoder
   converts RGB itself, which would remove the split pass for `Single420`.

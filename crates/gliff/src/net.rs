@@ -249,23 +249,41 @@ where
     let mut last_report = std::time::Instant::now();
 
     // The CPU decoder holds the newest picture of a High-profile
-    // (GPU-encoded) stream until the next access unit arrives. When the
-    // stream goes quiet, drain it so the screen shows the latest state.
+    // (GPU-encoded) stream until the next access unit arrives. When no video
+    // frame has arrived for a while, drain it so the screen shows the latest
+    // state. The deadline follows video frames only — cursor and other
+    // messages must not postpone it — and a frame the full UI channel
+    // rejected is retried at the same cadence.
     const IDLE_DRAIN: std::time::Duration = std::time::Duration::from_millis(150);
+    let mut drain_at = tokio::time::Instant::now() + IDLE_DRAIN;
+    let mut undelivered: Option<Frame> = None;
     loop {
         let read = tokio::select! {
             read = reader.read_msg::<ServerMsg>() => read,
             _ = &mut ui_gone => return Ok(()),
-            _ = tokio::time::sleep(IDLE_DRAIN),
-                if matches!(&decoder, VideoDecoder::Cpu(d) if d.has_pending()) =>
+            _ = tokio::time::sleep_until(drain_at),
+                if undelivered.is_some()
+                    || matches!(&decoder, VideoDecoder::Cpu(d) if d.has_pending()) =>
             {
-                if let VideoDecoder::Cpu(d) = &mut decoder {
-                    match d.flush() {
-                        Ok(Some(frame)) => {
-                            let _ = frames.try_send(Frame::Bgra(frame));
-                        }
-                        Ok(None) => {}
-                        Err(e) => tracing::warn!(error = %e, "idle drain failed"),
+                drain_at = tokio::time::Instant::now() + IDLE_DRAIN;
+                let frame = match undelivered.take() {
+                    Some(frame) => Some(frame),
+                    None => match &mut decoder {
+                        VideoDecoder::Cpu(d) => match d.flush() {
+                            Ok(frame) => frame.map(Frame::Bgra),
+                            Err(e) => {
+                                tracing::warn!(error = %e, "idle drain failed");
+                                None
+                            }
+                        },
+                        VideoDecoder::Gpu(_) => None,
+                    },
+                };
+                if let Some(frame) = frame {
+                    if let Err(std::sync::mpsc::TrySendError::Full(frame)) =
+                        frames.try_send(frame)
+                    {
+                        undelivered = Some(frame);
                     }
                 }
                 continue;
@@ -291,6 +309,9 @@ where
                     bytes::Bytes::new()
                 };
                 bytes_since += (data_len + aux_len) as u64;
+                drain_at = tokio::time::Instant::now() + IDLE_DRAIN;
+                // A live frame supersedes a drained one awaiting retry.
+                undelivered = None;
                 let t0 = std::time::Instant::now();
                 let decoded = match &mut decoder {
                     VideoDecoder::Gpu(d) => d
@@ -337,6 +358,7 @@ where
                 ..
             } => {
                 decoder = new_decoder(&gpu, chroma, width, height)?;
+                undelivered = None;
                 let _ = status.send(Status::Connected {
                     width,
                     height,
