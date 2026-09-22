@@ -248,10 +248,28 @@ where
     let mut decode_ms_acc = 0f32;
     let mut last_report = std::time::Instant::now();
 
+    // The CPU decoder holds the newest picture of a High-profile
+    // (GPU-encoded) stream until the next access unit arrives. When the
+    // stream goes quiet, drain it so the screen shows the latest state.
+    const IDLE_DRAIN: std::time::Duration = std::time::Duration::from_millis(150);
     loop {
         let read = tokio::select! {
             read = reader.read_msg::<ServerMsg>() => read,
             _ = &mut ui_gone => return Ok(()),
+            _ = tokio::time::sleep(IDLE_DRAIN),
+                if matches!(&decoder, VideoDecoder::Cpu(d) if d.has_pending()) =>
+            {
+                if let VideoDecoder::Cpu(d) = &mut decoder {
+                    match d.flush() {
+                        Ok(Some(frame)) => {
+                            let _ = frames.try_send(Frame::Bgra(frame));
+                        }
+                        Ok(None) => {}
+                        Err(e) => tracing::warn!(error = %e, "idle drain failed"),
+                    }
+                }
+                continue;
+            }
         };
         let msg = match read {
             Ok(m) => m,

@@ -79,11 +79,12 @@ where
 
     let video = VideoTier::open(cfg.video, &cfg.render_node);
     // The CPU tier defaults to one 4:2:0 stream: dual-stream 4:4:4 doubles
-    // the encode work, which the CPU pays for where the GPU does not.
-    let single_chroma = cfg.low_bandwidth
-        || !caps.chroma.contains(&ChromaMode::Dual420)
-        || (matches!(video, VideoTier::Cpu) && !cfg.full_chroma);
-    let chroma = if single_chroma {
+    // the encode work, which the CPU pays for where the GPU does not. A
+    // preference only applies when the client advertises the mode.
+    let prefer_single = cfg.low_bandwidth || (matches!(video, VideoTier::Cpu) && !cfg.full_chroma);
+    let chroma = if !caps.chroma.contains(&ChromaMode::Dual420)
+        || (prefer_single && caps.chroma.contains(&ChromaMode::Single420))
+    {
         ChromaMode::Single420
     } else {
         ChromaMode::Dual420

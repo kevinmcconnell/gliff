@@ -72,6 +72,23 @@ through `HOST_CACHED` memory it takes ~1 ms. `HostBuffer` prefers cached
 memory and falls back to write-combined. The encoder's bitstream buffer uses
 the same path.
 
+## OpenH264 (the CPU tier)
+
+- **The decoder holds one picture for non-Baseline streams.** OpenH264
+  skips its reorder buffer only for Baseline-profile streams, so the CPU
+  encoder emits Baseline and its streams display with no delay. A
+  GPU-encoded (High-profile) stream comes out one access unit late; the
+  client drains the held picture after 150 ms of stream silence
+  (`Decoder::flush`), which does not disturb later decoding.
+- **Per-decode flushing breaks the reference chain.** The `openh264`
+  crate's default `Flush::Flush` ejects the reference picture of a
+  low-delay stream (dsOutOfMemory on the fourth frame of a RADV-encoded
+  stream); the decoder runs with `Flush::NoFlush`.
+- **CBR is soft without frame skipping.** The encoder disables
+  `skip_frames` so every capture yields a frame (the AVC444 pair must stay
+  in step), which OpenH264 says weakens its bitrate cap. The server's own
+  `BitrateController` adapts the target from ack timing on top.
+
 ## Hyprland cursor capture (0.56.2, and upstream main as of 2026-09-02)
 
 The server captures the remote cursor with an `ext-image-copy-capture-v1`

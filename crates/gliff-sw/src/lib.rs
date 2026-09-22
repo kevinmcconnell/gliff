@@ -208,7 +208,20 @@ fn new_h264_encoder(settings: &EncoderSettings) -> Result<H264Encoder> {
             settings.width, settings.height
         )));
     }
+    // The 4:2:0 chroma split needs even dimensions.
+    if settings.width == 0
+        || settings.height == 0
+        || settings.width % 2 != 0
+        || settings.height % 2 != 0
+    {
+        return Err(Error::Unsupported(format!(
+            "{}x{} is not an even, non-zero size",
+            settings.width, settings.height
+        )));
+    }
     // Quiet: in `--stdio` mode nothing may write to the wire by accident.
+    // Baseline profile: OpenH264's decoder skips its one-picture reorder
+    // buffer only for Baseline streams, so they display with no delay.
     let config = EncoderConfig::new()
         .debug(false)
         .usage_type(UsageType::ScreenContentRealTime)
@@ -216,7 +229,7 @@ fn new_h264_encoder(settings: &EncoderSettings) -> Result<H264Encoder> {
         .bitrate(BitRate::from_bps(settings.bitrate))
         .max_frame_rate(FrameRate::from_hz(settings.framerate as f32))
         .skip_frames(false)
-        .profile(Profile::High)
+        .profile(Profile::Baseline)
         .vui(VuiConfig::bt709());
     Ok(H264Encoder::with_api_config(
         OpenH264API::from_source(),
@@ -234,6 +247,10 @@ fn encode_nv12(encoder: &mut H264Encoder, nv12: &Nv12, ts: Timestamp) -> Result<
 pub struct Decoder {
     main: H264Decoder,
     aux: Option<H264Decoder>,
+    /// Access units fed minus pictures returned: what the decoders still
+    /// hold. Zero for Baseline streams; one for a High-profile stream, whose
+    /// newest picture waits for the next unit or a [`Decoder::flush`].
+    held: u32,
 }
 
 impl Decoder {
@@ -241,7 +258,14 @@ impl Decoder {
         Ok(Self {
             main: new_h264_decoder()?,
             aux: dual.then(new_h264_decoder).transpose()?,
+            held: 0,
         })
+    }
+
+    /// True when the decoders hold a picture that only a further access
+    /// unit or a [`Decoder::flush`] will release.
+    pub fn has_pending(&self) -> bool {
+        self.held > 0
     }
 
     /// Decode one access unit pair and recombine to a BGRA frame. `None`
@@ -249,6 +273,7 @@ impl Decoder {
     /// (hardware encoders emit no VUI) comes out one access unit late.
     /// Both decoders are fed every unit so the pair stays in step.
     pub fn decode(&mut self, main: &[u8], aux: &[u8]) -> Result<Option<BgraFrame>> {
+        self.held += 1;
         let main_nv12 = decode_nv12(&mut self.main, main)?;
         let yuv = match &mut self.aux {
             Some(dec) => {
@@ -274,6 +299,7 @@ impl Decoder {
                 None => return Ok(None),
             },
         };
+        self.held = self.held.saturating_sub(1);
         Ok(Some(BgraFrame {
             width: yuv.width as u32,
             height: yuv.height as u32,
@@ -281,8 +307,9 @@ impl Decoder {
         }))
     }
 
-    /// Drain the picture still buffered in the decoders, for a caller that
-    /// has fed its last access unit (tests and the probe).
+    /// Drain the picture still buffered in the decoders: for the last access
+    /// unit of a run, or to put the newest picture on screen when the stream
+    /// goes quiet. Decoding continues cleanly afterwards.
     pub fn flush(&mut self) -> Result<Option<BgraFrame>> {
         let main = flush_nv12(&mut self.main)?;
         let yuv = match &mut self.aux {
@@ -295,6 +322,7 @@ impl Decoder {
                 None => return Ok(None),
             },
         };
+        self.held = self.held.saturating_sub(1);
         Ok(Some(BgraFrame {
             width: yuv.width as u32,
             height: yuv.height as u32,
