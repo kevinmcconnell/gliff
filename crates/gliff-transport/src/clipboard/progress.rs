@@ -12,7 +12,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use gliff_proto::clipboard::top_level;
+use gliff_proto::clipboard::{is_text_mime, top_level};
 use gliff_proto::ClipboardFile;
 use tokio::task::AbortHandle;
 
@@ -237,6 +237,25 @@ pub fn describe_files(files: &[ClipboardFile]) -> (String, Option<u64>) {
     (label, Some(total))
 }
 
+/// The label of a job that pastes one clipboard item: what the user would
+/// call it, not its mime type, when there is a common name for it.
+pub fn describe_mime(mime: &str) -> String {
+    let base = mime.split(';').next().unwrap_or(mime).trim();
+    let (kind, sub) = base.split_once('/').unwrap_or((base, ""));
+    match (kind, sub) {
+        ("text", "html") => "formatted text".into(),
+        ("text", _) => "text".into(),
+        _ if is_text_mime(mime) => "text".into(),
+        ("image" | "audio" | "video", sub) if !sub.is_empty() => {
+            let format = sub.split('+').next().unwrap_or(sub).to_uppercase();
+            format!("{format} {kind}")
+        }
+        ("application", "octet-stream") => "binary data".into(),
+        ("application", "pdf") => "PDF".into(),
+        _ => mime.into(),
+    }
+}
+
 /// Bytes as a short human figure: `1.5 MiB`.
 pub fn human_bytes(n: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
@@ -387,6 +406,19 @@ mod tests {
         assert_eq!(describe_files(&one), ("photos".into(), Some(5)));
         let two = [f("a", 1, false), f("b", 2, false)];
         assert_eq!(describe_files(&two), ("2 items".into(), Some(3)));
+    }
+
+    #[test]
+    fn an_item_is_named_by_its_kind() {
+        assert_eq!(describe_mime("text/plain;charset=utf-8"), "text");
+        assert_eq!(describe_mime("UTF8_STRING"), "text");
+        assert_eq!(describe_mime("text/html"), "formatted text");
+        assert_eq!(describe_mime("image/png"), "PNG image");
+        assert_eq!(describe_mime("image/svg+xml"), "SVG image");
+        assert_eq!(describe_mime("video/mp4"), "MP4 video");
+        assert_eq!(describe_mime("application/octet-stream"), "binary data");
+        assert_eq!(describe_mime("application/pdf"), "PDF");
+        assert_eq!(describe_mime("application/x-foo"), "application/x-foo");
     }
 
     #[test]
