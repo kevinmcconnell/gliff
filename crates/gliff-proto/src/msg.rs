@@ -980,6 +980,27 @@ mod tests {
         assert!(crate::cbor::known::<(), Codec>(&mut d, &mut ()).is_err());
     }
 
+    #[test]
+    fn the_largest_file_offer_fits_in_a_frame() {
+        use crate::clipboard::{MAX_FILE_ENTRIES, MAX_FILE_PATH_BYTES};
+        let path_len = MAX_FILE_PATH_BYTES / MAX_FILE_ENTRIES;
+        let offer = ClientMsg::ClipboardOffer {
+            serial: u32::MAX,
+            mime_types: crate::clipboard::TEXT_MIMES
+                .iter()
+                .map(|m| m.to_string())
+                .collect(),
+            files: (0..MAX_FILE_ENTRIES)
+                .map(|i| ClipboardFile {
+                    path: format!("{i:0path_len$}"),
+                    size: u64::MAX,
+                    dir: false,
+                })
+                .collect(),
+        };
+        assert!(minicbor::to_vec(&offer).unwrap().len() <= crate::frame::MAX_FRAME_BODY);
+    }
+
     /// The shape every new field takes: an optional enum appended last.
     #[derive(Debug, PartialEq, Encode, Decode)]
     struct Grown {

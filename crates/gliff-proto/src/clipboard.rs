@@ -31,6 +31,9 @@ pub const MAX_ITEM: u64 = 32 * 1024 * 1024;
 pub const MAX_FILES_TOTAL: u64 = 4 * 1024 * 1024 * 1024;
 /// Cap on the number of entries (files and directories) in one offer.
 pub const MAX_FILE_ENTRIES: usize = 10_000;
+/// Cap on the summed path lengths in one offer, which with the per-entry
+/// overhead keeps an offer well inside one frame.
+pub const MAX_FILE_PATH_BYTES: usize = 512 * 1024;
 
 /// Mime type the pasting side uses for text it received as any text flavour.
 pub const TEXT_MIME: &str = "text/plain;charset=utf-8";
@@ -301,6 +304,10 @@ pub fn validate_files(files: &[ClipboardFile]) -> Result<(), FilesError> {
     if files.len() > MAX_FILE_ENTRIES {
         return Err(FilesError::TooMany(files.len()));
     }
+    let path_bytes: usize = files.iter().map(|f| f.path.len()).sum();
+    if path_bytes > MAX_FILE_PATH_BYTES {
+        return Err(FilesError::PathsTooLong(path_bytes));
+    }
     let mut total: u64 = 0;
     let mut seen = std::collections::HashSet::new();
     for f in files {
@@ -325,6 +332,8 @@ pub enum FilesError {
     TooMany(usize),
     #[error("files total {0} bytes, over the limit of {MAX_FILES_TOTAL}")]
     TooLarge(u64),
+    #[error("paths total {0} bytes, over the limit of {MAX_FILE_PATH_BYTES}")]
+    PathsTooLong(usize),
     #[error("unsafe or duplicate path {0:?}")]
     BadPath(String),
 }
@@ -538,6 +547,14 @@ mod tests {
         assert!(matches!(
             validate_files(&[f("x", MAX_FILES_TOTAL + 1, false)]),
             Err(FilesError::TooLarge(_))
+        ));
+        let long_name = "x".repeat(200);
+        let long: Vec<_> = (0..MAX_FILE_PATH_BYTES / 200 + 1)
+            .map(|i| f(&format!("{i}{long_name}"), 0, false))
+            .collect();
+        assert!(matches!(
+            validate_files(&long),
+            Err(FilesError::PathsTooLong(_))
         ));
         let many: Vec<_> = (0..=MAX_FILE_ENTRIES)
             .map(|i| f(&format!("f{i}"), 0, false))
