@@ -93,16 +93,24 @@ impl KeyState {
         }
     }
 
-    /// Take over the state of `old`, a different keymap: the keys still
-    /// `held`, then its locked modifiers (matched by name) and locked
-    /// layout. Returns the resulting `(depressed, latched, locked, group)`.
+    /// Take over the state of `old`, a different keymap: its locked layout,
+    /// the keys still `held`, then its locked modifiers (matched by name).
+    /// Returns the resulting `(depressed, latched, locked, group)`.
     pub fn carry_over(
         &mut self,
         old: &KeyState,
         held: impl IntoIterator<Item = u32>,
     ) -> (u32, u32, u32, u32) {
-        // Replayed before the locks are set, so a held lock key does not
-        // count them as its own and clear them on release.
+        let layout = old.state.serialize_layout(xkb::STATE_LAYOUT_LOCKED);
+        let layout = if layout < self.keymap.num_layouts() {
+            layout
+        } else {
+            0
+        };
+        // Held keys are replayed in the carried layout, and before the
+        // locked modifiers are set, so a held lock key does not count them
+        // as its own and clear them on release.
+        self.state.update_mask(0, 0, 0, 0, 0, layout);
         for code in held {
             self.state.update_key(
                 xkb::Keycode::new(code.saturating_add(8)),
@@ -120,12 +128,6 @@ impl KeyState {
                 locked |= 1 << index;
             }
         }
-        let layout = old.state.serialize_layout(xkb::STATE_LAYOUT_LOCKED);
-        let layout = if layout < self.keymap.num_layouts() {
-            layout
-        } else {
-            0
-        };
         self.state.update_mask(
             self.state.serialize_mods(xkb::STATE_MODS_DEPRESSED),
             self.state.serialize_mods(xkb::STATE_MODS_LATCHED),
@@ -223,6 +225,24 @@ mod tests {
         assert_eq!(depressed, control);
         let mods = new.update(KEY_LEFTCTRL, false).expect("ctrl release");
         assert_eq!((mods.0, mods.2), (0, lock));
+    }
+
+    #[test]
+    fn carry_over_replays_held_keys_in_the_locked_layout() {
+        const KEY_RIGHTALT: u32 = 100;
+        let text = keymap_from_names(&KeymapNames {
+            layout: "us,de".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut old = KeyState::from_text(&text).unwrap();
+        old.state.update_mask(0, 0, 0, 0, 0, 1);
+        old.update(KEY_RIGHTALT, true);
+        let mut new = KeyState::from_text(&text).unwrap();
+        let (depressed, _, _, group) = new.carry_over(&old, [KEY_RIGHTALT]);
+        let level3 = 1 << new.keymap.mod_get_index("Mod5");
+        assert_eq!(group, 1);
+        assert_eq!(depressed, level3);
     }
 
     #[test]
