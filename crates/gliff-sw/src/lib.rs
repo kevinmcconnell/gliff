@@ -9,8 +9,8 @@ use gliff_proto::chroma::{nv12_to_yuv444, recombine_yuv444, split_yuv444, yuv444
 use gliff_proto::color::{bgra_to_yuv444, yuv444_to_bgra};
 use openh264::decoder::{DecodedYUV, Decoder as H264Decoder, DecoderConfig, Flush};
 use openh264::encoder::{
-    BitRate, Encoder as H264Encoder, EncoderConfig, FrameRate, FrameType, Profile, RateControlMode,
-    UsageType, VuiConfig,
+    BitRate, Encoder as H264Encoder, EncoderConfig, FrameRate, FrameType, Profile, QpRange,
+    RateControlMode, UsageType, VuiConfig,
 };
 use openh264::formats::YUVSource;
 use openh264::{OpenH264API, Timestamp};
@@ -226,6 +226,9 @@ fn new_h264_encoder(settings: &EncoderSettings) -> Result<H264Encoder> {
         .debug(false)
         .usage_type(UsageType::ScreenContentRealTime)
         .rate_control_mode(RateControlMode::Bitrate)
+        // Left unset, the range becomes 26..=35 for screen content, and QP 26
+        // caps the quality whatever the bitrate.
+        .qp(QpRange::new(12, 35))
         .bitrate(BitRate::from_bps(settings.bitrate))
         .max_frame_rate(FrameRate::from_hz(settings.framerate as f32))
         .skip_frames(false)
@@ -404,6 +407,20 @@ mod tests {
         out
     }
 
+    /// Dense, high-contrast detail, like small text.
+    fn detailed_bgra(w: usize, h: usize) -> Vec<u8> {
+        let mut seed = 0x2545_f491_u32;
+        let mut out = vec![0u8; w * h * 4];
+        for px in out.chunks_exact_mut(4) {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            let v = if seed % 3 == 0 { 230 } else { 20 };
+            px.copy_from_slice(&[v, v, v, 255]);
+        }
+        out
+    }
+
     fn rgb_channels(bgra: &[u8]) -> Vec<u8> {
         bgra.chunks_exact(4)
             .flat_map(|p| [p[0], p[1], p[2]])
@@ -498,6 +515,32 @@ mod tests {
             }
         }
         assert!(decoded >= 5, "decoded only {decoded}/6 frames");
+    }
+
+    #[test]
+    fn detailed_change_beats_the_default_screen_qp_floor() {
+        let (w, h) = (640usize, 360usize);
+        let settings = EncoderSettings {
+            width: w as u32,
+            height: h as u32,
+            bitrate: (w * h * 60 / 10) as u32,
+            framerate: 60,
+        };
+        let mut encoder = Encoder::new(settings, true).expect("encoder");
+        let mut decoder = Decoder::new(true).expect("decoder");
+        let dark = vec![16u8; w * h * 4];
+        let detail = detailed_bgra(w, h);
+        let mut last = None;
+        for src in [&dark, &detail, &detail] {
+            let packet = encoder.encode_bgra(src, false).expect("encode");
+            let aux = packet.aux.as_deref().unwrap_or(&[]);
+            last = decoder.decode(&packet.main, aux).expect("decode").or(last);
+        }
+        last = decoder.flush().expect("flush").or(last);
+        let out = last.expect("a decoded picture");
+        let reference = reference_bgra(&detail, w, h, true);
+        let p = psnr(&rgb_channels(&reference), &rgb_channels(&out.pixels));
+        assert!(p > 34.5, "detailed change PSNR {p:.1} dB");
     }
 
     #[test]
