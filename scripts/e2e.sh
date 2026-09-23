@@ -230,7 +230,8 @@ damage & kdp=$!; PIDS+=("$kdp")
 keyf=$(mktemp); kout=$(mktemp)
 $PROBE --instance "$NEST_SIG" keymap --secs 12 --caps Control_L >"$kout" 2>&1 &
 kwatch=$!; PIDS+=("$kwatch"); sleep 1
-GLIFF_SEND_KEYMAP_OPTIONS=ctrl:nocaps timeout 10 $PROBE --video "$CLIENT_VIDEO" serve-test --connect 127.0.0.1:9049 --frames 60 >"$keyf" 2>&1
+GLIFF_SEND_KEYMAP_OPTIONS=ctrl:nocaps timeout 10 $PROBE --video "$CLIENT_VIDEO" serve-test --connect 127.0.0.1:9049 --frames 60 >"$keyf" 2>&1 \
+    || fail "keymap client ($(tail -3 "$keyf" | tr '\n' ' '))"
 wait "$kwatch"
 kill "$kdp" "$ksp" 2>/dev/null
 grep -q "^PASS" "$kout" || fail "client keymap not served ($(tr '\n' ' ' <"$kout"); client said: $(tail -3 "$keyf" | tr '\n' ' '))"
