@@ -111,6 +111,16 @@ enum Cmd {
         #[arg(long, default_value_t = 3)]
         secs: u64,
     },
+    /// Print the keysym on Caps Lock in each keymap the compositor serves
+    /// its clients, which is the keymap of the keyboard used last
+    Keymap {
+        /// Seconds to watch.
+        #[arg(long, default_value_t = 3)]
+        secs: u64,
+        /// Pass when a keymap seen maps Caps Lock to this keysym.
+        #[arg(long)]
+        caps: Option<String>,
+    },
     /// Micro-benchmark the CPU colour/split reference the GPU shaders replace
     Bench {
         #[arg(long, default_value_t = 100)]
@@ -158,6 +168,7 @@ fn main() -> Result<()> {
         Cmd::Pipeline { output } => pipeline(&target, &node, output, video)?,
         Cmd::ServeTest { connect, frames } => serve_test(&node, &connect, frames, video)?,
         Cmd::Clipboard { set, secs } => clipboard(&target, set, secs)?,
+        Cmd::Keymap { secs, caps } => keymap(&target, secs, caps)?,
         Cmd::Bench { iters } => bench(iters)?,
         Cmd::All => {
             protocols(&target)?;
@@ -483,6 +494,12 @@ fn serve_test(node: &std::path::Path, addr: &str, frames: usize, video: VideoMod
             Ok(list) => gliff_transport::clipboard::files::list_files(&list.split(':').map(PathBuf::from).collect::<Vec<_>>())?,
             Err(_) => Default::default(),
         };
+        // GLIFF_SEND_KEYMAP_OPTIONS sends a us keymap with these xkb options
+        // after the first frames, then taps Shift so the compositor makes it
+        // the active keymap.
+        let mut send_keymap = std::env::var("GLIFF_SEND_KEYMAP_OPTIONS").ok().map(|options| {
+            hypr_input::keymap_from_names(&hypr_input::KeymapNames { layout: "us".into(), options: Some(options), ..Default::default() })
+        }).transpose()?;
         let recv_file = std::env::var("GLIFF_RECV_CLIP_FILE").ok();
         let recv_dir = std::env::var("GLIFF_RECV_CLIP_DIR").ok().map(PathBuf::from);
         let mut clip_recv: Vec<u8> = Vec::new();
@@ -532,6 +549,14 @@ fn serve_test(node: &std::path::Path, addr: &str, frames: usize, video: VideoMod
                     if out.is_some() { got += 1; }
                     if got == 1 { eprintln!("  first decoded frame ok ({}x{}, main {} aux {} bytes, key {keyframe})", w, h, data_len, aux_len); }
                     writer.write_msg(&ClientMsg::FrameAck { frame_id, decoded_at_ms: 0 }).await?;
+                    if got == 2 {
+                        if let Some(keymap) = send_keymap.take() {
+                            const KEY_LEFTSHIFT: u32 = 42;
+                            writer.write_msg(&ClientMsg::Keymap { keymap }).await?;
+                            writer.write_msg(&ClientMsg::Key { keycode: KEY_LEFTSHIFT, pressed: true }).await?;
+                            writer.write_msg(&ClientMsg::Key { keycode: KEY_LEFTSHIFT, pressed: false }).await?;
+                        }
+                    }
                     if got == 3 { writer.write_msg(&ClientMsg::Resize { width: 800, height: 600, scale: 2.0 }).await?; }
                     if got == 4 && (send_clip.is_some() || send_file.is_some() || !send_files.entries.is_empty()) {
                         let mut mime_types: Vec<String> = Vec::new();
@@ -609,6 +634,34 @@ fn serve_test(node: &std::path::Path, addr: &str, frames: usize, video: VideoMod
         }
         Ok::<(), anyhow::Error>(())
     })?;
+    Ok(())
+}
+
+fn keymap(target: &Target, secs: u64, want_caps: Option<String>) -> Result<()> {
+    const KEY_CAPSLOCK: u32 = 58;
+    let (tx, rx) = std::sync::mpsc::channel();
+    hypr_input::watch_keymap(
+        target.clone(),
+        Box::new(move |text| {
+            let _ = tx.send(text);
+        }),
+    )?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    let mut seen = Vec::new();
+    while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
+        let Ok(text) = rx.recv_timeout(left) else {
+            break;
+        };
+        let caps = hypr_input::key_name(&text, KEY_CAPSLOCK)?;
+        println!("  keymap of {} bytes: Caps Lock is {caps}", text.len());
+        seen.push(caps);
+    }
+    if let Some(want) = want_caps {
+        status(
+            seen.contains(&want),
+            &format!("Caps Lock seen as {seen:?}, want {want}"),
+        );
+    }
     Ok(())
 }
 

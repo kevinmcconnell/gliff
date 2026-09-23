@@ -14,6 +14,7 @@
 #   7. mirrored output resize
 #   8. a 1 MiB binary clipboard item in both directions (chunked)
 #   9. copied files (a directory tree) in both directions, via the spool
+#  10. a keymap sent mid-session is the one the compositor serves its clients
 #
 # Exits non-zero on the first failure.
 set -uo pipefail
@@ -221,5 +222,19 @@ cmp -s "$srcd/photos/a.bin" "$spool/photos/a.bin" && cmp -s "$srcd/photos/sub/b.
 rm -rf "$spool"
 rm -rf "$clipf" "$srcd" "$recvd"
 echo "   copied files both directions PASS"
+
+echo "== 10. client keymap reaches compositor clients =="
+"$SERVER" --listen 127.0.0.1:9049 --headless --instance "$NEST_SIG" >/tmp/gliff-e2e-server.log 2>&1 &
+ksp=$!; PIDS+=("$ksp"); sleep 2
+damage & kdp=$!; PIDS+=("$kdp")
+keyf=$(mktemp); kout=$(mktemp)
+$PROBE --instance "$NEST_SIG" keymap --secs 12 --caps Control_L >"$kout" 2>&1 &
+kwatch=$!; PIDS+=("$kwatch"); sleep 1
+GLIFF_SEND_KEYMAP_OPTIONS=ctrl:nocaps timeout 10 $PROBE --video "$CLIENT_VIDEO" serve-test --connect 127.0.0.1:9049 --frames 60 >"$keyf" 2>&1
+wait "$kwatch"
+kill "$kdp" "$ksp" 2>/dev/null
+grep -q "^PASS" "$kout" || fail "client keymap not served ($(tr '\n' ' ' <"$kout"); client said: $(tail -3 "$keyf" | tr '\n' ' '))"
+rm -f "$keyf" "$kout"
+echo "   client keymap PASS"
 
 echo "E2E PASS: all checks passed"
