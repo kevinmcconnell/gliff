@@ -1201,8 +1201,14 @@ fn pipeline(
     ));
     let rgb_psnr = psnr(&rgb_channels(&cpu), &rgb_channels(&out));
     println!("  decoded {dec_ms:.1} ms; end-to-end RGB PSNR vs CPU reference {rgb_psnr:.1} dB");
-    let ok = scaled || rgb_psnr > 35.0;
-    let tier = if gpu.is_some() { "GPU" } else { "CPU" };
+    // OpenH264 spends far fewer bits on a keyframe than the GPU encoder's
+    // rate control, so the CPU tier scores a few dB lower on the same frame.
+    let (tier, min_psnr) = if gpu.is_some() {
+        ("GPU", 35.0)
+    } else {
+        ("CPU", 32.0)
+    };
+    let ok = scaled || rgb_psnr > min_psnr;
     status(
         ok,
         &format!("Dual420 4:4:4 {tier} pipeline on a captured frame"),

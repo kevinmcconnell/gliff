@@ -39,10 +39,18 @@ SERVER=target/release/gliff-server
 
 echo "== starting nested Hyprland =="
 CONF=$(mktemp --suffix=-e2e-hypr.conf)
+# One-line blocks are silently ignored, so each option gets its own line.
+# The detailed default wallpaper gives every run the same demanding frame.
 cat > "$CONF" <<HYPR
 monitor=,1280x800,auto,1
-misc { disable_hyprland_logo = true; disable_splash_rendering = true }
-ecosystem { no_update_news = true; no_donation_nag = true }
+misc {
+    force_default_wallpaper = 2
+    disable_splash_rendering = true
+}
+ecosystem {
+    no_update_news = true
+    no_donation_nag = true
+}
 HYPR
 before=$(ls "$XDG_RUNTIME_DIR/hypr" 2>/dev/null)
 WAYLAND_DISPLAY="$WAYLAND_DISPLAY" HYPRLAND_INSTANCE_SIGNATURE= setsid Hyprland -c "$CONF" >/tmp/gliff-e2e-hypr.log 2>&1 &
