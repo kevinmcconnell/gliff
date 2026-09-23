@@ -12,8 +12,7 @@ workspace = true
 gliff-proto.workspace = true
 tokio.workspace = true
 bytes.workspace = true
-postcard.workspace = true
-serde.workspace = true
+minicbor.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 

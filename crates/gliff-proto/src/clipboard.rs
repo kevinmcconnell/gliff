@@ -19,7 +19,7 @@
 use std::collections::VecDeque;
 use std::path::{Component, Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use minicbor::{Decode, Encode};
 
 /// Largest `data_len` of one `Data` message.
 pub const CHUNK: usize = 256 * 1024;
@@ -59,23 +59,30 @@ const NON_DATA_TARGETS: &[&str] = &[
     "INSERT_SELECTION",
 ];
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub struct ClipboardFile {
     /// Path relative to the copied item, `/`-separated; a top-level item is
     /// its own name.
+    #[n(0)]
     pub path: String,
+    #[n(1)]
     pub size: u64,
+    #[n(2)]
     pub dir: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub enum ClipboardItem {
-    Mime(String),
+    #[n(0)]
+    Mime(#[n(0)] String),
     /// Index into the offer's `files`.
-    File(u32),
+    #[n(1)]
+    File(#[n(0)] u32),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// The clipboard messages both peers share. Never encoded itself: each end
+/// carries these as its own `ClientMsg`/`ServerMsg` variants.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClipboardMsg {
     /// The sender's selection changed to something it can serve. Empty lists
     /// mean the selection was cleared or holds nothing forwardable. `serial`

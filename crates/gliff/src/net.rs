@@ -12,8 +12,8 @@ use std::sync::Arc;
 use bytes::Bytes;
 use gliff_proto::clipboard::CHUNK;
 use gliff_proto::{
-    ChromaMode, ClientCaps, ClientMsg, ClipboardFile, ClipboardMsg, Codec, ServerMsg,
-    PROTOCOL_VERSION,
+    features, is_incompatible, version_mismatch, ChromaMode, ClientCaps, ClientMsg, ClipboardFile,
+    ClipboardMsg, Codec, ServerMsg, VideoPipeline, PROTOCOL_VERSION,
 };
 use gliff_sw::VideoMode;
 use gliff_transport::clipboard::progress::Progress;
@@ -89,8 +89,15 @@ pub enum Status {
         progress: Progress,
     },
     Error(String),
+    /// The two ends speak different protocol versions, so retrying cannot
+    /// help.
+    Incompatible(String),
     Closed,
 }
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct Incompatible(String);
 
 /// How to reach the server.
 #[derive(Clone)]
@@ -165,7 +172,10 @@ impl Worker {
             }
         });
         if let Err(e) = result {
-            let _ = status.send(Status::Error(e.to_string()));
+            let _ = status.send(match e.downcast::<Incompatible>() {
+                Ok(Incompatible(message)) => Status::Incompatible(message),
+                Err(e) => Status::Error(e.to_string()),
+            });
         } else {
             let _ = status.send(Status::Closed);
         }
@@ -239,6 +249,7 @@ where
         } else {
             vec![ChromaMode::Single420]
         },
+        features: features(),
     };
     let _ = tokio::time::timeout(FIRST_KEYMAP_WAIT, keymap.wait_for(|k| !k.is_empty())).await;
     let first_keymap = keymap.borrow_and_update().clone();
@@ -260,10 +271,15 @@ where
     let mut got_ack = false;
     let (mut width, mut height, mut chroma, mut scale_milli, pipeline, mut view, mut fps_cap) = loop {
         match reader.read_msg::<ServerMsg>().await? {
-            ServerMsg::HelloAck { version, .. } => {
+            ServerMsg::HelloAck {
+                version, features, ..
+            } => {
                 if version != PROTOCOL_VERSION {
-                    anyhow::bail!("server version {version} != {PROTOCOL_VERSION}");
+                    return Err(
+                        Incompatible(version_mismatch(PROTOCOL_VERSION, version).into()).into(),
+                    );
                 }
+                tracing::debug!(?features, "server features");
                 got_ack = true;
             }
             ServerMsg::Ping { t } => writer.write_msg(&ClientMsg::Pong { t }).await?,
@@ -288,7 +304,10 @@ where
                     fps_cap,
                 )
             }
-            ServerMsg::Error { code, message } => {
+            ServerMsg::Error { code, message, .. } if is_incompatible(code) => {
+                return Err(Incompatible(message).into())
+            }
+            ServerMsg::Error { code, message, .. } => {
                 anyhow::bail!("server error {code}: {message}")
             }
             other => anyhow::bail!("unexpected message before StreamConfig: {other:?}"),
@@ -296,7 +315,7 @@ where
     };
     let mut decoder = new_decoder(&gpu, chroma, width, height)?;
     let local = if gpu.is_some() { "gpu" } else { "cpu" };
-    let mut video_label = format!("{} > {}", pipeline.label(), local);
+    let mut video_label = format!("{} > {}", pipeline.map_or("?", VideoPipeline::label), local);
     let _ = status.send(Status::Connected {
         video: video_label.clone(),
         view_width: view.0,
@@ -552,7 +571,7 @@ where
                 }
                 (width, height, chroma, scale_milli) = (w, h, c, s);
                 (view, fps_cap) = ((view_width, view_height), f);
-                video_label = format!("{} > {}", pipeline.label(), local);
+                video_label = format!("{} > {}", pipeline.map_or("?", VideoPipeline::label), local);
                 let _ = status.send(Status::Connected {
                     video: video_label.clone(),
                     view_width,
@@ -581,7 +600,12 @@ where
                 let _ = out_tx.send((ClientMsg::Pong { t }, Bytes::new()));
             }
             ServerMsg::CursorPos { .. } | ServerMsg::Pong { .. } => {}
-            ServerMsg::Error { code, message } => anyhow::bail!("server error {code}: {message}"),
+            ServerMsg::Error { code, message, .. } if is_incompatible(code) => {
+                return Err(Incompatible(message).into())
+            }
+            ServerMsg::Error { code, message, .. } => {
+                anyhow::bail!("server error {code}: {message}")
+            }
             ServerMsg::HelloAck { .. } => {}
             other => {
                 if let Ok(clip) = other.into_clipboard() {

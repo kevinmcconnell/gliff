@@ -4,6 +4,7 @@
 //!
 //! No I/O here. `gliff-transport` moves bytes; this crate defines their shape.
 
+pub mod cbor;
 pub mod chroma;
 pub mod clipboard;
 pub mod color;

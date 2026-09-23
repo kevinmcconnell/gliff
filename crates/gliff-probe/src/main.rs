@@ -509,7 +509,7 @@ fn serve_test(node: &std::path::Path, addr: &str, frames: usize, video: VideoMod
         let (rd, wr) = tokio::io::split(stream);
         let mut reader = Framed::new(rd);
         let mut writer = Framed::new(wr);
-        let caps = ClientCaps { codecs: vec![Codec::H264], max_width: 1280, max_height: 720, chroma: vec![ChromaMode::Dual420, ChromaMode::Single420] };
+        let caps = ClientCaps { codecs: vec![Codec::H264], max_width: 1280, max_height: 720, chroma: vec![ChromaMode::Dual420, ChromaMode::Single420], features: gliff_proto::features() };
         writer.write_msg(&ClientMsg::Hello { version: gliff_proto::PROTOCOL_VERSION, keymap: String::new(), caps }).await?;
         let ack = reader.read_msg::<ServerMsg>().await?;
         let ServerMsg::HelloAck { session, outputs, .. } = ack else { bail!("expected HelloAck, got {ack:?}") };
@@ -783,7 +783,7 @@ fn stream_bench(
         let (rd, wr) = tokio::io::split(stream);
         let mut reader = Framed::new(rd);
         let mut writer = Framed::new(wr);
-        let caps = ClientCaps { codecs: vec![Codec::H264], max_width: 3840, max_height: 2160, chroma: vec![ChromaMode::Dual420, ChromaMode::Single420] };
+        let caps = ClientCaps { codecs: vec![Codec::H264], max_width: 3840, max_height: 2160, chroma: vec![ChromaMode::Dual420, ChromaMode::Single420], features: gliff_proto::features() };
         writer.write_msg(&ClientMsg::Hello { version: gliff_proto::PROTOCOL_VERSION, keymap: String::new(), caps }).await?;
         let ack = reader.read_msg::<ServerMsg>().await?;
         let ServerMsg::HelloAck { session, .. } = ack else { bail!("expected HelloAck, got {ack:?}") };
@@ -810,8 +810,8 @@ fn stream_bench(
         let mut csv_out = match csv { Some(p) => Some(std::io::BufWriter::new(std::fs::File::create(p)?)), None => None };
         if let Some(c) = csv_out.as_mut() { writeln!(c, "t_ms,frame_id,key,bytes,latency_ms,decode_ms")?; }
 
-        // Reads happen on their own task: `read_msg` is not cancel-safe in
-        // a `select!`, and pings must go out while no frames arrive.
+        // Reads happen on their own task, so pings go out while no frames
+        // arrive.
         let (msg_tx, mut msg_rx) = tokio::sync::mpsc::unbounded_channel();
         tokio::task::spawn_local(async move {
             loop {
