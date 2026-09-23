@@ -27,7 +27,7 @@ use gliff_proto::{ClientMsg, ClipboardFile, ClipboardItem, ClipboardMsg};
 use gliff_transport::clipboard::files::{
     fetch_files, open_source, retire, write_body, LocalFiles, Spool,
 };
-use gliff_transport::clipboard::progress::{describe_files, Jobs};
+use gliff_transport::clipboard::progress::{describe_files, describe_mime, Jobs};
 use gliff_transport::clipboard::{Event, TransferError, Transfers};
 
 use crate::net::Status;
@@ -193,18 +193,19 @@ impl Bridge {
     ) {
         let transfers = self.transfers.clone();
         if !is_file_mime(&mime_type) {
-            self.jobs.run(mime_type.clone(), None, |meter| async move {
-                let r = transfers
-                    .fetch(
-                        ClipboardItem::Mime(mime_type),
-                        serial,
-                        meter.wrap(sink),
-                        Some(MAX_ITEM),
-                    )
-                    .await;
-                let _ = result.send(r.as_ref().map(|_| ()).map_err(|e| e.to_string()));
-                r.map(|_| ())
-            });
+            self.jobs
+                .run(describe_mime(&mime_type), None, |meter| async move {
+                    let r = transfers
+                        .fetch(
+                            ClipboardItem::Mime(mime_type),
+                            serial,
+                            meter.wrap(sink),
+                            Some(MAX_ITEM),
+                        )
+                        .await;
+                    let _ = result.send(r.as_ref().map(|_| ()).map_err(|e| e.to_string()));
+                    r.map(|_| ())
+                });
             return;
         }
         let (files, spooled, spool) = {

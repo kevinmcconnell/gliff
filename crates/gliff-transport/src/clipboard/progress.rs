@@ -12,7 +12,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use gliff_proto::clipboard::top_level;
+use gliff_proto::clipboard::{is_text_mime, top_level};
 use gliff_proto::ClipboardFile;
 use tokio::task::AbortHandle;
 
@@ -25,7 +25,7 @@ pub const CADENCE: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Progress {
-    /// What is being pasted: a mime type or a file summary.
+    /// What is being pasted: the kind of item or a file summary.
     pub label: String,
     pub done: u64,
     pub total: Option<u64>,
@@ -237,6 +237,35 @@ pub fn describe_files(files: &[ClipboardFile]) -> (String, Option<u64>) {
     (label, Some(total))
 }
 
+/// The label of a job that pastes one clipboard item: what the user would
+/// call it, not its mime type, when there is a common name for it.
+pub fn describe_mime(mime: &str) -> String {
+    if is_text_mime(mime) {
+        return "text".into();
+    }
+    let base = mime
+        .split(';')
+        .next()
+        .unwrap_or(mime)
+        .trim()
+        .to_ascii_lowercase();
+    let Some((kind, sub)) = base.split_once('/') else {
+        return mime.into();
+    };
+    let format = sub.split('+').next().unwrap_or(sub);
+    match (kind, sub) {
+        (_, "") => mime.into(),
+        ("text", "html") => "formatted text".into(),
+        ("text", _) => "text".into(),
+        ("image" | "audio" | "video", _) if !format.is_empty() => {
+            format!("{} {kind}", format.to_uppercase())
+        }
+        ("application", "octet-stream") => "binary data".into(),
+        ("application", "pdf") => "PDF".into(),
+        _ => mime.into(),
+    }
+}
+
 /// Bytes as a short human figure: `1.5 MiB`.
 pub fn human_bytes(n: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
@@ -387,6 +416,23 @@ mod tests {
         assert_eq!(describe_files(&one), ("photos".into(), Some(5)));
         let two = [f("a", 1, false), f("b", 2, false)];
         assert_eq!(describe_files(&two), ("2 items".into(), Some(3)));
+    }
+
+    #[test]
+    fn an_item_is_named_by_its_kind() {
+        assert_eq!(describe_mime("text/plain;charset=utf-8"), "text");
+        assert_eq!(describe_mime("UTF8_STRING"), "text");
+        assert_eq!(describe_mime("text/html"), "formatted text");
+        assert_eq!(describe_mime("image/png"), "PNG image");
+        assert_eq!(describe_mime("image/svg+xml"), "SVG image");
+        assert_eq!(describe_mime("video/mp4"), "MP4 video");
+        assert_eq!(describe_mime("application/octet-stream"), "binary data");
+        assert_eq!(describe_mime("application/pdf"), "PDF");
+        assert_eq!(describe_mime("application/x-foo"), "application/x-foo");
+        assert_eq!(describe_mime("IMAGE/PNG"), "PNG image");
+        assert_eq!(describe_mime("Text/HTML"), "formatted text");
+        assert_eq!(describe_mime("text/"), "text/");
+        assert_eq!(describe_mime("image/+xml"), "image/+xml");
     }
 
     #[test]

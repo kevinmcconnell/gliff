@@ -373,7 +373,7 @@ impl TransferBars {
         column.append(&text);
         column.append(&bar);
         let button = gtk::Button::builder()
-            .icon_name("process-stop-symbolic")
+            .icon_name("window-close-symbolic")
             .tooltip_text("Cancel")
             .valign(gtk::Align::Center)
             .build();

@@ -29,7 +29,7 @@ use gliff_proto::{ClipboardFile, ClipboardItem, ClipboardMsg};
 use gliff_transport::clipboard::files::{
     fetch_files, list_files, open_source, retire, write_body, LocalFiles, Spool,
 };
-use gliff_transport::clipboard::progress::{describe_files, Jobs};
+use gliff_transport::clipboard::progress::{describe_files, describe_mime, Jobs};
 use gliff_transport::clipboard::{Event, ReadSource, Transfers, WriteSink};
 use hypr_input::{Clipboard, ClipboardEvent};
 
@@ -256,17 +256,18 @@ impl Bridge {
             });
         } else {
             let serial = self.remote.borrow().serial;
-            self.jobs.run(mime_type.clone(), None, |meter| async move {
-                transfers
-                    .fetch(
-                        ClipboardItem::Mime(mime_type),
-                        serial,
-                        meter.wrap(WriteSink(target)),
-                        Some(MAX_ITEM),
-                    )
-                    .await
-                    .map(|_| ())
-            });
+            self.jobs
+                .run(describe_mime(&mime_type), None, |meter| async move {
+                    transfers
+                        .fetch(
+                            ClipboardItem::Mime(mime_type),
+                            serial,
+                            meter.wrap(WriteSink(target)),
+                            Some(MAX_ITEM),
+                        )
+                        .await
+                        .map(|_| ())
+                });
         }
     }
 }
