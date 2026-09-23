@@ -84,18 +84,58 @@ impl KeyState {
         };
         self.state
             .update_key(xkb::Keycode::new(evdev_code.saturating_add(8)), dir);
-        let mods = (
-            self.state.serialize_mods(xkb::STATE_MODS_DEPRESSED),
-            self.state.serialize_mods(xkb::STATE_MODS_LATCHED),
-            self.state.serialize_mods(xkb::STATE_MODS_LOCKED),
-            self.state.serialize_layout(xkb::STATE_LAYOUT_EFFECTIVE),
-        );
+        let mods = self.mods();
         if mods != self.last_mods {
             self.last_mods = mods;
             Some(mods)
         } else {
             None
         }
+    }
+
+    /// Take over the state of `old`, a different keymap: its locked
+    /// modifiers (matched by name) and locked layout, then the keys still
+    /// `held`. Returns the resulting `(depressed, latched, locked, group)`.
+    pub fn carry_over(
+        &mut self,
+        old: &KeyState,
+        held: impl IntoIterator<Item = u32>,
+    ) -> (u32, u32, u32, u32) {
+        let old_locked = old.state.serialize_mods(xkb::STATE_MODS_LOCKED);
+        let mut locked = 0;
+        for i in 0..old.keymap.num_mods() {
+            if old_locked & (1 << i) == 0 {
+                continue;
+            }
+            let index = self.keymap.mod_get_index(old.keymap.mod_get_name(i));
+            if index != xkb::MOD_INVALID {
+                locked |= 1 << index;
+            }
+        }
+        let layout = old.state.serialize_layout(xkb::STATE_LAYOUT_LOCKED);
+        let layout = if layout < self.keymap.num_layouts() {
+            layout
+        } else {
+            0
+        };
+        self.state.update_mask(0, 0, locked, 0, 0, layout);
+        for code in held {
+            self.state.update_key(
+                xkb::Keycode::new(code.saturating_add(8)),
+                xkb::KeyDirection::Down,
+            );
+        }
+        self.last_mods = self.mods();
+        self.last_mods
+    }
+
+    fn mods(&self) -> (u32, u32, u32, u32) {
+        (
+            self.state.serialize_mods(xkb::STATE_MODS_DEPRESSED),
+            self.state.serialize_mods(xkb::STATE_MODS_LATCHED),
+            self.state.serialize_mods(xkb::STATE_MODS_LOCKED),
+            self.state.serialize_layout(xkb::STATE_LAYOUT_EFFECTIVE),
+        )
     }
 
     pub fn reset(&mut self) {
@@ -151,5 +191,28 @@ mod tests {
             .expect("caps press changes mods");
         assert_eq!(mods.0, control);
         assert_eq!(mods.2, 0);
+    }
+
+    #[test]
+    fn carry_over_keeps_locks_and_held_keys() {
+        const KEY_CAPSLOCK: u32 = 58;
+        const KEY_LEFTCTRL: u32 = 29;
+        let mut old = KeyState::default_us().unwrap();
+        old.update(KEY_CAPSLOCK, true);
+        old.update(KEY_CAPSLOCK, false);
+        old.update(KEY_LEFTCTRL, true);
+        let text = keymap_from_names(&KeymapNames {
+            layout: "us,de".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut new = KeyState::from_text(&text).unwrap();
+        let (depressed, _, locked, _) = new.carry_over(&old, [KEY_LEFTCTRL]);
+        let lock = 1 << new.keymap.mod_get_index(xkb::MOD_NAME_CAPS);
+        let control = 1 << new.keymap.mod_get_index(xkb::MOD_NAME_CTRL);
+        assert_eq!(locked, lock);
+        assert_eq!(depressed, control);
+        let mods = new.update(KEY_LEFTCTRL, false).expect("ctrl release");
+        assert_eq!((mods.0, mods.2), (0, lock));
     }
 }

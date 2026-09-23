@@ -299,39 +299,40 @@ where
     // Forward UI input into the same write channel; clipboard commands from
     // the UI go to the bridge. The UI closes its end when it switches to
     // another machine; `ui_gone` then ends this session and, with it, the
-    // ssh child.
+    // ssh child. Keymap changes share the task and go first, so a key from
+    // a newly used keyboard never reaches the server ahead of its keymap.
     let (ui_gone_tx, mut ui_gone) = tokio::sync::oneshot::channel::<()>();
     {
         let out_tx = out_tx.clone();
         let clipboard = clipboard.clone();
         tokio::task::spawn_local(async move {
-            while let Some(cmd) = input.recv().await {
-                match cmd {
-                    ToWorker::Send(m) => {
-                        if out_tx.send((m, Bytes::new())).is_err() {
-                            return;
+            let mut follow_keymap = true;
+            loop {
+                let msg = tokio::select! {
+                    biased;
+                    changed = keymap.changed(), if follow_keymap => {
+                        if changed.is_err() {
+                            follow_keymap = false;
+                            continue;
                         }
+                        let text = keymap.borrow_and_update().clone();
+                        tracing::debug!(bytes = text.len(), "sending changed keymap");
+                        ClientMsg::Keymap { keymap: text }
                     }
-                    other => clipboard.on_ui(other),
-                }
-            }
-            let _ = ui_gone_tx.send(());
-        });
-    }
-
-    {
-        let out_tx = out_tx.clone();
-        tokio::task::spawn_local(async move {
-            while keymap.changed().await.is_ok() {
-                let text = keymap.borrow_and_update().clone();
-                tracing::debug!(bytes = text.len(), "sending changed keymap");
-                if out_tx
-                    .send((ClientMsg::Keymap { keymap: text }, Bytes::new()))
-                    .is_err()
-                {
+                    cmd = input.recv() => match cmd {
+                        Some(ToWorker::Send(m)) => m,
+                        Some(other) => {
+                            clipboard.on_ui(other);
+                            continue;
+                        }
+                        None => break,
+                    },
+                };
+                if out_tx.send((msg, Bytes::new())).is_err() {
                     return;
                 }
             }
+            let _ = ui_gone_tx.send(());
         });
     }
 
