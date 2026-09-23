@@ -127,6 +127,8 @@ pub(crate) struct Session {
 impl Session {
     pub(crate) fn new(gpu: &Arc<Gpu>, info: &vk::VideoSessionCreateInfoKHR) -> Result<Self> {
         // SAFETY: valid create info; every returned requirement is bound.
+        // The session owns its handle and memory as soon as they exist, so
+        // a later failure frees them on drop.
         unsafe {
             let mut handle = vk::VideoSessionKHR::null();
             (gpu.video.fp().create_video_session_khr)(
@@ -136,6 +138,11 @@ impl Session {
                 &mut handle,
             )
             .result()?;
+            let mut session = Self {
+                gpu: gpu.clone(),
+                handle,
+                memory: Vec::new(),
+            };
             let mut count = 0u32;
             (gpu.video.fp().get_video_session_memory_requirements_khr)(
                 gpu.device.handle(),
@@ -152,7 +159,6 @@ impl Session {
                 reqs.as_mut_ptr(),
             )
             .result()?;
-            let mut memory = Vec::new();
             let mut binds = Vec::new();
             for r in &reqs {
                 let mem = gpu.allocate(
@@ -160,7 +166,7 @@ impl Session {
                     vk::MemoryPropertyFlags::empty(),
                     None,
                 )?;
-                memory.push(mem);
+                session.memory.push(mem);
                 binds.push(
                     vk::BindVideoSessionMemoryInfoKHR::default()
                         .memory_bind_index(r.memory_bind_index)
@@ -176,11 +182,7 @@ impl Session {
                 binds.as_ptr(),
             )
             .result()?;
-            Ok(Self {
-                gpu: gpu.clone(),
-                handle,
-                memory,
-            })
+            Ok(session)
         }
     }
 }

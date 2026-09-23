@@ -93,17 +93,6 @@ where
             .await?;
         anyhow::bail!("client advertises no chroma mode this server speaks");
     }
-    // The CPU tier defaults to one 4:2:0 stream: dual-stream 4:4:4 doubles
-    // the encode work, which the CPU pays for where the GPU does not. A
-    // preference only applies when the client advertises the mode.
-    let prefer_single = cfg.low_bandwidth || (matches!(video, VideoTier::Cpu) && !cfg.full_chroma);
-    let chroma = if !caps.chroma.contains(&ChromaMode::Dual420)
-        || (prefer_single && caps.chroma.contains(&ChromaMode::Single420))
-    {
-        ChromaMode::Single420
-    } else {
-        ChromaMode::Dual420
-    };
     let codec = Codec::H264;
     writer
         .write_msg(&ServerMsg::HelloAck {
@@ -120,17 +109,26 @@ where
             }],
         })
         .await?;
-    let encoder_max = video.encoder_max().context("query encoder limits")?;
-    let stream = EncoderSettings::fit_extent(output.width, output.height, encoder_max);
-    if stream != (output.width, output.height) {
-        tracing::info!(
-            width = stream.0,
-            height = stream.1,
-            "scaling the stream to the encoder maximum"
-        );
-    }
     let ladder = Ladder::new(START_LEVEL);
     let start_fps = ladder.level().fps_cap.min(MAX_FPS);
+    let fps_cmd = start_fps;
+    let on_gpu = matches!(video, VideoTier::Gpu(_));
+    let VideoStart {
+        video,
+        chroma,
+        stream,
+        encoder_max,
+        ctl,
+        settings,
+        encoder,
+    } = match VideoStart::open(video, &cfg, &caps, &output, fps_cmd) {
+        Ok(start) => start,
+        Err(e) if on_gpu => {
+            tracing::warn!(error = %format!("{e:#}"), "cannot start the GPU video pipeline; falling back to the CPU pipeline");
+            VideoStart::open(VideoTier::Cpu, &cfg, &caps, &output, fps_cmd)?
+        }
+        Err(e) => return Err(e),
+    };
     // Pipelined behind HelloAck, never waited on: the Pong seeds the
     // round-trip estimate, usually before the first frame ack arrives.
     writer.write_msg(&ServerMsg::Ping { t: now_ms() }).await?;
@@ -185,24 +183,6 @@ where
         jobs,
         compositor_clipboard,
     );
-
-    let streams = if chroma == ChromaMode::Dual420 { 2 } else { 1 };
-    let ctl = RateController::new(
-        stream.0 as u64 * stream.1 as u64,
-        streams,
-        MAX_FPS,
-        cfg.bitrate,
-    );
-    let fps_cmd = start_fps;
-    let settings = encoder_settings(
-        stream.0,
-        stream.1,
-        ctl.stream_bitrate(),
-        fps_cmd,
-        ctl.vbv_ms(fps_cmd),
-    );
-    let encoder = VideoEncoder::new(&video, &settings, chroma == ChromaMode::Dual420)
-        .context("create encoder")?;
 
     let mut msg_rx = spawn_reader(reader);
     let (writer, mut write_reports) = Writer::spawn(writer);
@@ -1108,7 +1088,8 @@ enum VideoTier {
 
 impl VideoTier {
     /// Open the requested tier. In `Gpu` mode a machine without a usable
-    /// Vulkan Video encoder falls back to the CPU instead of failing.
+    /// Vulkan Video encoder falls back to the CPU instead of failing; a GPU
+    /// whose encoder cannot then be created falls back in `VideoStart`.
     fn open(mode: VideoMode, render_node: &std::path::Path) -> Self {
         if mode == VideoMode::Cpu {
             tracing::info!("using the CPU video pipeline as requested");
@@ -1142,6 +1123,76 @@ impl VideoTier {
             Self::Gpu(_) => VideoPipeline::Gpu,
             Self::Cpu => VideoPipeline::Cpu,
         }
+    }
+}
+
+/// The tier-dependent choices a session starts with, settled by creating
+/// the encoder they describe.
+struct VideoStart {
+    video: VideoTier,
+    chroma: ChromaMode,
+    stream: (u32, u32),
+    encoder_max: (u32, u32),
+    ctl: RateController,
+    settings: EncoderSettings,
+    encoder: VideoEncoder,
+}
+
+impl VideoStart {
+    fn open(
+        video: VideoTier,
+        cfg: &Config,
+        caps: &ClientCaps,
+        output: &SessionOutput,
+        fps: u32,
+    ) -> Result<Self> {
+        // The CPU tier defaults to one 4:2:0 stream: dual-stream 4:4:4
+        // doubles the encode work, which the CPU pays for where the GPU
+        // does not. A preference only applies when the client advertises
+        // the mode.
+        let prefer_single =
+            cfg.low_bandwidth || (matches!(video, VideoTier::Cpu) && !cfg.full_chroma);
+        let chroma = if !caps.chroma.contains(&ChromaMode::Dual420)
+            || (prefer_single && caps.chroma.contains(&ChromaMode::Single420))
+        {
+            ChromaMode::Single420
+        } else {
+            ChromaMode::Dual420
+        };
+        let encoder_max = video.encoder_max().context("query encoder limits")?;
+        let stream = EncoderSettings::fit_extent(output.width, output.height, encoder_max);
+        if stream != (output.width, output.height) {
+            tracing::info!(
+                width = stream.0,
+                height = stream.1,
+                "scaling the stream to the encoder maximum"
+            );
+        }
+        let streams = if chroma == ChromaMode::Dual420 { 2 } else { 1 };
+        let ctl = RateController::new(
+            stream.0 as u64 * stream.1 as u64,
+            streams,
+            MAX_FPS,
+            cfg.bitrate,
+        );
+        let settings = encoder_settings(
+            stream.0,
+            stream.1,
+            ctl.stream_bitrate(),
+            fps,
+            ctl.vbv_ms(fps),
+        );
+        let encoder = VideoEncoder::new(&video, &settings, chroma == ChromaMode::Dual420)
+            .context("create encoder")?;
+        Ok(Self {
+            video,
+            chroma,
+            stream,
+            encoder_max,
+            ctl,
+            settings,
+            encoder,
+        })
     }
 }
 

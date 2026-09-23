@@ -2,10 +2,11 @@
 
 gliff targets Vulkan Video on both ends, with a CPU fallback (OpenH264 in
 `gliff-sw`) for machines without it: in the default `--video gpu` mode a
-failed device open or a missing encode/decode queue drops to the CPU tier
-with a log line, and `--video cpu` / `GLIFF_VIDEO=cpu` forces it. Driver
-behaviour differs, so this file records what we have found and where more
-testing is needed. Findings so far come from **two** machines:
+failed device open, a missing encode/decode queue, or a failure to create
+the encoder drops to the CPU tier with a log line, and `--video cpu` /
+`GLIFF_VIDEO=cpu` forces it. Driver behaviour differs, so this file
+records what we have found and where more testing is needed. Findings so
+far come from **two** machines:
 
 - GPU: AMD Granite Ridge iGPU (Ryzen 9 9955HX), VCN 4 class.
   Driver: Mesa RADV 26.2 (Vulkan 1.4), kernel 7.2.

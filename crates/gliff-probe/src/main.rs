@@ -225,7 +225,12 @@ fn main() -> Result<()> {
                 }
             };
             if gpu_ok && video == VideoMode::Gpu {
-                roundtrip(&node, 640, 360, 10, true, None, false, VideoMode::Gpu)?;
+                if let Err(e) = roundtrip(&node, 640, 360, 10, true, None, false, VideoMode::Gpu) {
+                    status(
+                        false,
+                        &format!("GPU round trip failed ({e:#}); the CPU pipeline will be used"),
+                    );
+                }
             }
             roundtrip(&node, 640, 360, 10, true, None, false, VideoMode::Cpu)?;
         }
