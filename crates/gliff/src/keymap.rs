@@ -1,51 +1,27 @@
-//! Build the local xkb keymap to ship to the server, so every key maps the
-//! same on both ends. RMLVO names come from the local Hyprland; on any failure
-//! we fall back to a plain us layout and let the server default.
+//! The local keymap to ship to the server, so every key maps the same on
+//! both ends. It follows the compositor: a change of keyboard or layout
+//! mid-session is sent on.
 
-use hypr_input::{keymap_from_names, KeymapNames};
+use std::time::Duration;
 
-/// Full xkb keymap text (format v1) for the local layout, or empty to let the
-/// server use its own default.
-pub fn local_keymap() -> String {
-    match build() {
-        Ok(text) => text,
-        Err(e) => {
-            tracing::warn!(error = %e, "could not read local keymap; server will default to us");
-            String::new()
-        }
+use tokio::sync::watch;
+
+/// The current local keymap (xkb text, format v1); empty until the first
+/// one arrives, or for good when the compositor cannot be reached.
+pub type Keymap = watch::Receiver<String>;
+
+/// How long a new session waits for the first keymap before it lets the
+/// server fall back to its default.
+pub const FIRST_KEYMAP_WAIT: Duration = Duration::from_secs(1);
+
+pub fn watch() -> Keymap {
+    let (tx, rx) = watch::channel(String::new());
+    let sink = Box::new(move |text: String| {
+        tracing::debug!(bytes = text.len(), "local keymap changed");
+        tx.send_replace(text);
+    });
+    if let Err(e) = hypr_input::watch_keymap(hypr_input::Target::default(), sink) {
+        tracing::warn!(error = %e, "cannot follow the local keymap; server will default to us");
     }
-}
-
-fn build() -> anyhow::Result<String> {
-    let inst = hypr_ipc::Instance::discover(None)?;
-    // Hyprland reports an unset string option as the literal "[[EMPTY]]".
-    let opt = |name: &str| {
-        inst.get_option(name)
-            .ok()
-            .and_then(|o| o.string)
-            .filter(|v| v != "[[EMPTY]]")
-            .unwrap_or_default()
-    };
-    let names = KeymapNames {
-        rules: String::new(),
-        model: opt("input:kb_model"),
-        layout: {
-            let l = opt("input:kb_layout");
-            if l.is_empty() {
-                "us".to_string()
-            } else {
-                l
-            }
-        },
-        variant: opt("input:kb_variant"),
-        options: {
-            let o = opt("input:kb_options");
-            if o.is_empty() {
-                None
-            } else {
-                Some(o)
-            }
-        },
-    };
-    Ok(keymap_from_names(&names)?)
+    rx
 }

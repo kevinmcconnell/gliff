@@ -24,6 +24,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{self, unbounded_channel, UnboundedReceiver};
 
 use crate::clipboard::{Bridge, ToWorker};
+use crate::keymap::{Keymap, FIRST_KEYMAP_WAIT};
 
 /// Status/telemetry the worker reports to the UI.
 pub enum Status {
@@ -94,6 +95,7 @@ pub struct Worker {
     pub frames: SyncSender<Frame>,
     pub status: StdSender<Status>,
     pub input: UnboundedReceiver<ToWorker>,
+    pub keymap: Keymap,
 }
 
 impl Worker {
@@ -117,7 +119,16 @@ impl Worker {
                     let stream = tokio::net::TcpStream::connect(addr).await?;
                     stream.set_nodelay(true)?;
                     let (rd, wr) = tokio::io::split(stream);
-                    session(rd, wr, self.video, self.frames, self.status, self.input).await
+                    session(
+                        rd,
+                        wr,
+                        self.video,
+                        self.frames,
+                        self.status,
+                        self.input,
+                        self.keymap,
+                    )
+                    .await
                 }
                 Endpoint::Ssh(ref target) => {
                     let ssh = spawn_ssh(target)?;
@@ -128,6 +139,7 @@ impl Worker {
                         self.frames,
                         self.status,
                         self.input,
+                        self.keymap,
                     )
                     .await
                 }
@@ -187,6 +199,7 @@ async fn session<R, W>(
     frames: SyncSender<Frame>,
     status: StdSender<Status>,
     mut input: UnboundedReceiver<ToWorker>,
+    mut keymap: Keymap,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin + 'static,
@@ -208,11 +221,16 @@ where
             vec![ChromaMode::Single420]
         },
     };
-    let keymap = crate::keymap::local_keymap();
+    let _ = tokio::time::timeout(FIRST_KEYMAP_WAIT, keymap.wait_for(|k| !k.is_empty())).await;
+    let first_keymap = keymap.borrow_and_update().clone();
+    if first_keymap.is_empty() {
+        tracing::warn!("no local keymap yet; server will default to us");
+    }
+    tracing::debug!(bytes = first_keymap.len(), "sending keymap");
     writer
         .write_msg(&ClientMsg::Hello {
             version: PROTOCOL_VERSION,
-            keymap,
+            keymap: first_keymap,
             caps,
         })
         .await?;
@@ -298,6 +316,22 @@ where
                 }
             }
             let _ = ui_gone_tx.send(());
+        });
+    }
+
+    {
+        let out_tx = out_tx.clone();
+        tokio::task::spawn_local(async move {
+            while keymap.changed().await.is_ok() {
+                let text = keymap.borrow_and_update().clone();
+                tracing::debug!(bytes = text.len(), "sending changed keymap");
+                if out_tx
+                    .send((ClientMsg::Keymap { keymap: text }, Bytes::new()))
+                    .is_err()
+                {
+                    return;
+                }
+            }
         });
     }
 

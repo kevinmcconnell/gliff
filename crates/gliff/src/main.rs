@@ -117,6 +117,7 @@ struct App {
     remembered: Cell<bool>,
     config_path: PathBuf,
     cli: Cli,
+    keymap: keymap::Keymap,
 }
 
 fn main() -> glib::ExitCode {
@@ -279,6 +280,7 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         remembered: Cell::new(false),
         config_path: Config::default_path(),
         cli: cli.clone(),
+        keymap: keymap::watch(),
     });
 
     let hotkey = ReleaseHotkey::parse(&cli.release_hotkey).unwrap_or_else(|e| {
@@ -524,6 +526,7 @@ fn start_session(ui: Rc<App>, endpoint: Endpoint) {
     ui.status.set_text("Connecting…");
 
     let video = gliff_sw::VideoMode::resolve(ui.cli.video.as_deref());
+    let keymap = ui.keymap.clone();
     std::thread::Builder::new()
         .name("gliff-net".into())
         .spawn(move || {
@@ -533,6 +536,7 @@ fn start_session(ui: Rc<App>, endpoint: Endpoint) {
                 frames: frame_tx,
                 status: status_tx,
                 input: input_rx,
+                keymap,
             }
             .run();
         })

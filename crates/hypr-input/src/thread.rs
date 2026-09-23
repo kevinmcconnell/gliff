@@ -239,11 +239,18 @@ impl LoopState for State {
             }
             InputCmd::SetKeymap(text) => match KeyState::from_text(&text) {
                 Ok(ks) => {
-                    self.release_all();
                     self.keys = ks;
                     if let Err(e) = self.upload_keymap() {
                         self.emit(InputEvent::Error(e.to_string()));
                     }
+                    let mut mods = (0, 0, 0, 0);
+                    for &code in &self.pressed_keys {
+                        if let Some(m) = self.keys.update(code, true) {
+                            mods = m;
+                        }
+                    }
+                    let (dep, lat, lock, group) = mods;
+                    self.keyboard.modifiers(dep, lat, lock, group);
                 }
                 Err(e) => self.emit(InputEvent::Error(e.to_string())),
             },
