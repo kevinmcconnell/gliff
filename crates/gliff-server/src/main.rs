@@ -4,6 +4,7 @@
 
 mod clipboard;
 mod notify;
+mod rate;
 mod session;
 mod writer;
 

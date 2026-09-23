@@ -21,9 +21,14 @@ pub struct EncoderSettings {
     /// Target bitrate in bits per second (CBR).
     pub bitrate: u32,
     pub framerate: u32,
+    /// Rate control buffer: how far one frame may overshoot the average.
+    /// Small on a slow link so a keyframe cannot stall it.
+    pub vbv_ms: u32,
 }
 
 impl EncoderSettings {
+    pub const DEFAULT_VBV_MS: u32 = 500;
+
     /// A rough default bitrate for a desktop stream at this size and rate.
     pub fn default_bitrate(width: u32, height: u32, framerate: u32) -> u32 {
         // ~0.1 bits per pixel per frame keeps text crisp on a LAN.
@@ -264,8 +269,9 @@ pub struct H264Encoder {
     idr_pic_id: u16,
     poc: i32,
     started: bool,
-    /// A bitrate change to apply with the next frame's rate-control update.
-    pending_bitrate: Option<u32>,
+    /// A bitrate and frame rate to apply with the next frame's rate-control
+    /// update.
+    pending_rate: Option<(u32, u32, u32)>,
 }
 
 /// The encoder capabilities gliff reads, flattened out of the Vulkan chain.
@@ -404,7 +410,7 @@ impl H264Encoder {
                 idr_pic_id: 0,
                 poc: 0,
                 started: false,
-                pending_bitrate: None,
+                pending_rate: None,
             };
             enc.sps = enc.encoded_parameters(true, false)?;
             enc.pps = enc.encoded_parameters(false, true)?;
@@ -424,8 +430,18 @@ impl H264Encoder {
     /// Change the CBR target from the next frame on, without resetting the
     /// session (no keyframe is forced).
     pub fn set_bitrate(&mut self, bitrate: u32) {
-        if bitrate != self.settings.bitrate {
-            self.pending_bitrate = Some(bitrate);
+        self.set_rate(bitrate, self.settings.framerate, self.settings.vbv_ms);
+    }
+
+    /// Change the CBR target and the frame rate it is spread over, from the
+    /// next frame on. The frame rate is the pace frames are actually
+    /// produced at, so the per-frame budget matches the bandwidth.
+    pub fn set_rate(&mut self, bitrate: u32, framerate: u32, vbv_ms: u32) {
+        if bitrate != self.settings.bitrate
+            || framerate != self.settings.framerate
+            || vbv_ms != self.settings.vbv_ms
+        {
+            self.pending_rate = Some((bitrate, framerate.max(1), vbv_ms.max(20)));
         }
     }
 
@@ -502,7 +518,7 @@ impl H264Encoder {
         wait: Option<u64>,
         force_keyframe: bool,
     ) -> Result<PendingEncode> {
-        let bitrate_change = self.pending_bitrate.take();
+        let rate_change = self.pending_rate.take();
         let idr = force_keyframe || !self.started || self.current_ref.is_none();
         if idr {
             self.frame_num = 0;
@@ -688,8 +704,10 @@ impl H264Encoder {
             }
 
             let mut next_settings = self.settings.clone();
-            if let Some(b) = bitrate_change {
+            if let Some((b, f, v)) = rate_change {
                 next_settings.bitrate = b;
+                next_settings.framerate = f;
+                next_settings.vbv_ms = v;
             }
             let settings = &next_settings;
             let started = self.started;
@@ -709,7 +727,7 @@ impl H264Encoder {
                         (video.cmd_begin_video_coding_khr)(cmd, &begin);
                         if !started {
                             record_rate_control(cmd, video, settings, true);
-                        } else if bitrate_change.is_some() {
+                        } else if rate_change.is_some() {
                             record_rate_control(cmd, video, settings, false);
                         }
                         dev.cmd_begin_query(cmd, query_pool, 0, vk::QueryControlFlags::empty());
@@ -725,9 +743,16 @@ impl H264Encoder {
             Ok::<(), Error>(())
         })?;
 
-        if let Some(b) = bitrate_change {
-            tracing::info!(bitrate = b, "encoder bitrate changed");
+        if let Some((b, f, v)) = rate_change {
+            tracing::info!(
+                bitrate = b,
+                framerate = f,
+                vbv_ms = v,
+                "encoder rate changed"
+            );
             self.settings.bitrate = b;
+            self.settings.framerate = f;
+            self.settings.vbv_ms = v;
         }
         // The DPB and counters describe the picture just recorded; the
         // bitstream itself is collected by `finish`.
@@ -820,6 +845,7 @@ unsafe fn record_rate_control(
 struct RateControl {
     h264_layer: vk::VideoEncodeH264RateControlLayerInfoKHR<'static>,
     layers: [vk::VideoEncodeRateControlLayerInfoKHR<'static>; 1],
+    vbv_ms: u32,
 }
 
 impl RateControl {
@@ -830,7 +856,11 @@ impl RateControl {
             .max_bitrate(s.bitrate as u64)
             .frame_rate_numerator(s.framerate)
             .frame_rate_denominator(1)];
-        Self { h264_layer, layers }
+        Self {
+            h264_layer,
+            layers,
+            vbv_ms: s.vbv_ms.max(20),
+        }
     }
 
     /// The two structs to chain onto a control or begin info. Both borrow
@@ -846,8 +876,8 @@ impl RateControl {
         let rc = vk::VideoEncodeRateControlInfoKHR::default()
             .rate_control_mode(vk::VideoEncodeRateControlModeFlagsKHR::CBR)
             .layers(&self.layers)
-            .virtual_buffer_size_in_ms(500)
-            .initial_virtual_buffer_size_in_ms(250);
+            .virtual_buffer_size_in_ms(self.vbv_ms)
+            .initial_virtual_buffer_size_in_ms(self.vbv_ms / 2);
         let h264 = vk::VideoEncodeH264RateControlInfoKHR::default()
             .flags(
                 vk::VideoEncodeH264RateControlFlagsKHR::REGULAR_GOP

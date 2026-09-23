@@ -25,3 +25,4 @@ gliff-vk.workspace = true
 gliff-sw.workspace = true
 drm-fourcc.workspace = true
 tokio.workspace = true
+bytes.workspace = true

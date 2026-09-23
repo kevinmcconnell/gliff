@@ -172,6 +172,9 @@ mod tests {
                 scale_milli: 1000,
                 extradata: Vec::new(),
                 aux_extradata: None,
+                view_width: width,
+                view_height: 480,
+                fps_cap: 60,
             },
             Vec::new(),
         )

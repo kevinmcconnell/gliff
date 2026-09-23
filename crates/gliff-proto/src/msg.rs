@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 pub use crate::clipboard::{ClipboardFile, ClipboardItem, ClipboardMsg};
 
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Codec {
@@ -148,6 +148,11 @@ pub enum ClientMsg {
     Keymap {
         keymap: String,
     },
+    /// Answer to `ServerMsg::Ping`, sent before anything else so the server
+    /// can seed its round-trip estimate ahead of the first frame ack.
+    Pong {
+        t: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -165,11 +170,20 @@ pub enum ServerMsg {
         /// Stream size in physical pixels.
         width: u32,
         height: u32,
-        /// Output scale x1000: the remote's logical size is `width / scale`,
-        /// and pointer coordinates are sent in that logical space.
+        /// Effective stream scale x1000: the remote's logical size is
+        /// `width / scale`, and pointer coordinates are sent in that logical
+        /// space. It folds in any downscale of the stream, so it stays the
+        /// number stream pixels are divided by.
         scale_milli: u32,
         extradata: Vec<u8>,
         aux_extradata: Option<Vec<u8>>,
+        /// The full-quality fit size in physical pixels: the area the client
+        /// should draw the stream into. Equal to the stream size unless the
+        /// server sends a reduced-resolution stream.
+        view_width: u32,
+        view_height: u32,
+        /// The frame-rate ceiling in force, for the client's stats display.
+        fps_cap: u32,
     },
     VideoFrame {
         frame_id: u64,
@@ -224,6 +238,12 @@ pub enum ServerMsg {
     },
     ClipboardAbort {
         id: u32,
+    },
+    /// Sent right after HelloAck; the client answers with `ClientMsg::Pong`
+    /// ahead of anything else, seeding the server's round-trip estimate
+    /// before the first frame is acked.
+    Ping {
+        t: u64,
     },
 }
 

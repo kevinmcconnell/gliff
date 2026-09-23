@@ -159,7 +159,17 @@ impl Encoder {
     /// OpenH264 fixes the target at initialization, so the encoders are
     /// rebuilt; the fresh IDR also carries the parameter sets in-band.
     pub fn set_bitrate(&mut self, bitrate: u32) {
+        self.set_rate(bitrate, self.settings.framerate);
+    }
+
+    /// Change the target bitrate and the frame rate it is spread over, so
+    /// the per-frame budget matches the frames that really leave.
+    pub fn set_rate(&mut self, bitrate: u32, framerate: u32) {
+        if (bitrate, framerate) == (self.settings.bitrate, self.settings.framerate) {
+            return;
+        }
         self.settings.bitrate = bitrate;
+        self.settings.framerate = framerate.max(1);
         match Self::new(self.settings.clone(), self.aux.is_some()) {
             Ok(fresh) => {
                 self.main = fresh.main;

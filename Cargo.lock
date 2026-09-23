@@ -757,6 +757,7 @@ name = "gliff-probe"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
  "drm-fourcc",
  "gliff-proto",

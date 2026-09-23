@@ -270,6 +270,14 @@ impl Capturer {
             .map_err(|_| Error::ThreadGone)
     }
 
+    /// Abandon the in-flight capture and start a fresh full-damage one, for
+    /// a first frame the compositor never completed.
+    pub fn recapture(&self) -> Result<()> {
+        self.cmd
+            .send(thread::Cmd::Recapture)
+            .map_err(|_| Error::ThreadGone)
+    }
+
     pub fn stop(&self) {
         let _ = self.cmd.send(thread::Cmd::Stop);
     }
