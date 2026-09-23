@@ -458,6 +458,11 @@ impl Session {
             | ClientMsg::ClipboardRequest { .. }
             | ClientMsg::ClipboardAck { .. }
             | ClientMsg::ClipboardAbort { .. } => {}
+            ClientMsg::Keymap { keymap } if !keymap.is_empty() => {
+                tracing::debug!(bytes = keymap.len(), "client keymap changed");
+                self.inject(InputCmd::SetKeymap(keymap))
+            }
+            ClientMsg::Keymap { .. } => {}
             ClientMsg::Hello { .. } => anyhow::bail!("unexpected second Hello"),
         }
         Ok(ControlFlow::Continue(()))
@@ -1094,6 +1099,7 @@ fn start_input(target: &Target, output: &str, keymap: &str) -> Result<Input> {
     let mut ic = InputConfig::new(output.to_string());
     ic.target = target.clone();
     ic.keymap = (!keymap.is_empty()).then(|| keymap.to_string());
+    tracing::debug!(bytes = keymap.len(), "client keymap");
     Ok(Input::start(ic, Box::new(|_| {}))?)
 }
 

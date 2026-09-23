@@ -24,6 +24,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{self, unbounded_channel, UnboundedReceiver};
 
 use crate::clipboard::{Bridge, ToWorker};
+use crate::keymap::{Keymap, FIRST_KEYMAP_WAIT};
 
 /// Status/telemetry the worker reports to the UI.
 pub enum Status {
@@ -94,6 +95,7 @@ pub struct Worker {
     pub frames: SyncSender<Frame>,
     pub status: StdSender<Status>,
     pub input: UnboundedReceiver<ToWorker>,
+    pub keymap: Keymap,
 }
 
 impl Worker {
@@ -117,7 +119,16 @@ impl Worker {
                     let stream = tokio::net::TcpStream::connect(addr).await?;
                     stream.set_nodelay(true)?;
                     let (rd, wr) = tokio::io::split(stream);
-                    session(rd, wr, self.video, self.frames, self.status, self.input).await
+                    session(
+                        rd,
+                        wr,
+                        self.video,
+                        self.frames,
+                        self.status,
+                        self.input,
+                        self.keymap,
+                    )
+                    .await
                 }
                 Endpoint::Ssh(ref target) => {
                     let ssh = spawn_ssh(target)?;
@@ -128,6 +139,7 @@ impl Worker {
                         self.frames,
                         self.status,
                         self.input,
+                        self.keymap,
                     )
                     .await
                 }
@@ -187,6 +199,7 @@ async fn session<R, W>(
     frames: SyncSender<Frame>,
     status: StdSender<Status>,
     mut input: UnboundedReceiver<ToWorker>,
+    mut keymap: Keymap,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin + 'static,
@@ -208,11 +221,16 @@ where
             vec![ChromaMode::Single420]
         },
     };
-    let keymap = crate::keymap::local_keymap();
+    let _ = tokio::time::timeout(FIRST_KEYMAP_WAIT, keymap.wait_for(|k| !k.is_empty())).await;
+    let first_keymap = keymap.borrow_and_update().clone();
+    if first_keymap.is_empty() {
+        tracing::warn!("no local keymap yet; server will default to us");
+    }
+    tracing::debug!(bytes = first_keymap.len(), "sending keymap");
     writer
         .write_msg(&ClientMsg::Hello {
             version: PROTOCOL_VERSION,
-            keymap,
+            keymap: first_keymap,
             caps,
         })
         .await?;
@@ -281,20 +299,37 @@ where
     // Forward UI input into the same write channel; clipboard commands from
     // the UI go to the bridge. The UI closes its end when it switches to
     // another machine; `ui_gone` then ends this session and, with it, the
-    // ssh child.
+    // ssh child. Keymap changes share the task and go first, so a key from
+    // a newly used keyboard never reaches the server ahead of its keymap.
     let (ui_gone_tx, mut ui_gone) = tokio::sync::oneshot::channel::<()>();
     {
         let out_tx = out_tx.clone();
         let clipboard = clipboard.clone();
         tokio::task::spawn_local(async move {
-            while let Some(cmd) = input.recv().await {
-                match cmd {
-                    ToWorker::Send(m) => {
-                        if out_tx.send((m, Bytes::new())).is_err() {
-                            return;
+            let mut follow_keymap = true;
+            loop {
+                let msg = tokio::select! {
+                    biased;
+                    changed = keymap.changed(), if follow_keymap => {
+                        if changed.is_err() {
+                            follow_keymap = false;
+                            continue;
                         }
+                        let text = keymap.borrow_and_update().clone();
+                        tracing::debug!(bytes = text.len(), "sending changed keymap");
+                        ClientMsg::Keymap { keymap: text }
                     }
-                    other => clipboard.on_ui(other),
+                    cmd = input.recv() => match cmd {
+                        Some(ToWorker::Send(m)) => m,
+                        Some(other) => {
+                            clipboard.on_ui(other);
+                            continue;
+                        }
+                        None => break,
+                    },
+                };
+                if out_tx.send((msg, Bytes::new())).is_err() {
+                    return;
                 }
             }
             let _ = ui_gone_tx.send(());

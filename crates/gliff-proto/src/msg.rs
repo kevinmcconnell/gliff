@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 pub use crate::clipboard::{ClipboardFile, ClipboardItem, ClipboardMsg};
 
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Codec {
@@ -143,6 +143,10 @@ pub enum ClientMsg {
     },
     ClipboardAbort {
         id: u32,
+    },
+    /// The local keymap changed since `Hello`; same format as its `keymap`.
+    Keymap {
+        keymap: String,
     },
 }
 
@@ -328,6 +332,9 @@ mod tests {
             ClientMsg::FrameAck {
                 frame_id: 42,
                 decoded_at_ms: 1000,
+            },
+            ClientMsg::Keymap {
+                keymap: "xkb".into(),
             },
         ];
         for m in msgs {

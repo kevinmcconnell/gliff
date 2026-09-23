@@ -22,7 +22,8 @@ Working and validated on AMD (Ryzen Granite Ridge, Mesa RADV):
 
 - Capture of a Hyprland output via `ext-image-copy-capture-v1` into GBM dmabufs.
 - Keyboard and pointer injection, with the client's xkb keymap uploaded so keys
-  map identically on both ends.
+  map identically on both ends, and sent again when the local keyboard or
+  layout changes.
 - Vulkan Video H.264 encode and decode (`VK_KHR_video_encode_h264`,
   `VK_KHR_video_decode_h264`); Dual420 4:4:4 round-trips near-lossless, plus a
   `--low-bandwidth` single 4:2:0 stream.
