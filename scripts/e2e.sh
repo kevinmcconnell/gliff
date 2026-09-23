@@ -25,7 +25,7 @@ PIDS=()
 NEST_SIG=""
 cleanup() {
     for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done
-    [ -n "$NEST_SIG" ] && pkill -9 -f "Hyprland .*e2e-hypr.conf" 2>/dev/null || true
+    [ -n "$NEST_SIG" ] && pkill -9 -f "Hyprland .*e2e-hypr.lua" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -38,11 +38,20 @@ PROBE=target/release/gliff-probe
 SERVER=target/release/gliff-server
 
 echo "== starting nested Hyprland =="
-CONF=$(mktemp --suffix=-e2e-hypr.conf)
+CONF=$(mktemp --suffix=-e2e-hypr.lua)
+# The detailed default wallpaper gives every run the same demanding frame.
 cat > "$CONF" <<HYPR
-monitor=,1280x800,auto,1
-misc { disable_hyprland_logo = true; disable_splash_rendering = true }
-ecosystem { no_update_news = true; no_donation_nag = true }
+hl.monitor({ output = "", mode = "1280x800", position = "auto", scale = 1 })
+hl.config({
+    misc = {
+        force_default_wallpaper = 2,
+        disable_splash_rendering = true,
+    },
+    ecosystem = {
+        no_update_news = true,
+        no_donation_nag = true,
+    },
+})
 HYPR
 before=$(ls "$XDG_RUNTIME_DIR/hypr" 2>/dev/null)
 WAYLAND_DISPLAY="$WAYLAND_DISPLAY" HYPRLAND_INSTANCE_SIGNATURE= setsid Hyprland -c "$CONF" >/tmp/gliff-e2e-hypr.log 2>&1 &
@@ -147,10 +156,11 @@ rm -f "$clipf"
 echo "   clipboard both directions PASS"
 
 echo "== 7. mirrored output resize =="
+set_monitor() { hyprctl eval "hl.monitor({ output = \"$1\", mode = \"$2\", position = \"auto\", scale = 1 })" >/dev/null 2>&1; }
 hyprctl output create headless e2emirror >/dev/null 2>&1
 sleep 1
 mirror=$(hyprctl monitors -j | python3 -c "import sys,json; print(next(m['name'] for m in json.load(sys.stdin) if 'e2emirror' in m['name']))")
-hyprctl keyword monitor "$mirror,1280x800@60,auto,1" >/dev/null 2>&1
+set_monitor "$mirror" 1280x800@60
 sleep 1
 "$SERVER" --listen 127.0.0.1:9043 --output "$mirror" --instance "$NEST_SIG" >/tmp/gliff-e2e-mirror-server.log 2>&1 &
 msp=$!; PIDS+=("$msp"); sleep 1
@@ -168,9 +178,9 @@ wait_for_mirror() {
     fail "mirror resize: missing '$pattern' (log: $mirror_log)"
 }
 wait_for_mirror 'first decoded frame ok'
-hyprctl keyword monitor "$mirror,640x480@60,auto,1" >/dev/null 2>&1
+set_monitor "$mirror" 640x480@60
 wait_for_mirror 'reconfig to 640x480'
-hyprctl keyword monitor "$mirror,1024x768@60,auto,1" >/dev/null 2>&1
+set_monitor "$mirror" 1024x768@60
 wait_for_mirror 'reconfig to 800x600'
 wait "$mcp" || fail "mirror resize: probe failed (log: $mirror_log)"
 grep -q '^PASS decoded 30 frames' "$mirror_log" || fail "mirror resize: frames stopped (log: $mirror_log)"
