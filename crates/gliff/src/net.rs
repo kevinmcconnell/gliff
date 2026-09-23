@@ -9,6 +9,7 @@ use std::rc::Rc;
 use std::sync::mpsc::{Sender as StdSender, SyncSender};
 use std::sync::Arc;
 
+use anyhow::Context;
 use bytes::Bytes;
 use gliff_proto::clipboard::CHUNK;
 use gliff_proto::{
@@ -330,17 +331,15 @@ where
     // never block on a write and the two peers cannot deadlock. Both the reader
     // loop (acks, keyframe requests) and the UI thread (input) feed `out_tx`.
     let (out_tx, mut out_rx) = unbounded_channel::<(ClientMsg, Bytes)>();
-    tokio::task::spawn_local(async move {
+    let mut writes = tokio::task::spawn_local(async move {
         while let Some((m, payload)) = out_rx.recv().await {
-            let r = if payload.is_empty() {
-                writer.write_msg(&m).await
+            if payload.is_empty() {
+                writer.write_msg(&m).await?;
             } else {
-                writer.write_msg_with_payloads(&m, &[&payload]).await
-            };
-            if r.is_err() {
-                break;
+                writer.write_msg_with_payloads(&m, &[&payload]).await?;
             }
         }
+        Ok::<(), gliff_transport::Error>(())
     });
     // Clipboard transfers write through the same channel, in chunks.
     let (clip_out_tx, mut clip_out_rx) = outbound_channel();
@@ -421,6 +420,10 @@ where
         let read = tokio::select! {
             read = reader.read_msg::<ServerMsg>() => read,
             _ = &mut ui_gone => return Ok(()),
+            written = &mut writes => {
+                written.context("writer task")?.context("write to server")?;
+                return Ok(());
+            }
             _ = tokio::time::sleep_until(drain_at),
                 if undelivered.is_some()
                     || matches!(&decoder, VideoDecoder::Cpu(d) if d.has_pending()) =>
