@@ -39,8 +39,9 @@ Working and validated on AMD (Ryzen Granite Ridge, Mesa RADV):
   `omarchy theme set`. Without Omarchy it is stock Adwaita and follows the
   desktop dark/light preference.
 
-On Intel (Mesa ANV) the client has been tested and works, but we have not
-started server support yet. The client needs
+On Intel (Mesa ANV) the client has been tested and works, but the server
+has no GPU support there yet: ANV's encoder lacks CBR rate control, so the
+server uses the CPU pipeline. The client needs
 `ANV_DEBUG=video-decode,video-encode` set; `docs/hardware-quirks.md` explains
 why.
 
@@ -56,7 +57,7 @@ bar in the gliff window, or a desktop notification on the server.
 
 Not done yet: AV1 for outputs above 4096 wide (H.264 is scaled to fit today)
 and native single-stream 4:4:4; a verified ssh-from-cold-machine path; Intel
-server support; and testing on NVIDIA Vulkan drivers.
+GPU server support; and testing on NVIDIA Vulkan drivers.
 
 ## Build
 
