@@ -69,13 +69,30 @@ round-trip.
   segments. A frame is ~115 packets, so raw UDP would damage most frames at
   those loss rates, and a working UDP path needs NACK or FEC, a jitter buffer
   and codec resilience, whose recovery also costs one RTT. TCP in SSH stays
-  until a high-RTT lossy path becomes a primary use; then QUIC (one stream
-  per frame, keys handed over SSH) is the candidate, not raw UDP. To measure
+  until a high-RTT lossy path becomes a primary use; then the candidate is
+  video datagrams over UDP, AEAD-encrypted with a session key handed over
+  SSH, while control, input and clipboard stay on the SSH channel. QUIC was
+  considered and rejected: its TLS handshake duplicates the trust SSH
+  already gives us, its per-stream retransmission is unneeded when the
+  encoder can answer a lost keyframe with a fresh one, and its congestion
+  controller would sit under ours. The UDP path still owes packetization to
+  the path MTU, a nonce counter with a replay window, a NACK-or-re-keyframe
+  policy, pacing, and one open UDP port on the server that silently drops
+  unauthenticated packets. To measure
   again: client `RUST_LOG=info,gliff_vk=debug`, server
   `--server-bin 'env RUST_LOG=info,gliff_server=debug gliff-server'`, compare
   the `queued frame`, `output write completed`, and `decode + recombine`
   timestamps, and sample
   `ss -tin` on the server for retransmits.
+  Measured again on 2026-09-22 under the `satellite` bench preset
+  (2.5 Mbit/s shaped, 550 ms one-way, 10% random loss both ways, 45 s run):
+  TCP holds the stream to 0.3 Mbit/s and 4.3 fps with a 2.3 s median frame
+  latency (p95 4.8 s) and 34 arrival gaps over 100 ms — retransmission
+  timeouts with 1.1 s RTT stall delivery for seconds while later frames wait
+  in order. The ladder correctly sits on its lowest rung, so on such links
+  the transport, not the adaptation, is the ceiling; that is the case a UDP
+  media path addresses (drop or supersede late frames, recover only
+  keyframes, delay-based control that ignores random loss).
 
 - **4:4:4 by two 4:2:0 streams (AVC444).** Hardware H.264 encoders only do
   4:2:0, which blurs coloured text. gliff splits full 4:4:4 into a main stream
@@ -101,17 +118,50 @@ round-trip.
   (SPS, PPS, slice header up to the reference marking) and manages a two-slot
   DPB with sliding-window marking.
 
-- **Latest-wins, ack-paced.** The server keeps only the most recent captured
-  frame and encodes it when the client has ack capacity. The number of unacked
-  frames allowed is derived from a smoothed ack RTT and clamped to 2..8, so the
-  frame rate is not capped by latency and a slow client cannot build a backlog.
-  Frames are captured on demand, so a static screen costs nothing.
+- **Latest-wins, rate-paced.** The server keeps only the most recent captured
+  frame and encodes it on one commanded cadence: the pace timer and the
+  encoder's programmed frame rate are the same number (the ladder's fps cap,
+  bounded by the sustainable encode time), so bits per frame match the frames
+  that really leave. Sending is bounded by bytes in flight against
+  `gain x delivered rate x base RTT` (never below two frames), not by an ack
+  count, so latency does not cap the frame rate and a slow client cannot
+  build a backlog. Frames are captured on demand, so a static screen costs
+  nothing; a request stays outstanding while sending is blocked, so the frame
+  that finally goes out is current.
   A separate writer task owns the socket write half and keeps at most one
   queued encoded frame; unsent cursor and pong messages are coalesced,
   clipboard messages are never coalesced (transfers are ordered and
   reliable, bounded by the engine's ack window), and stream configuration
   stays ordered with its video frames.
-  The session keeps processing input while a video write is blocked.
+  The session keeps processing input while a video write is blocked, and a
+  write that outlives a frame interval is a congestion signal of its own.
+
+- **Rate control and the quality ladder** (`gliff-server/src/rate.rs`). A
+  transport-independent `LinkEstimator` pairs acks by frame id and measures
+  the base RTT (10 s windowed minimum, seeded by a handshake ping before the
+  first frame), RFC 6298 mdev with an adaptive queueing threshold, and a
+  BBR-style max-filtered delivered rate; samples from content-limited sends
+  (a quiet screen, refinement passes) may only raise the estimate. The
+  `RateController` follows Google Congestion Control's shape: start at
+  3 Mbit/s, double per completed flight in slow start, grow ~8%/s or jump to
+  0.85x the delivered rate, and cut to 0.85x the recent delivered rate only
+  after two consecutive evaluations of sustained queueing while blocked —
+  one TCP loss-recovery stall never cuts. A future UDP transport feeds the
+  same estimator inputs (bytes sent, acks, a blocked marker).
+  Above the controller a ladder degrades frame rate first (60, 30, 15 fps),
+  then the auxiliary chroma stream, then resolution, chosen from affordable
+  bits per pixel at the measured rate. During slow start the ladder moves
+  freely (the seed jump), so a LAN reaches full quality in under a second
+  and a slow link lands on its level at the first real measurement; after
+  that, step-ups need 1.25x headroom and a hold that doubles on a flap. The
+  client draws a reduced-resolution stream into the full-quality view size
+  (`StreamConfig.view_width/height`), so a rung change never shrinks the
+  picture on screen, and an fps-only rung change reprograms the rate without
+  an encoder rebuild, a keyframe, or a client decoder reset.
+  When the screen is still and the link has room, the last frame is
+  re-encoded (at most 8 times, 200 ms apart, stopping once a pass codes
+  below a fifth of the frame budget), so a picture that arrived soft under
+  a low starting budget converges to sharp.
 
 - **Threading.** Each pipeline lives on one thread: the server loop and the
   client decode worker are current-thread tokio runtimes that own their
@@ -179,21 +229,29 @@ round-trip.
 - **Unit tests** cover the pure logic: AVC444 split/recombine losslessness,
   single-stream subsample/upsample, BGRA↔YUV444 colour round-trip, the H.264
   header parser against an x264 stream, framing with payloads and partial
-  writes, the ack-window bounds, keymap building, Hyprland instance
-  discovery, and the clipboard rules and engine (mime filtering, URI lists,
-  safe paths, the send window and assembler, chunked transfers between two
-  engines, the size cap, and a spooled directory tree).
+  writes, the rate controller and ladder against a simulated link (a fake
+  clock drives satellite, LAN and collapse scenarios), keymap building,
+  Hyprland instance discovery, and the clipboard rules and engine (mime
+  filtering, URI lists, safe paths, the send window and assembler, chunked
+  transfers between two engines, the size cap, and a spooled directory
+  tree).
 - **`gliff-probe`** is the hardware integration harness: `protocols`,
   `outputs`, `vulkan`, `roundtrip` (synthetic BGRA → encode → decode → PSNR
   against the CPU reference), `capture`, `input`, `pipeline` (a captured
-  dmabuf through the exact server and client pipelines), and `serve-test` (a
-  headless protocol client). Run it under `VK_LAYER_KHRONOS_validation` after
-  touching `gliff-vk`.
+  dmabuf through the exact server and client pipelines), `serve-test` (a
+  headless protocol client), and `stream-bench` (startup milestones, fps,
+  latency, interval and size statistics, `--timeline`, `--csv`). Run it under
+  `VK_LAYER_KHRONOS_validation` after touching `gliff-vk`.
 - **`scripts/e2e.sh`** boots a nested Hyprland and asserts PASS across the probe
   checks, the GPU pipeline, both Dual420 and Single420 server-plus-client
-  streams, and the clipboard in both directions, as text and as a 1 MiB
-  binary item. It needs a Hyprland session and a GPU with Vulkan Video, so it
-  is not a CI unit test; run it on a target machine.
+  streams, the clipboard in both directions (as text and as a 1 MiB binary
+  item), and a mirrored-output resize. It needs a Hyprland session and a GPU
+  with Vulkan Video, so it is not a CI unit test; run it on a target machine.
+- **`scripts/bench.sh`** runs a server and `stream-bench` in a nested
+  Hyprland over a shaped link: `BENCH_PRESET=lan|dsl|satellite`, a
+  token-bucket TCP proxy (`scripts/throttle-proxy.py`) or `tc netem` in an
+  unprivileged network namespace (`scripts/netem.sh`, loss and delay in both
+  directions). `BENCH_STATIC=1` drops the damage loop.
 
 ## Measurements
 
@@ -209,8 +267,17 @@ Dual420, from `gliff-probe roundtrip`:
 No pixel work happens on the CPU at any resolution; the remaining cost is the
 encode hardware itself, which serialises the two streams, so a 1080p Dual420
 frame costs about two encodes' worth of time. The server adapts the CBR
-target to the link (see the session's `BitrateController`), so a slow link
-lowers quality rather than frame rate.
+target to the link (`gliff-server/src/rate.rs`); a slow link gives up frame
+rate first, then chroma, then resolution.
+
+Shaped-link runs (`scripts/bench.sh`, nested Hyprland, 2560x1440 headless,
+2026-09-21):
+
+| Preset | Result |
+|---|---|
+| `lan` (no shaping) | first frame decoded 0.6 s, 60 fps level at 1.0 s, 59.6 fps, 38 Mbit/s, 0 gaps > 100 ms |
+| `dsl` (20 Mbit/s, 10 ms one-way) | 50 fps, 15.8 Mbit/s, 0 gaps, no ladder flap |
+| `satellite` (2.5 Mbit/s, 550 ms one-way, 10% random loss BOTH ways) | first frame decoded 4.0 s, settles on the 10 fps single-stream rungs; 60 decoded frames in 19.5 s vs 29.7 s for the pre-adaptation server. TCP loss recovery still stalls the stream (gaps of seconds); that is the head-of-line blocking a UDP media path would remove. |
 
 ## Pending and recommended improvements
 
@@ -238,10 +305,27 @@ Not yet built, roughly in priority order:
    on some driver would also retire the split.
 3. **Verified ssh path** from a cold machine, including the `WAYLAND_DISPLAY` /
    `XDG_RUNTIME_DIR` environment setup, and a systemd user unit if wanted.
-4. **Polish**: multi-output selection UI, `tc netem` tuning of the adaptive
-   ack window, and a lazy file spool (a FUSE mount the pasting application
-   reads through, so its own copy dialog shows progress, instead of spooling
-   every file before the URI list is handed over).
+4. **First frame on a truly static screen.** The 700 ms `Recapture` rescue
+   needs verifying against a locked, unchanging screen (the nested bench
+   screens always produce damage); if the compositor still withholds the
+   frame, the fallbacks are a `debug:damage_tracking` toggle or a 1 px
+   virtual-pointer nudge.
+5. **Optional UDP media transport for high-RTT lossy links.** TCP over SSH
+   stays the default and keeps working everywhere; this is an optional
+   enhancement, worth building only when such a path becomes a real use.
+   The evidence and the trigger conditions are in "Why not UDP" above: on
+   the `satellite` preset TCP's loss recovery is the ceiling (0.3 Mbit/s,
+   4.3 fps, multi-second head-of-line stalls), while `lan` and `dsl` show
+   no transport limit. The shape is encrypted video datagrams with a
+   session key handed over SSH, control and input staying on the SSH
+   channel, late frames dropped rather than waited for, and a lost keyframe
+   answered with a fresh keyframe rather than a retransmit. `LinkEstimator`,
+   `RateController` and the ladder already take transport-neutral inputs
+   (bytes sent, acks, a blocked marker) and carry over unchanged.
+6. **Polish**: multi-output selection UI, a `--max-fps` server flag, and a
+   lazy file spool (a FUSE mount the pasting application
+   reads through, so its own copy dialog shows progress, instead of
+   spooling every file before the URI list is handed over).
 
 See `docs/hardware-quirks.md` for driver-specific behaviour and the low-severity
 items surfaced by code review.

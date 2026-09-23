@@ -31,7 +31,7 @@ use gtk::glib;
 use gtk4 as gtk;
 use libadwaita as adw;
 use net::Frame;
-use net::{Endpoint, Status, Worker};
+use net::{Endpoint, Picture, Status, Worker};
 use recent::Config;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
@@ -89,8 +89,17 @@ struct App {
     recent_popover: gtk::Popover,
     recent_list: gtk::ListBox,
     transfers: Rc<clipboard_ui::TransferBars>,
-    /// Size of the stream the server is sending, from the last StreamConfig.
+    /// Size of the stream the server is sending, from the last painted frame.
     stream_size: Cell<(u32, u32)>,
+    /// The full-quality fit size the stream is drawn into; equals the stream
+    /// size unless the server reduced the resolution. From the last painted
+    /// frame, so pointer mapping always matches the picture on screen.
+    stream_view: Cell<(u32, u32)>,
+    /// The view from the last StreamConfig (which may not be painted yet);
+    /// only the resize gate reads it.
+    server_view: Cell<(u32, u32)>,
+    /// The server's frame-rate ceiling, for the stats overlay.
+    fps_cap: Cell<u32>,
     /// The remote output's scale: pointer coordinates go in physical / scale.
     stream_scale: Cell<f32>,
     /// Size of the video widget in device pixels, rounded down to even.
@@ -267,6 +276,9 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         recent_list: recent_list.clone(),
         transfers,
         stream_size: Cell::new((0, 0)),
+        stream_view: Cell::new((0, 0)),
+        server_view: Cell::new((0, 0)),
+        fps_cap: Cell::new(0),
         stream_scale: Cell::new(1.0),
         view_size: Cell::new((0, 0)),
         resize_requested: Cell::new((0, 0)),
@@ -508,6 +520,8 @@ fn connect_to(ui: &Rc<App>, endpoint: Endpoint) {
 fn show_disconnected(ui: &App) {
     ui.frame.clear();
     ui.stream_size.set((0, 0));
+    ui.stream_view.set((0, 0));
+    ui.server_view.set((0, 0));
     ui.stats.set_text("");
     ui.video.set_cursor(None);
 }
@@ -515,7 +529,7 @@ fn show_disconnected(ui: &App) {
 /// Start a worker for `endpoint`. Each call is a new session generation;
 /// pollers and reconnects from an older generation stop themselves.
 fn start_session(ui: Rc<App>, endpoint: Endpoint) {
-    let (frame_tx, frame_rx) = sync_channel::<Frame>(2);
+    let (frame_tx, frame_rx) = sync_channel::<Picture>(2);
     let (status_tx, status_rx) = channel::<Status>();
     let (input_tx, input_rx) = unbounded_channel::<clipboard::ToWorker>();
     // Replacing the sender closes the old worker's input, which ends it.
@@ -589,7 +603,7 @@ fn schedule_reconnect(ui: Rc<App>, session: u64) {
 }
 
 /// Pull decoded frames on the GTK main loop, latest-wins, and paint them.
-fn poll_frames(ui: Rc<App>, rx: Receiver<Frame>, session: u64) {
+fn poll_frames(ui: Rc<App>, rx: Receiver<Picture>, session: u64) {
     glib::timeout_add_local(Duration::from_millis(8), move || {
         if ui.session.get() != session {
             return glib::ControlFlow::Break;
@@ -606,9 +620,17 @@ fn poll_frames(ui: Rc<App>, rx: Receiver<Frame>, session: u64) {
                 }
             }
         }
-        if let Some(f) = latest {
-            match frame_texture(f) {
-                Ok(texture) => ui.frame.set_frame(texture, ui.video.scale_factor()),
+        if let Some(p) = latest {
+            match frame_texture(p.frame) {
+                Ok(texture) => {
+                    // Geometry follows the frame that really paints, so the
+                    // pointer never maps against a picture that is not on
+                    // screen (a newer config, or a failed import).
+                    ui.stream_size.set(p.stream);
+                    ui.stream_view.set(p.view);
+                    ui.stream_scale.set((p.scale_milli.max(1) as f32) / 1000.0);
+                    ui.frame.set_frame(texture, ui.video.scale_factor(), p.view);
+                }
                 Err(e) => tracing::warn!(error = %e, "frame texture import failed"),
             }
         }
@@ -668,22 +690,28 @@ fn poll_status(ui: Rc<App>, rx: Receiver<Status>, session: u64) {
         }
         while let Ok(s) = rx.try_recv() {
             match s {
+                // Pointer-mapping geometry (stream_size/view/scale) is not
+                // read from the config: it follows each painted frame, so a
+                // new config never remaps clicks against the old picture.
                 Status::Connected {
-                    width,
-                    height,
-                    scale_milli,
                     video,
+                    view_width,
+                    view_height,
+                    fps_cap,
                 } => {
-                    ui.stream_size.set((width, height));
-                    ui.stream_scale.set((scale_milli.max(1) as f32) / 1000.0);
+                    ui.server_view.set((view_width, view_height));
+                    ui.fps_cap.set(fps_cap);
                     ui.resize_requested.set((0, 0));
                     ui.retries.set(0);
-                    ui.status.set_text(&format!("Connected — {width}x{height}"));
+                    ui.status
+                        .set_text(&format!("Connected — {view_width}x{view_height}"));
                     // Visible before the first per-second stats arrive.
                     ui.stats.set_text(&video);
                     remember_machine(&ui);
                     // A fresh server starts at its own default size; a
-                    // reconnect must bring it back to the window.
+                    // reconnect must bring it back to the window. The gate
+                    // compares against the view, so a server-chosen
+                    // reduced-resolution stream never triggers one.
                     request_resize(&ui);
                 }
                 Status::Stats {
@@ -692,8 +720,16 @@ fn poll_status(ui: Rc<App>, rx: Receiver<Status>, session: u64) {
                     decode_ms,
                     video,
                 } => {
+                    let (sw, sh) = ui.stream_size.get();
+                    let (vw, vh) = ui.stream_view.get();
+                    let stream = if (sw, sh) == (vw, vh) {
+                        format!("{sw}x{sh}")
+                    } else {
+                        format!("{sw}x{sh} → {vw}x{vh}")
+                    };
+                    let cap = ui.fps_cap.get();
                     ui.stats.set_text(&format!(
-                        "{video}  {fps:.0} fps  {mbit:.1} Mbit/s  decode {decode_ms:.1} ms"
+                        "{video}  {fps:.0} fps  {mbit:.1} Mbit/s  decode {decode_ms:.1} ms  {stream} @{cap}"
                     ));
                 }
                 Status::Cursor {
@@ -782,20 +818,24 @@ fn has_visible_shape(argb: &[u8]) -> bool {
 /// scale, which is what the virtual pointer expects.
 fn to_remote(ui: &App, x: f64, y: f64) -> (f64, f64) {
     let (rw, rh) = ui.stream_size.get();
-    if rw == 0 || rh == 0 {
+    let (vw, vh) = ui.stream_view.get();
+    if rw == 0 || rh == 0 || vw == 0 || vh == 0 {
         return (0.0, 0.0);
     }
-    // The frame is drawn at one stream pixel per device pixel, centred, and
-    // only ever shrunk to fit (ScaleDown): its logical size is stream / device
-    // scale, times a fit factor of at most 1.
+    // The frame is drawn into the view box (view / device scale in logical
+    // pixels), centred, and only ever shrunk to fit (ScaleDown). A
+    // reduced-resolution stream is stretched to the same box, so the
+    // letterbox comes from the view, and stream pixels from the ratio.
     let device = ui.video.scale_factor().max(1) as f64;
-    let (lw, lh) = (rw as f64 / device, rh as f64 / device);
+    let (lw, lh) = (vw as f64 / device, vh as f64 / device);
     let (aw, ah) = (ui.video.width() as f64, ui.video.height() as f64);
     let fit = (aw / lw).min(ah / lh).min(1.0);
     let (fw, fh) = (lw * fit, lh * fit);
     let (ox, oy) = ((aw - fw) / 2.0, (ah - fh) / 2.0);
-    let px = ((x - ox) / fit * device).clamp(0.0, rw as f64);
-    let py = ((y - oy) / fit * device).clamp(0.0, rh as f64);
+    let vx = (x - ox) / fit * device;
+    let vy = (y - oy) / fit * device;
+    let px = (vx * rw as f64 / vw as f64).clamp(0.0, rw as f64);
+    let py = (vy * rh as f64 / vh as f64).clamp(0.0, rh as f64);
     let scale = ui.stream_scale.get().max(0.01) as f64;
     (px / scale, py / scale)
 }
@@ -1173,12 +1213,15 @@ fn install_resize_handler(ui: &Rc<App>) {
     });
 }
 
-/// Send a Resize if the stream does not already match the view.
+/// Send a Resize if the server's view does not already match the window.
+/// The gate compares the server's VIEW, not the stream: a stream the server
+/// chose to send at reduced resolution is not a size mismatch, and asking
+/// again would fight the server's own choice.
 fn request_resize(ui: &App) {
     let size = ui.view_size.get();
     if size.0 < 64
         || size.1 < 64
-        || size == ui.stream_size.get()
+        || size == ui.server_view.get()
         || size == ui.resize_requested.get()
     {
         return;

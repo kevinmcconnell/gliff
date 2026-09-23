@@ -79,10 +79,19 @@ impl Encoder {
 
     /// Change the target bitrate of both streams from the next frame on.
     pub fn set_bitrate(&mut self, bitrate: u32) {
+        let (fps, vbv) = (self.settings.framerate, self.settings.vbv_ms);
+        self.set_rate(bitrate, fps, vbv);
+    }
+
+    /// Change the target bitrate, the frame rate it is spread over, and the
+    /// rate-control buffer of both streams from the next frame on.
+    pub fn set_rate(&mut self, bitrate: u32, framerate: u32, vbv_ms: u32) {
         self.settings.bitrate = bitrate;
-        self.main.set_bitrate(bitrate);
+        self.settings.framerate = framerate;
+        self.settings.vbv_ms = vbv_ms;
+        self.main.set_rate(bitrate, framerate, vbv_ms);
         if let Some(a) = &mut self.aux {
-            a.set_bitrate(bitrate);
+            a.set_rate(bitrate, framerate, vbv_ms);
         }
     }
 

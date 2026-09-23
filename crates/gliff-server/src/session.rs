@@ -1,6 +1,5 @@
 //! One client session: output setup, the capture/encode/send loop, and input.
 
-use std::collections::VecDeque;
 use std::ops::ControlFlow;
 use std::os::fd::AsFd;
 use std::path::PathBuf;
@@ -23,6 +22,7 @@ use gliff_transport::clipboard::{outbound_channel, Side, Transfers};
 use gliff_transport::Framed;
 use gliff_vk::{DmabufPlane, EncodedFrame, Encoder, EncoderSettings, Gpu};
 
+use crate::rate::{Ladder, LinkEstimator, RateController};
 use crate::writer::Writer;
 use hypr_capture::{CaptureConfig, CaptureEvent, CapturedFrame, Capturer};
 use hypr_input::{Axis as InAxis, Clipboard, ClipboardEvent, Input, InputCmd, InputConfig};
@@ -129,6 +129,11 @@ where
             "scaling the stream to the encoder maximum"
         );
     }
+    let ladder = Ladder::new(START_LEVEL);
+    let start_fps = ladder.level().fps_cap.min(MAX_FPS);
+    // Pipelined behind HelloAck, never waited on: the Pong seeds the
+    // round-trip estimate, usually before the first frame ack arrives.
+    writer.write_msg(&ServerMsg::Ping { t: now_ms() }).await?;
     writer
         .write_msg(&stream_config(
             codec,
@@ -136,6 +141,8 @@ where
             video.pipeline(),
             &output,
             stream,
+            stream,
+            start_fps,
         ))
         .await?;
 
@@ -179,14 +186,21 @@ where
         compositor_clipboard,
     );
 
-    let bitrate_ctl = match cfg.bitrate {
-        Some(fixed) => BitrateController::new(fixed, true),
-        None => BitrateController::new(
-            EncoderSettings::default_bitrate(stream.0, stream.1, 60),
-            false,
-        ),
-    };
-    let settings = encoder_settings(stream.0, stream.1, bitrate_ctl.current());
+    let streams = if chroma == ChromaMode::Dual420 { 2 } else { 1 };
+    let ctl = RateController::new(
+        stream.0 as u64 * stream.1 as u64,
+        streams,
+        MAX_FPS,
+        cfg.bitrate,
+    );
+    let fps_cmd = start_fps;
+    let settings = encoder_settings(
+        stream.0,
+        stream.1,
+        ctl.stream_bitrate(),
+        fps_cmd,
+        ctl.vbv_ms(fps_cmd),
+    );
     let encoder = VideoEncoder::new(&video, &settings, chroma == ChromaMode::Dual420)
         .context("create encoder")?;
 
@@ -194,6 +208,8 @@ where
     let (writer, mut write_reports) = Writer::spawn(writer);
 
     capturer.request_frame().ok();
+    let first_frame_deadline =
+        tokio::time::Instant::from_std(Instant::now() + FIRST_FRAME_DEADLINE);
     let mut clip_open = true;
     let mut session = Session {
         writer,
@@ -204,7 +220,8 @@ where
         encoder_max,
         client_extent: (caps.max_width, caps.max_height),
         caps,
-        bitrate_ctl,
+        link: LinkEstimator::new(),
+        ctl,
         codec,
         chroma,
         settings,
@@ -214,11 +231,19 @@ where
         pending: None,
         capture_asked: true,
         blocked_noted: false,
-        in_flight: 0,
-        n_limit: 2,
         frame_id: 0,
         want_keyframe: true,
-        rtt: RttEstimator::new(),
+        fps_cmd,
+        encode_us: 0.0,
+        next_send_at: Instant::now(),
+        last_frame: None,
+        refines: MAX_REFINES,
+        next_refine_at: Instant::now(),
+        recaptured: false,
+        ladder,
+        base_stream: stream,
+        base_chroma: chroma,
+        sent_fps_cap: start_fps,
         cursor_shape_id: 0,
     };
 
@@ -252,7 +277,38 @@ where
             }
             ev = cap_rx.recv() => session.on_capture(ev)?,
             report = write_reports.recv() => {
-                report.context("writer task ended")??;
+                let elapsed = report.context("writer task ended")??;
+                // A write that took longer than a frame interval means the
+                // socket, not the byte cap, was the bottleneck.
+                if elapsed > session.frame_interval() {
+                    session.ctl.note_writer_blocked();
+                }
+                ControlFlow::Continue(())
+            }
+            // The one-shot first-frame rescue: a static screen produces no
+            // damage, so the capture never completes; retry it once with
+            // full damage.
+            _ = tokio::time::sleep_until(first_frame_deadline),
+                if session.frame_id == 0 && !session.recaptured =>
+            {
+                tracing::info!("no first frame yet; recapturing with full damage");
+                session.recaptured = true;
+                session.capturer.recapture().ok();
+                ControlFlow::Continue(())
+            }
+            // The refinement timer: fires when the screen is still and the
+            // last frame can be re-encoded toward sharp.
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(session.refine_wake())),
+                if session.can_refine() =>
+            {
+                ControlFlow::Continue(())
+            }
+            // The pace timer: fires when a frame waits only on the cadence.
+            // The guard must not test the deadline itself, or the arm would
+            // disarm exactly while waiting for it.
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(session.next_send_at)),
+                if session.pending.is_some() && session.link_has_room() =>
+            {
                 ControlFlow::Continue(())
             }
         };
@@ -368,7 +424,8 @@ struct Session {
     /// The client's last reported window size, so a mirrored output that
     /// changes mode can be refitted to the window.
     client_extent: (u32, u32),
-    bitrate_ctl: BitrateController,
+    link: LinkEstimator,
+    ctl: RateController,
     codec: Codec,
     chroma: ChromaMode,
     settings: EncoderSettings,
@@ -378,40 +435,108 @@ struct Session {
     /// The newest captured frame not yet encoded.
     pending: Option<CapturedFrame>,
     capture_asked: bool,
-    /// The pending frame has already counted as blocked for the bitrate
+    /// The pending frame has already counted as blocked for the rate
     /// controller.
     blocked_noted: bool,
-    /// Frames sent but not yet acked; bounded by `n_limit` for pacing.
-    in_flight: u32,
-    n_limit: u32,
     frame_id: u64,
     want_keyframe: bool,
-    rtt: RttEstimator,
+    /// The one commanded cadence: the pace timer and the encoder's
+    /// programmed frame rate both use it.
+    fps_cmd: u32,
+    /// Smoothed encode time, for the sustainable-fps clamp.
+    encode_us: f64,
+    /// The pace slot for the next frame.
+    next_send_at: Instant,
+    /// The last frame that went out, kept for still-picture refinement and
+    /// for the keyframe after a ladder step on a static screen. It pins one
+    /// capture ring slot, which the ring's extra buffer pays for.
+    last_frame: Option<CapturedFrame>,
+    /// Refinement passes spent on `last_frame`.
+    refines: u8,
+    next_refine_at: Instant,
+    /// The one-shot first-frame recapture has fired.
+    recaptured: bool,
+    /// Quality levels the link rate picks from: fps first, then chroma,
+    /// then resolution.
+    ladder: Ladder,
+    /// The full-quality fit size (the client's view); the active stream is
+    /// this scaled by the ladder level.
+    base_stream: (u32, u32),
+    /// The chroma the handshake negotiated; a ladder level may reduce the
+    /// active `chroma` to Single420.
+    base_chroma: ChromaMode,
+    /// The fps cap in the last StreamConfig, so a pace-only level change
+    /// still reaches the client.
+    sent_fps_cap: u32,
     cursor_shape_id: u32,
 }
+
+/// The session-wide fps ceiling; ladder levels cap below it.
+const MAX_FPS: u32 = 60;
+/// Still-picture refinement: at most this many re-encodes of an unchanged
+/// frame, at least this far apart.
+const MAX_REFINES: u8 = 8;
+const REFINE_EVERY: Duration = Duration::from_millis(200);
+/// A static screen produces no damage and so no first frame; after this
+/// long the capture is torn down and retried once with full damage.
+const FIRST_FRAME_DEADLINE: Duration = Duration::from_millis(700);
+/// The starting ladder level: 30 fps, full quality. It halves the first
+/// burst against level 0 while the controller measures available capacity.
+const START_LEVEL: usize = 1;
 
 impl Session {
     async fn on_client_msg(&mut self, msg: ClientMsg) -> Result<ControlFlow<()>> {
         match msg {
             ClientMsg::Bye => return Ok(ControlFlow::Break(())),
-            ClientMsg::FrameAck {
-                frame_id,
-                decoded_at_ms,
-            } => {
-                self.in_flight = self.in_flight.saturating_sub(1);
-                self.rtt.record(frame_id, decoded_at_ms);
-                let n_limit = self.rtt.window(self.settings.framerate);
-                if n_limit != self.n_limit {
+            ClientMsg::FrameAck { frame_id, .. } => {
+                let now = Instant::now();
+                self.link.on_ack(now, frame_id);
+                if let Some(reason) = self.ctl.on_ack(now, &mut self.link) {
                     tracing::debug!(
-                        rtt_ms = format!("{:.1}", self.rtt.smoothed_ms),
-                        n_limit,
-                        "ack window changed"
+                        ?reason,
+                        target = self.ctl.target(),
+                        fps_cmd = self.fps_cmd,
+                        rate_mbit = self
+                            .link
+                            .rate_max_bps(now)
+                            .map(|r| format!("{:.2}", r / 1e6)),
+                        queueing_ms = self.link.base_rtt_ms(now).map(|b| format!("{b:.0}")),
+                        mdev_ms = format!("{:.0}", self.link.mdev_ms()),
+                        inflight = self.link.inflight_bytes(),
+                        cap = self.link.cap_bytes(now, self.ctl.is_slow_start()),
+                        "rate changed"
                     );
-                    self.n_limit = n_limit;
+                    self.apply_rate();
                 }
-                if let Some(bitrate) = self.bitrate_ctl.on_ack(self.rtt.smoothed_ms) {
-                    self.settings.bitrate = bitrate;
-                    self.encoder.set_bitrate(bitrate);
+                if self.pending.is_none() && self.link.inflight_bytes() == 0 {
+                    self.ctl.note_idle(now);
+                }
+                let dual = self.base_chroma == ChromaMode::Dual420;
+                let can_drop_aux = self.can_drop_aux();
+                let pixels = self.base_stream.0 as u64 * self.base_stream.1 as u64;
+                if let Some(level) = self.ladder.consider(
+                    now,
+                    &self.link,
+                    self.ctl.is_slow_start(),
+                    self.ctl.congested_recently(now),
+                    pixels,
+                    dual,
+                    can_drop_aux,
+                    MAX_FPS,
+                ) {
+                    tracing::info!(
+                        level,
+                        fps_cap = self.fps_cap(),
+                        rate_mbit = self
+                            .link
+                            .rate_max_bps(now)
+                            .map(|r| format!("{:.2}", r / 1e6)),
+                        delivered_fps = format!("{:.1}", self.link.delivered_fps(now)),
+                        "ladder step"
+                    );
+                    if self.apply_stream_params()? {
+                        self.send_config();
+                    }
                 }
             }
             ClientMsg::RequestKeyframe => self.want_keyframe = true,
@@ -452,6 +577,10 @@ impl Session {
                 },
                 Vec::new(),
             ),
+            ClientMsg::Pong { t } => {
+                let rtt_ms = now_ms().saturating_sub(t) as f64;
+                self.link.seed_rtt(Instant::now(), rtt_ms);
+            }
             // The reader task routes clipboard messages to the Bridge.
             ClientMsg::ClipboardData { .. }
             | ClientMsg::ClipboardOffer { .. }
@@ -509,52 +638,36 @@ impl Session {
         // so the logical size is whole; wait for it and use what it chose.
         let applied = self.wait_for_mode(width, height, scale).await;
         if !same_size {
-            let stream = EncoderSettings::fit_extent(width, height, self.encoder_max);
-            if stream != (width, height) {
+            let base = EncoderSettings::fit_extent(width, height, self.encoder_max);
+            if base != (width, height) {
                 tracing::info!(
-                    width = stream.0,
-                    height = stream.1,
+                    width = base.0,
+                    height = base.1,
                     "scaling the stream to the encoder maximum"
                 );
             }
-            self.bitrate_ctl
-                .retarget(EncoderSettings::default_bitrate(stream.0, stream.1, 60));
-            let settings = encoder_settings(stream.0, stream.1, self.bitrate_ctl.current());
-            match VideoEncoder::new(&self.video, &settings, self.chroma == ChromaMode::Dual420) {
-                Ok(encoder) => {
-                    self.encoder = encoder;
-                    self.settings = settings;
-                    self.output.width = width;
-                    self.output.height = height;
-                    self.stream = stream;
-                    self.pending = None;
-                    self.want_keyframe = true;
-                }
-                Err(e) => {
-                    // Keep streaming at the old size rather than end the session.
-                    tracing::warn!(error = %e, width, height, "encoder rejected the new size; keeping the old one");
-                    let (w, h, s) = (self.output.width, self.output.height, self.output.scale);
-                    self.instance
-                        .set_monitor_mode(&self.output.name, w, h, 60, s)
-                        .ok();
-                    self.wait_for_mode(w, h, s).await;
-                    self.inject(self.output.logical_extent());
-                    return Ok(());
-                }
+            let old_base = self.base_stream;
+            let (old_w, old_h) = (self.output.width, self.output.height);
+            self.base_stream = base;
+            self.output.width = width;
+            self.output.height = height;
+            if !self.apply_stream_params()? {
+                // Keep streaming at the old size rather than end the session.
+                self.base_stream = old_base;
+                self.output.width = old_w;
+                self.output.height = old_h;
+                let s = self.output.scale;
+                self.instance
+                    .set_monitor_mode(&self.output.name, old_w, old_h, 60, s)
+                    .ok();
+                self.wait_for_mode(old_w, old_h, s).await;
+                self.inject(self.output.logical_extent());
+                return Ok(());
             }
         }
         self.output.scale = applied;
         self.inject(self.output.logical_extent());
-        self.writer.send(
-            stream_config(
-                self.codec,
-                self.chroma,
-                self.video.pipeline(),
-                &self.output,
-                self.stream,
-            ),
-            Vec::new(),
-        );
+        self.send_config();
         Ok(())
     }
 
@@ -564,46 +677,27 @@ impl Session {
     fn fit_mirror(&mut self, win_w: u32, win_h: u32) -> Result<()> {
         let (ow, oh) = (self.output.width as f64, self.output.height as f64);
         let fit = (win_w as f64 / ow).min(win_h as f64 / oh).min(1.0);
-        let stream = EncoderSettings::fit_extent(
+        let base = EncoderSettings::fit_extent(
             ((ow * fit).round() as u32).max(2) & !1,
             ((oh * fit).round() as u32).max(2) & !1,
             self.encoder_max,
         );
-        if stream == self.stream {
+        if base == self.base_stream {
             return Ok(());
         }
-        self.bitrate_ctl
-            .retarget(EncoderSettings::default_bitrate(stream.0, stream.1, 60));
-        let settings = encoder_settings(stream.0, stream.1, self.bitrate_ctl.current());
-        match VideoEncoder::new(&self.video, &settings, self.chroma == ChromaMode::Dual420) {
-            Ok(encoder) => {
-                tracing::info!(
-                    width = stream.0,
-                    height = stream.1,
-                    "scaling the mirrored screen to the window"
-                );
-                self.encoder = encoder;
-                self.settings = settings;
-                self.stream = stream;
-                self.pending = None;
-                self.want_keyframe = true;
-                self.writer.send(
-                    stream_config(
-                        self.codec,
-                        self.chroma,
-                        self.video.pipeline(),
-                        &self.output,
-                        self.stream,
-                    ),
-                    Vec::new(),
-                );
-                Ok(())
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "encoder rejected the fitted size; keeping the current one");
-                Ok(())
-            }
+        tracing::info!(
+            width = base.0,
+            height = base.1,
+            "scaling the mirrored screen to the window"
+        );
+        let old_base = self.base_stream;
+        self.base_stream = base;
+        if self.apply_stream_params()? {
+            self.send_config();
+        } else {
+            self.base_stream = old_base;
         }
+        Ok(())
     }
 
     /// Poll until the output reports the requested mode (Hyprland applies it
@@ -648,16 +742,10 @@ impl Session {
                     let previous_stream = self.stream;
                     self.fit_mirror(self.client_extent.0, self.client_extent.1)?;
                     if self.stream == previous_stream {
-                        self.writer.send(
-                            stream_config(
-                                self.codec,
-                                self.chroma,
-                                self.video.pipeline(),
-                                &self.output,
-                                self.stream,
-                            ),
-                            Vec::new(),
-                        );
+                        // Same fitted size, but the output (and so the
+                        // effective scale) changed: tell the client and
+                        // restart from a keyframe.
+                        self.send_config();
                         self.want_keyframe = true;
                     }
                     tracing::info!(width = size.0, height = size.1, "mirrored output resized");
@@ -708,38 +796,256 @@ impl Session {
         Ok(ControlFlow::Continue(()))
     }
 
-    /// Encode and queue the pending frame if the client has ack capacity and
-    /// the writer has no queued frame, then ask the capture thread for the
-    /// next one.
+    /// Encode and queue the pending frame if the link has room and the pace
+    /// slot is due, then ask the capture thread for the next one.
     fn pump_encoder(&mut self) -> Result<()> {
-        // Count a blocked frame once, not once per event-loop pass.
-        if self.pending.is_some() && self.stalled() && !self.blocked_noted {
-            self.bitrate_ctl.note_blocked();
+        let now = Instant::now();
+        // Only a wait on the byte cap is congestion; count it once per
+        // frame. A wait on the pace timer or the writer queue is not (the
+        // writer has its own report-duration signal).
+        if self.pending.is_some()
+            && !self.blocked_noted
+            && self.writer.video_ready()
+            && !self.byte_cap_has_room(now)
+        {
+            self.ctl.note_blocked_at_cap();
             self.blocked_noted = true;
         }
-        if !self.stalled() {
+        if self.link_has_room() && now >= self.next_send_at {
             if let Some(frame) = self.pending.take() {
                 // A frame captured before a resize took effect is stale.
-                let info = &frame.buffer.info;
-                if (info.width & !1, info.height & !1) == (self.output.width, self.output.height) {
-                    self.encode_and_send(&frame)?;
+                if self.matches_output(&frame) {
+                    self.encode_and_send(&frame, false)?;
+                    // Keep the frame: an idle link refines the still picture
+                    // toward sharp, and a ladder step re-keyframes it at once.
+                    self.last_frame = Some(frame);
+                    self.refines = 0;
+                    self.next_refine_at = now + REFINE_EVERY;
+                }
+            } else if now >= self.next_refine_at && self.refines < MAX_REFINES {
+                if let Some(frame) = self.last_frame.take() {
+                    if self.matches_output(&frame) {
+                        // Re-encode the same buffer (import-cache hit) so a
+                        // frame that arrived soft under a low budget
+                        // converges to sharp while nothing changes on screen.
+                        let bytes = self.encode_and_send(&frame, true)?;
+                        self.refines += 1;
+                        self.next_refine_at = now + REFINE_EVERY;
+                        if (bytes as f64) < self.refined_done_bytes() {
+                            // Converged: keep the frame for ladder steps,
+                            // stop spending link on it.
+                            self.refines = MAX_REFINES;
+                        } else {
+                            tracing::debug!(bytes, n = self.refines, "refined still frame");
+                        }
+                        self.last_frame = Some(frame);
+                    }
                 }
             }
         }
-        if !self.capture_asked && self.pending.is_none() && !self.stalled() {
+        // Keep one capture request outstanding even while blocked: a newer
+        // frame replaces `pending` (latest wins), so the frame that finally
+        // goes out on a slow link is current, not as old as the stall.
+        if !self.capture_asked {
             self.capturer.request_frame().ok();
             self.capture_asked = true;
         }
         Ok(())
     }
 
-    /// The pacing gate: every allowed frame is unacked, or a frame write is
-    /// still in the writer's queue.
-    fn stalled(&self) -> bool {
-        self.in_flight >= self.n_limit || !self.writer.video_ready()
+    /// Room on the link: no frame in the writer queue and the bytes in
+    /// flight stay under the cap. The pace timer is checked separately.
+    fn link_has_room(&self) -> bool {
+        self.writer.video_ready() && self.byte_cap_has_room(Instant::now())
     }
 
-    fn encode_and_send(&mut self, frame: &CapturedFrame) -> Result<()> {
+    fn byte_cap_has_room(&self, now: Instant) -> bool {
+        self.link.inflight_bytes() == 0
+            || self.link.inflight_bytes() + self.link.est_frame_bytes()
+                <= self.link.cap_bytes(now, self.ctl.is_slow_start())
+    }
+
+    fn frame_interval(&self) -> Duration {
+        Duration::from_secs_f64(1.0 / self.fps_cmd.max(1) as f64)
+    }
+
+    /// A frame captured before a resize took effect is stale. The check is
+    /// against the CAPTURE-native (output) size, never the fitted stream
+    /// size: a mirrored capture keeps output dimensions while its stream is
+    /// fitted smaller.
+    fn matches_output(&self, frame: &CapturedFrame) -> bool {
+        let info = &frame.buffer.info;
+        (info.width & !1, info.height & !1) == (self.output.width, self.output.height)
+    }
+
+    /// A refinement pass that codes below this many bytes changed nothing
+    /// worth sending: the still picture has converged.
+    fn refined_done_bytes(&self) -> f64 {
+        let streams = if self.chroma == ChromaMode::Dual420 {
+            2.0
+        } else {
+            1.0
+        };
+        0.2 * self.ctl.budget_per_frame(self.fps_cmd) as f64 * streams / 8.0
+    }
+
+    /// When the refinement timer should next fire, bounded by the pace.
+    fn refine_wake(&self) -> Instant {
+        self.next_refine_at.max(self.next_send_at)
+    }
+
+    fn can_refine(&self) -> bool {
+        self.pending.is_none()
+            && self.last_frame.is_some()
+            && self.refines < MAX_REFINES
+            && self.link_has_room()
+    }
+
+    /// The ladder level's frame-rate ceiling, bounded by the session's.
+    fn fps_cap(&self) -> u32 {
+        self.ladder.level().fps_cap.min(MAX_FPS)
+    }
+
+    /// A rung may only drop the auxiliary stream when the client can
+    /// decode Single420; a Dual420-only client keeps both streams on every
+    /// rung.
+    fn can_drop_aux(&self) -> bool {
+        self.caps.chroma.contains(&ChromaMode::Single420)
+    }
+
+    /// The chroma the current ladder level allows, within what the client
+    /// advertised.
+    fn active_chroma(&self) -> ChromaMode {
+        if self.ladder.level().aux || !self.can_drop_aux() {
+            self.base_chroma
+        } else {
+            ChromaMode::Single420
+        }
+    }
+
+    /// One commanded cadence: the ladder's cap bounded by what the encoder
+    /// can sustain.
+    fn update_fps_cmd(&mut self) {
+        let sustainable = if self.encode_us > 0.0 {
+            (1e6 / (self.encode_us * 1.1)).clamp(5.0, MAX_FPS as f64) as u32
+        } else {
+            MAX_FPS
+        };
+        self.fps_cmd = self.fps_cap().min(sustainable).max(1);
+    }
+
+    /// Tell the client the active stream, view and fps cap.
+    fn send_config(&mut self) {
+        self.sent_fps_cap = self.fps_cap();
+        self.writer.send(
+            stream_config(
+                self.codec,
+                self.chroma,
+                self.video.pipeline(),
+                &self.output,
+                self.stream,
+                self.base_stream,
+                self.sent_fps_cap,
+            ),
+            Vec::new(),
+        );
+    }
+
+    /// The single choke point for stream geometry: derive the active stream
+    /// from the full-quality fit size (`base_stream`) and the ladder level.
+    /// A change of size or chroma rebuilds the encoder; an fps-only change
+    /// updates the rate without one. Returns false when the encoder
+    /// rejected the geometry; the caller sends the StreamConfig on success.
+    fn apply_stream_params(&mut self) -> Result<bool> {
+        self.update_fps_cmd();
+        let level = self.ladder.level();
+        let chroma = self.active_chroma();
+        let want = EncoderSettings::fit_extent(
+            ((self.base_stream.0 as f32 * level.scale) as u32).max(2) & !1,
+            ((self.base_stream.1 as f32 * level.scale) as u32).max(2) & !1,
+            self.encoder_max,
+        );
+        if want == self.stream && chroma == self.chroma {
+            self.apply_rate();
+            return Ok(true);
+        }
+        let streams = if chroma == ChromaMode::Dual420 { 2 } else { 1 };
+        self.ctl
+            .reconfigure(want.0 as u64 * want.1 as u64, streams, MAX_FPS);
+        let settings = encoder_settings(
+            want.0,
+            want.1,
+            self.ctl.stream_bitrate(),
+            self.fps_cmd,
+            self.ctl.vbv_ms(self.fps_cmd),
+        );
+        match VideoEncoder::new(&self.video, &settings, chroma == ChromaMode::Dual420) {
+            Ok(encoder) => {
+                tracing::info!(
+                    width = want.0,
+                    height = want.1,
+                    ?chroma,
+                    fps_cap = self.fps_cap(),
+                    level = self.ladder.index(),
+                    "stream reconfigured"
+                );
+                self.encoder = encoder;
+                self.settings = settings;
+                self.stream = want;
+                self.chroma = chroma;
+                // `pending` stays: a captured frame is output-sized, and a
+                // ladder change does not touch the output. Dropping it here
+                // would freeze the screen on its previous content whenever a
+                // step lands just before the screen goes still (the pump's
+                // matches_output check handles real output changes).
+                self.want_keyframe = true;
+                self.encode_us = 0.0;
+                // The kept still frame produces the new config's keyframe at
+                // once, even when nothing changes on screen.
+                self.refines = 0;
+                self.next_refine_at = Instant::now();
+                Ok(true)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, width = want.0, height = want.1, "encoder rejected the size; keeping the current one");
+                Ok(false)
+            }
+        }
+    }
+
+    /// Fold one encode's duration into the sustainable-fps estimate and
+    /// re-apply the rate when the commanded cadence moved by more than 15%.
+    fn note_encode_time(&mut self, enc_us: f64) {
+        self.encode_us = if self.encode_us == 0.0 {
+            enc_us
+        } else {
+            0.8 * self.encode_us + 0.2 * enc_us
+        };
+        let before = self.fps_cmd;
+        self.update_fps_cmd();
+        let moved = (self.fps_cmd as f64 - before as f64).abs() / before.max(1) as f64;
+        if moved > 0.15 {
+            self.apply_rate();
+        } else {
+            self.fps_cmd = before;
+        }
+    }
+
+    /// Program the encoder with the current target at the commanded cadence,
+    /// so bits per frame match the frames that really leave.
+    fn apply_rate(&mut self) {
+        let bitrate = self.ctl.stream_bitrate();
+        let vbv = self.ctl.vbv_ms(self.fps_cmd);
+        self.settings.bitrate = bitrate;
+        self.settings.framerate = self.fps_cmd;
+        self.settings.vbv_ms = vbv;
+        self.encoder.set_rate(bitrate, self.fps_cmd, vbv);
+    }
+
+    /// Encode `frame` and queue it; returns the coded byte count.
+    /// `app_limited` marks a send that does not use the capacity we have
+    /// (a refinement pass), so it cannot lower the rate estimate.
+    fn encode_and_send(&mut self, frame: &CapturedFrame, app_limited: bool) -> Result<usize> {
         let (width, height) = self.stream;
         let key = std::mem::take(&mut self.want_keyframe);
         let t0 = Instant::now();
@@ -765,16 +1071,31 @@ impl Session {
             main = encoded.main.len(),
             aux = aux.len(),
             enc_us,
-            in_flight = self.in_flight,
-            n_limit = self.n_limit,
+            inflight_bytes = self.link.inflight_bytes(),
             "queued frame"
         );
+        let total = encoded.main.len() + aux.len();
+        // A frame that neither waited on the byte cap nor fills the pipe is
+        // app-limited: its delivery rate reflects the content (a quiet
+        // screen codes tiny frames), not what the link could carry. Such
+        // samples may only raise the rate estimate.
+        let now = Instant::now();
+        let cap = self.link.cap_bytes(now, self.ctl.is_slow_start());
+        let app_limited = app_limited
+            || (!self.blocked_noted
+                && self.link.inflight_bytes() + total as u64 + self.link.est_frame_bytes() <= cap);
         self.writer.send(msg, vec![encoded.main, aux]);
-        self.rtt.on_sent(self.frame_id);
-        self.bitrate_ctl.note_sent();
+        self.ctl.note_frame_sent(now);
+        self.link.on_sent(t0, self.frame_id, total, app_limited);
+        self.note_encode_time(enc_us as f64);
+        // Pace from the encode start so a slow encode adds no extra wait;
+        // after an idle gap or a stall the cadence restarts one interval
+        // after this encode, so resuming never sends a burst.
+        let interval = self.frame_interval();
+        self.next_send_at = (self.next_send_at + interval).max(t0 + interval);
+        self.blocked_noted = false;
         self.frame_id += 1;
-        self.in_flight += 1;
-        Ok(())
+        Ok(total)
     }
 }
 
@@ -849,10 +1170,23 @@ impl VideoEncoder {
         }
     }
 
-    fn set_bitrate(&mut self, bitrate: u32) {
+    /// Change the CBR target, the frame rate it is spread over, and (GPU
+    /// only) the rate-control buffer window, from the next frame on. The
+    /// CPU encoder has no VBV knob; OpenH264 manages its own buffer. It
+    /// also cannot change its rate live — every change re-creates the
+    /// encoders and costs a keyframe — so small bitrate moves (the
+    /// controller's ~8%/s growth steps) are skipped until they add up to
+    /// 10%, bounding rebuilds to roughly one per second while growing.
+    fn set_rate(&mut self, bitrate: u32, framerate: u32, vbv_ms: u32) {
         match self {
-            Self::Gpu(enc) => enc.set_bitrate(bitrate),
-            Self::Cpu(enc) => enc.set_bitrate(bitrate),
+            Self::Gpu(enc) => enc.set_rate(bitrate, framerate, vbv_ms),
+            Self::Cpu(enc) => {
+                let s = enc.settings();
+                let moved = (bitrate as f64 - s.bitrate as f64).abs() / s.bitrate.max(1) as f64;
+                if moved >= 0.10 || framerate != s.framerate {
+                    enc.set_rate(bitrate, framerate);
+                }
+            }
         }
     }
 
@@ -952,6 +1286,8 @@ fn stream_config(
     pipeline: VideoPipeline,
     output: &SessionOutput,
     stream: (u32, u32),
+    view: (u32, u32),
+    fps_cap: u32,
 ) -> ServerMsg {
     // The scale the client divides stream pixels by to reach the remote's
     // logical space: the output scale times any downscale of the stream.
@@ -966,15 +1302,25 @@ fn stream_config(
         scale_milli: (effective_scale * 1000.0).round() as u32,
         extradata: Vec::new(),
         aux_extradata: None,
+        view_width: view.0,
+        view_height: view.1,
+        fps_cap,
     }
 }
 
-fn encoder_settings(width: u32, height: u32, bitrate: u32) -> EncoderSettings {
+fn encoder_settings(
+    width: u32,
+    height: u32,
+    bitrate: u32,
+    fps: u32,
+    vbv_ms: u32,
+) -> EncoderSettings {
     EncoderSettings {
         width,
         height,
         bitrate,
-        framerate: 60,
+        framerate: fps,
+        vbv_ms,
     }
 }
 
@@ -1065,6 +1411,9 @@ fn start_capture(
     cc.target = target.clone();
     cc.render_node = render_node.to_path_buf();
     cc.cursor = true;
+    // One extra ring slot: the session pins the last sent frame for
+    // still-picture refinement.
+    cc.buffers = 4;
     let sink = Box::new(move |ev: CaptureEvent| {
         let msg = match ev {
             CaptureEvent::Frame(frame) => Incoming::Frame(frame),
@@ -1101,161 +1450,4 @@ fn start_input(target: &Target, output: &str, keymap: &str) -> Result<Input> {
     ic.keymap = (!keymap.is_empty()).then(|| keymap.to_string());
     tracing::debug!(bytes = keymap.len(), "client keymap");
     Ok(Input::start(ic, Box::new(|_| {}))?)
-}
-
-/// Smoothed ack round-trip time, driving how many frames may be unacked.
-struct RttEstimator {
-    sent: VecDeque<(u64, Instant)>,
-    smoothed_ms: f64,
-}
-
-/// Adapts the CBR target to the path. The ack RTT is the signal: its
-/// minimum is the base delay, growth over the base is queueing; a queue or
-/// a starved send window cuts the rate, a quiet path grows it back slowly.
-struct BitrateController {
-    min: u32,
-    max: u32,
-    current: u32,
-    /// Set by `--bitrate`: the target does not follow the stream size.
-    fixed: bool,
-    base_rtt_ms: f64,
-    last_eval: Instant,
-    last_change: Instant,
-    sent: u32,
-    blocked: u32,
-}
-
-impl BitrateController {
-    const EVAL_EVERY: Duration = Duration::from_millis(500);
-    const GROW_AFTER: Duration = Duration::from_secs(2);
-    const QUEUE_HIGH_MS: f64 = 50.0;
-    const QUEUE_LOW_MS: f64 = 15.0;
-
-    fn new(max: u32, fixed: bool) -> Self {
-        let now = Instant::now();
-        Self {
-            min: (max / 8).max(1_000_000).min(max),
-            max,
-            current: max,
-            fixed,
-            base_rtt_ms: f64::MAX,
-            last_eval: now,
-            last_change: now,
-            sent: 0,
-            blocked: 0,
-        }
-    }
-
-    fn current(&self) -> u32 {
-        self.current
-    }
-
-    /// The stream size changed: keep the same share of the new ceiling, so
-    /// bits per pixel stay constant across a resize.
-    fn retarget(&mut self, max: u32) {
-        if self.fixed || max == self.max {
-            return;
-        }
-        let share = self.current as f64 / self.max as f64;
-        self.max = max;
-        self.min = (max / 8).max(1_000_000).min(max);
-        self.current = ((max as f64 * share) as u32).clamp(self.min, self.max);
-    }
-
-    fn note_sent(&mut self) {
-        self.sent += 1;
-    }
-
-    /// A frame is waiting because every allowed frame is still unacked.
-    fn note_blocked(&mut self) {
-        self.blocked += 1;
-    }
-
-    /// Feed the smoothed ack RTT; returns a new target when it changes.
-    fn on_ack(&mut self, smoothed_ms: f64) -> Option<u32> {
-        self.base_rtt_ms = self.base_rtt_ms.min(smoothed_ms);
-        let now = Instant::now();
-        if now.duration_since(self.last_eval) < Self::EVAL_EVERY {
-            return None;
-        }
-        self.last_eval = now;
-        // Let the base drift up slowly so a path change is re-learned.
-        self.base_rtt_ms += 0.5;
-        let queueing = smoothed_ms - self.base_rtt_ms;
-        let starved = self.sent > 0 && self.blocked > self.sent;
-        let (sent, blocked) = (self.sent, self.blocked);
-        self.sent = 0;
-        self.blocked = 0;
-        let next = if queueing > Self::QUEUE_HIGH_MS || starved {
-            (self.current / 4 * 3).max(self.min)
-        } else if queueing < Self::QUEUE_LOW_MS
-            && now.duration_since(self.last_change) >= Self::GROW_AFTER
-        {
-            (self.current / 10 * 11).min(self.max)
-        } else {
-            self.current
-        };
-        if next == self.current {
-            return None;
-        }
-        tracing::info!(
-            from = self.current,
-            to = next,
-            queueing_ms = format!("{queueing:.1}"),
-            sent,
-            blocked,
-            "adapting bitrate"
-        );
-        self.current = next;
-        self.last_change = now;
-        Some(next)
-    }
-}
-
-impl RttEstimator {
-    fn new() -> Self {
-        Self {
-            sent: VecDeque::new(),
-            smoothed_ms: 30.0,
-        }
-    }
-
-    fn on_sent(&mut self, frame_id: u64) {
-        self.sent.push_back((frame_id, Instant::now()));
-    }
-
-    fn record(&mut self, _frame_id: u64, _decoded_at_ms: u64) {
-        // We approximate RTT from when we noticed the ack, not the client clock,
-        // which avoids clock-skew: use the gap since the last ack as a proxy.
-        let now = Instant::now();
-        if let Some((_, t)) = self.sent.pop_front() {
-            let sample = now.duration_since(t).as_secs_f64() * 1000.0;
-            self.smoothed_ms = 0.875 * self.smoothed_ms + 0.125 * sample.min(1000.0);
-        }
-    }
-
-    fn window(&self, framerate: u32) -> u32 {
-        let interval_ms = 1000.0 / framerate.max(1) as f64;
-        let n = (self.smoothed_ms / interval_ms).ceil() as i64 + 1;
-        n.clamp(2, 8) as u32
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::RttEstimator;
-
-    #[test]
-    fn ack_window_stays_in_bounds() {
-        let rtt = RttEstimator::new();
-        // With the default smoothed RTT the window is at least 2 and never
-        // exceeds 8, for any frame rate.
-        for fps in [1u32, 30, 60, 240] {
-            let n = rtt.window(fps);
-            assert!(
-                (2..=8).contains(&n),
-                "window {n} out of bounds at {fps} fps"
-            );
-        }
-    }
 }

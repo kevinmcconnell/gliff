@@ -43,7 +43,13 @@ use hypr_wl::{LoopState, Outputs, Seat, Target};
 
 pub enum Cmd {
     RequestFrame,
-    Release { index: usize, generation: u64 },
+    /// Abandon the in-flight capture and start a fresh one with full
+    /// damage, for a first frame the compositor never completed.
+    Recapture,
+    Release {
+        index: usize,
+        generation: u64,
+    },
     Stop,
 }
 
@@ -293,6 +299,14 @@ impl LoopState for State {
     fn on_cmd(&mut self, cmd: Cmd) {
         match cmd {
             Cmd::RequestFrame => {
+                self.want_frame = true;
+                self.maybe_capture();
+            }
+            Cmd::Recapture => {
+                if let Some((frame, _)) = self.in_flight.take() {
+                    // Its slot was never marked busy, so it is reused.
+                    frame.destroy();
+                }
                 self.want_frame = true;
                 self.maybe_capture();
             }

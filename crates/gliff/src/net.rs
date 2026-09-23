@@ -26,14 +26,33 @@ use tokio::sync::mpsc::{self, unbounded_channel, UnboundedReceiver};
 use crate::clipboard::{Bridge, ToWorker};
 use crate::keymap::{Keymap, FIRST_KEYMAP_WAIT};
 
-/// Status/telemetry the worker reports to the UI.
+/// Stream geometry one picture was configured under: stream size, view
+/// size, and the effective scale x1000.
+type Geometry = ((u32, u32), (u32, u32), u32);
+
+/// A decoded frame with the geometry it was configured under, so the UI
+/// never paints a frame with another configuration's view or scale (frames
+/// and statuses travel on separate channels).
+pub struct Picture {
+    pub frame: Frame,
+    /// Stream size in physical pixels.
+    pub stream: (u32, u32),
+    /// The full-quality fit size the frame should be drawn into.
+    pub view: (u32, u32),
+    /// Effective stream scale x1000 for pointer mapping.
+    pub scale_milli: u32,
+}
+
+/// Status/telemetry the worker reports to the UI. Pointer-mapping geometry
+/// is deliberately absent: it travels with each `Picture`, so the UI never
+/// maps clicks against a configuration whose frame is not on screen yet.
 pub enum Status {
     Connected {
-        width: u32,
-        height: u32,
-        scale_milli: u32,
         /// "server pipeline > client pipeline", e.g. "gpu > cpu".
         video: String,
+        view_width: u32,
+        view_height: u32,
+        fps_cap: u32,
     },
     Stats {
         fps: f32,
@@ -92,7 +111,7 @@ pub struct Worker {
     pub video: VideoMode,
     /// Bounded so a stalled UI thread cannot make the decoder buffer frames
     /// without limit; when full, the newest frame is dropped (latest-wins).
-    pub frames: SyncSender<Frame>,
+    pub frames: SyncSender<Picture>,
     pub status: StdSender<Status>,
     pub input: UnboundedReceiver<ToWorker>,
     pub keymap: Keymap,
@@ -196,7 +215,7 @@ async fn session<R, W>(
     rd: R,
     wr: W,
     video: VideoMode,
-    frames: SyncSender<Frame>,
+    frames: SyncSender<Picture>,
     status: StdSender<Status>,
     mut input: UnboundedReceiver<ToWorker>,
     mut keymap: Keymap,
@@ -235,30 +254,54 @@ where
         })
         .await?;
 
-    let ack = reader.read_msg::<ServerMsg>().await?;
-    let ServerMsg::HelloAck { .. } = ack else {
-        anyhow::bail!("expected HelloAck, got {ack:?}");
-    };
-    let cfg = reader.read_msg::<ServerMsg>().await?;
-    let (width, height, chroma, scale_milli, pipeline) = match cfg {
-        ServerMsg::StreamConfig {
-            width,
-            height,
-            chroma,
-            scale_milli,
-            pipeline,
-            ..
-        } => (width, height, chroma, scale_milli, pipeline),
-        other => anyhow::bail!("expected StreamConfig, got {other:?}"),
+    // Between HelloAck and StreamConfig the server may send a Ping; answer
+    // it before anything else (even GPU setup) so the server's round-trip
+    // estimate is seeded ahead of the first frame ack.
+    let mut got_ack = false;
+    let (mut width, mut height, mut chroma, mut scale_milli, pipeline, mut view, mut fps_cap) = loop {
+        match reader.read_msg::<ServerMsg>().await? {
+            ServerMsg::HelloAck { version, .. } => {
+                if version != PROTOCOL_VERSION {
+                    anyhow::bail!("server version {version} != {PROTOCOL_VERSION}");
+                }
+                got_ack = true;
+            }
+            ServerMsg::Ping { t } => writer.write_msg(&ClientMsg::Pong { t }).await?,
+            ServerMsg::StreamConfig {
+                width,
+                height,
+                chroma,
+                scale_milli,
+                pipeline,
+                view_width,
+                view_height,
+                fps_cap,
+                ..
+            } if got_ack => {
+                break (
+                    width,
+                    height,
+                    chroma,
+                    scale_milli,
+                    pipeline,
+                    (view_width, view_height),
+                    fps_cap,
+                )
+            }
+            ServerMsg::Error { code, message } => {
+                anyhow::bail!("server error {code}: {message}")
+            }
+            other => anyhow::bail!("unexpected message before StreamConfig: {other:?}"),
+        }
     };
     let mut decoder = new_decoder(&gpu, chroma, width, height)?;
     let local = if gpu.is_some() { "gpu" } else { "cpu" };
     let mut video_label = format!("{} > {}", pipeline.label(), local);
     let _ = status.send(Status::Connected {
-        width,
-        height,
-        scale_milli,
         video: video_label.clone(),
+        view_width: view.0,
+        view_height: view.1,
+        fps_cap,
     });
     let decode_on = gpu.as_ref().map_or("cpu", |g| g.name.as_str());
     tracing::info!(width, height, scale_milli, decode_on, video = %video_label, "connected");
@@ -349,7 +392,12 @@ where
     // rejected is retried at the same cadence.
     const IDLE_DRAIN: std::time::Duration = std::time::Duration::from_millis(150);
     let mut drain_at = tokio::time::Instant::now() + IDLE_DRAIN;
-    let mut undelivered: Option<Frame> = None;
+    let mut undelivered: Option<Picture> = None;
+    // Geometry of the access units inside the decoder, oldest first. The CPU
+    // decoder returns the PREVIOUS access unit's picture, and a scale-only
+    // config can land in between: a picture must carry the geometry of the
+    // config it was encoded under, not whatever is current when it emerges.
+    let mut in_decoder: std::collections::VecDeque<Geometry> = std::collections::VecDeque::new();
     loop {
         let read = tokio::select! {
             read = reader.read_msg::<ServerMsg>() => read,
@@ -359,11 +407,21 @@ where
                     || matches!(&decoder, VideoDecoder::Cpu(d) if d.has_pending()) =>
             {
                 drain_at = tokio::time::Instant::now() + IDLE_DRAIN;
-                let frame = match undelivered.take() {
-                    Some(frame) => Some(frame),
+                let picture = match undelivered.take() {
+                    Some(picture) => Some(picture),
                     None => match &mut decoder {
                         VideoDecoder::Cpu(d) => match d.flush() {
-                            Ok(frame) => frame.map(Frame::Bgra),
+                            Ok(frame) => frame.map(|f| {
+                                let (stream, view, scale_milli) = in_decoder
+                                    .pop_front()
+                                    .unwrap_or(((width, height), view, scale_milli));
+                                Picture {
+                                    frame: Frame::Bgra(f),
+                                    stream,
+                                    view,
+                                    scale_milli,
+                                }
+                            }),
                             Err(e) => {
                                 tracing::warn!(error = %e, "idle drain failed");
                                 None
@@ -372,11 +430,11 @@ where
                         VideoDecoder::Gpu(_) => None,
                     },
                 };
-                if let Some(frame) = frame {
-                    if let Err(std::sync::mpsc::TrySendError::Full(frame)) =
-                        frames.try_send(frame)
+                if let Some(picture) = picture {
+                    if let Err(std::sync::mpsc::TrySendError::Full(picture)) =
+                        frames.try_send(picture)
                     {
-                        undelivered = Some(frame);
+                        undelivered = Some(picture);
                     }
                 }
                 continue;
@@ -403,6 +461,7 @@ where
                 };
                 bytes_since += (data_len + aux_len) as u64;
                 drain_at = tokio::time::Instant::now() + IDLE_DRAIN;
+                in_decoder.push_back(((width, height), view, scale_milli));
                 let t0 = std::time::Instant::now();
                 let decoded = match &mut decoder {
                     VideoDecoder::Gpu(d) => d
@@ -431,40 +490,74 @@ where
                         }
                         // Latest-wins: a frame the full UI channel rejects
                         // waits in `undelivered` (superseding any drained
-                        // one) and is retried at the drain cadence.
-                        match frames.try_send(frame) {
+                        // one) and is retried at the drain cadence. The
+                        // geometry travels with the frame, taken from the
+                        // access unit that produced this picture (the GPU
+                        // decoder returns the one just fed; the CPU decoder
+                        // returns the previous one).
+                        let (stream, pic_view, pic_scale) =
+                            in_decoder
+                                .pop_front()
+                                .unwrap_or(((width, height), view, scale_milli));
+                        let picture = Picture {
+                            frame,
+                            stream,
+                            view: pic_view,
+                            scale_milli: pic_scale,
+                        };
+                        match frames.try_send(picture) {
                             Ok(()) => undelivered = None,
-                            Err(std::sync::mpsc::TrySendError::Full(frame)) => {
-                                undelivered = Some(frame)
+                            Err(std::sync::mpsc::TrySendError::Full(picture)) => {
+                                undelivered = Some(picture)
                             }
                             Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {}
                         }
                         frames_since += 1;
                         decode_ms_acc += dec_ms;
                     }
-                    Ok(None) => {}
+                    Ok(None) => {
+                        // The GPU decoder never buffers across calls: no
+                        // picture means this access unit produced none, so
+                        // its geometry entry goes with it. The CPU decoder
+                        // holds it (drained later or by the next decode).
+                        if matches!(decoder, VideoDecoder::Gpu(_)) {
+                            in_decoder.pop_front();
+                        }
+                    }
                     Err(e) => {
                         tracing::warn!(error = %e, "decode error; requesting keyframe");
+                        in_decoder.clear();
                         let _ = out_tx.send((ClientMsg::RequestKeyframe, Bytes::new()));
                     }
                 }
             }
             ServerMsg::StreamConfig {
-                width,
-                height,
-                chroma,
-                scale_milli,
+                width: w,
+                height: h,
+                chroma: c,
+                scale_milli: s,
                 pipeline,
+                view_width,
+                view_height,
+                fps_cap: f,
                 ..
             } => {
-                decoder = new_decoder(&gpu, chroma, width, height)?;
+                // A pace-only change (fps cap) must not reset the decoder;
+                // a coded-stream change does, and drops the frame waiting
+                // for the UI with it.
+                if (w, h, c) != (width, height, chroma) {
+                    decoder = new_decoder(&gpu, c, w, h)?;
+                    undelivered = None;
+                    in_decoder.clear();
+                }
+                (width, height, chroma, scale_milli) = (w, h, c, s);
+                (view, fps_cap) = ((view_width, view_height), f);
                 video_label = format!("{} > {}", pipeline.label(), local);
-                undelivered = None;
                 let _ = status.send(Status::Connected {
-                    width,
-                    height,
-                    scale_milli,
                     video: video_label.clone(),
+                    view_width,
+                    view_height,
+                    fps_cap,
                 });
             }
             ServerMsg::CursorShape {
@@ -483,6 +576,9 @@ where
                     hot_y,
                     argb,
                 });
+            }
+            ServerMsg::Ping { t } => {
+                let _ = out_tx.send((ClientMsg::Pong { t }, Bytes::new()));
             }
             ServerMsg::CursorPos { .. } | ServerMsg::Pong { .. } => {}
             ServerMsg::Error { code, message } => anyhow::bail!("server error {code}: {message}"),
