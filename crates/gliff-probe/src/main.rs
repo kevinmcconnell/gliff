@@ -1201,8 +1201,9 @@ fn pipeline(
     ));
     let rgb_psnr = psnr(&rgb_channels(&cpu), &rgb_channels(&out));
     println!("  decoded {dec_ms:.1} ms; end-to-end RGB PSNR vs CPU reference {rgb_psnr:.1} dB");
-    // OpenH264 spends far fewer bits on a keyframe than the GPU encoder's
-    // rate control, so the CPU tier scores a few dB lower on the same frame.
+    // OpenH264 takes a first keyframe's QP from a fixed bits-per-pixel
+    // table (QP 30 at the default bitrate), so the CPU tier scores a few dB
+    // below the GPU on the same frame.
     let (tier, min_psnr) = if gpu.is_some() {
         ("GPU", 35.0)
     } else {
