@@ -5,6 +5,7 @@
 
 mod clipboard;
 mod keymap;
+mod keymap_watch;
 mod thread;
 
 use std::sync::mpsc;
@@ -13,7 +14,8 @@ use calloop::channel::Sender;
 
 pub use clipboard::{Clipboard, ClipboardEvent, ClipboardSink};
 pub use hypr_wl::{OutputInfo, Target};
-pub use keymap::{keymap_from_names, KeymapNames};
+pub use keymap::{key_name, keymap_from_names, KeymapNames};
+pub use keymap_watch::{watch_keymap, KeymapSink};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

@@ -29,6 +29,16 @@ pub fn keymap_from_names(names: &KeymapNames) -> Result<String> {
     Ok(keymap.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1))
 }
 
+/// Name of the keysym `evdev_code` gives on its first level in the first
+/// layout, e.g. `Control_L`.
+pub fn key_name(text: &str, evdev_code: u32) -> Result<String> {
+    let keymap = KeyState::from_text(text)?.keymap;
+    let syms = keymap.key_get_syms_by_level(xkb::Keycode::new(evdev_code + 8), 0, 0);
+    Ok(syms
+        .first()
+        .map_or_else(String::new, |s| xkb::keysym_get_name(*s)))
+}
+
 /// Tracks modifier state for the virtual keyboard from raw key events.
 pub struct KeyState {
     pub keymap: xkb::Keymap,
@@ -123,5 +133,23 @@ mod tests {
             .update(KEY_LEFTSHIFT, false)
             .expect("shift release changes mods");
         assert_eq!(mods.0, 0);
+    }
+
+    #[test]
+    fn uploaded_keymap_options_apply() {
+        let text = keymap_from_names(&KeymapNames {
+            layout: "us".into(),
+            options: Some("ctrl:nocaps".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut ks = KeyState::from_text(&text).unwrap();
+        let control = 1 << ks.keymap.mod_get_index(xkb::MOD_NAME_CTRL);
+        const KEY_CAPSLOCK: u32 = 58;
+        let mods = ks
+            .update(KEY_CAPSLOCK, true)
+            .expect("caps press changes mods");
+        assert_eq!(mods.0, control);
+        assert_eq!(mods.2, 0);
     }
 }
