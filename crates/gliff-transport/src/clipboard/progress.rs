@@ -25,7 +25,7 @@ pub const CADENCE: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Progress {
-    /// What is being pasted: a mime type or a file summary.
+    /// What is being pasted: the kind of item or a file summary.
     pub label: String,
     pub done: u64,
     pub total: Option<u64>,
@@ -240,15 +240,25 @@ pub fn describe_files(files: &[ClipboardFile]) -> (String, Option<u64>) {
 /// The label of a job that pastes one clipboard item: what the user would
 /// call it, not its mime type, when there is a common name for it.
 pub fn describe_mime(mime: &str) -> String {
-    let base = mime.split(';').next().unwrap_or(mime).trim();
-    let (kind, sub) = base.split_once('/').unwrap_or((base, ""));
+    if is_text_mime(mime) {
+        return "text".into();
+    }
+    let base = mime
+        .split(';')
+        .next()
+        .unwrap_or(mime)
+        .trim()
+        .to_ascii_lowercase();
+    let Some((kind, sub)) = base.split_once('/') else {
+        return mime.into();
+    };
+    let format = sub.split('+').next().unwrap_or(sub);
     match (kind, sub) {
+        (_, "") => mime.into(),
         ("text", "html") => "formatted text".into(),
         ("text", _) => "text".into(),
-        _ if is_text_mime(mime) => "text".into(),
-        ("image" | "audio" | "video", sub) if !sub.is_empty() => {
-            let format = sub.split('+').next().unwrap_or(sub).to_uppercase();
-            format!("{format} {kind}")
+        ("image" | "audio" | "video", _) if !format.is_empty() => {
+            format!("{} {kind}", format.to_uppercase())
         }
         ("application", "octet-stream") => "binary data".into(),
         ("application", "pdf") => "PDF".into(),
@@ -419,6 +429,10 @@ mod tests {
         assert_eq!(describe_mime("application/octet-stream"), "binary data");
         assert_eq!(describe_mime("application/pdf"), "PDF");
         assert_eq!(describe_mime("application/x-foo"), "application/x-foo");
+        assert_eq!(describe_mime("IMAGE/PNG"), "PNG image");
+        assert_eq!(describe_mime("Text/HTML"), "formatted text");
+        assert_eq!(describe_mime("text/"), "text/");
+        assert_eq!(describe_mime("image/+xml"), "image/+xml");
     }
 
     #[test]
