@@ -1,6 +1,8 @@
 //! Shared Wayland plumbing for gliff's compositor-facing crates: connecting to
 //! a chosen socket, listing globals, and tracking `wl_output`s and the seat.
 
+#![forbid(unsafe_code)]
+
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::Duration;

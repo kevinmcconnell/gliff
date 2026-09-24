@@ -6,6 +6,8 @@
 //! callback. No `unsafe`: GBM allocation and mapping use the `gbm` crate's
 //! safe API, and cursor pixels are read from a memfd with `read_at`.
 
+#![forbid(unsafe_code)]
+
 mod cursor;
 mod thread;
 

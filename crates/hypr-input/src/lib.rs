@@ -3,6 +3,8 @@
 //!
 //! Runs on its own thread; the owner sends [`InputCmd`]s through [`Input`].
 
+#![forbid(unsafe_code)]
+
 mod clipboard;
 mod keymap;
 mod keymap_watch;
