@@ -9,6 +9,8 @@
 //! decoder. Because the header covers the payload, a message this build does
 //! not know is skipped whole.
 
+#![forbid(unsafe_code)]
+
 pub mod clipboard;
 mod ssh;
 

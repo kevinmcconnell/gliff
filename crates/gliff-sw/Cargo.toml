@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 gliff-proto.workspace = true
 openh264.workspace = true
+openh264-sys2.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 

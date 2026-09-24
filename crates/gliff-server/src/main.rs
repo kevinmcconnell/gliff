@@ -2,6 +2,8 @@
 //! serves it to one client over the gliff protocol. `--stdio` (spawned by ssh)
 //! or `--listen` (dev, localhost).
 
+#![forbid(unsafe_code)]
+
 mod clipboard;
 mod notify;
 mod rate;

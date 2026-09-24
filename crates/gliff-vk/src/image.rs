@@ -657,13 +657,19 @@ impl HostBuffer {
     }
 
     pub fn write(&self, offset: usize, data: &[u8]) {
-        assert!(offset + data.len() <= self.size, "write past the buffer");
+        assert!(
+            offset <= self.size && data.len() <= self.size - offset,
+            "write past the buffer"
+        );
         // SAFETY: in bounds of a live host-coherent mapping.
         unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), self.ptr.add(offset), data.len()) };
     }
 
     pub fn read(&self, offset: usize, len: usize) -> Vec<u8> {
-        assert!(offset + len <= self.size, "read past the buffer");
+        assert!(
+            offset <= self.size && len <= self.size - offset,
+            "read past the buffer"
+        );
         // SAFETY: in bounds of a live host-coherent mapping; the GPU work
         // that wrote it has completed (caller waited on its fence).
         unsafe { std::slice::from_raw_parts(self.ptr.add(offset), len).to_vec() }

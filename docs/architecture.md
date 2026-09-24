@@ -42,16 +42,17 @@ video, cursor and pongs flow server→client.
 | `hypr-wl` | shared Wayland plumbing (connect, globals, output/seat tracking, calloop runner) | none |
 | `hypr-capture` | output + cursor capture into GBM dmabufs on a calloop thread | none |
 | `hypr-input` | virtual keyboard (xkb state) + virtual pointer + clipboard bridge (mime types and pipes) on calloop threads | none |
-| `gliff-vk` | Vulkan device, dmabuf import/export, split/recombine compute, H.264 encode/decode, header parser | **yes, isolated here** |
+| `gliff-vk` | Vulkan device, dmabuf import/export, split/recombine compute, H.264 encode/decode, header parser | yes, Vulkan API calls |
+| `gliff-sw` | CPU fallback with OpenH264 encode/decode | one block: sets the encoder trace level through the raw API |
 | `gliff-server` | ties capture+input+encoder to the protocol; `--stdio`/`--listen` | none |
 | `gliff` | GTK4/libadwaita UI, decode worker | one block: hands GTK a dmabuf fd |
 | `gliff-probe` | environment checks and the headless test client | none |
 
-`gliff-vk` wraps `ash`, whose every call is `unsafe` because Vulkan is a C API
-with no lifetime or synchronisation checks. The crate exposes plain Rust types
-(`Gpu`, `Encoder`, `Decoder`, `DisplayFrame`); every `unsafe` block carries a
-`SAFETY` comment, and the Khronos validation layer runs clean on the probe
-round-trip.
+`gliff-vk` wraps `ash`, whose Vulkan calls are `unsafe` because the API cannot
+check lifetimes or synchronisation. The crate exposes plain Rust types
+(`Gpu`, `Encoder`, `Decoder`, `DisplayFrame`). All three crates with `unsafe`
+document the safety requirements at each block. The Khronos validation layer
+runs clean on the probe round-trip.
 
 ## Key design choices
 

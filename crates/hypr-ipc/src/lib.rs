@@ -3,6 +3,8 @@
 //! Instance discovery works without `HYPRLAND_INSTANCE_SIGNATURE`, so a server
 //! spawned by ssh can find the running compositor from `$XDG_RUNTIME_DIR`.
 
+#![forbid(unsafe_code)]
+
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};

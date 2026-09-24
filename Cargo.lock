@@ -772,6 +772,7 @@ version = "0.1.0"
 dependencies = [
  "gliff-proto",
  "openh264",
+ "openh264-sys2",
  "thiserror",
  "tracing",
 ]

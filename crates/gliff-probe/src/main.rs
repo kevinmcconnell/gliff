@@ -1,6 +1,8 @@
 //! Environment probe: protocols, outputs, Vulkan, codec round-trip, capture,
 //! and input injection. Every check prints PASS/FAIL lines.
 
+#![forbid(unsafe_code)]
+
 use std::os::fd::AsFd;
 use std::path::PathBuf;
 use std::sync::mpsc;
