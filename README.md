@@ -148,7 +148,8 @@ skipped and the CPU cases still run.
 - `crates/hypr-input` keyboard and pointer injection.
 - `crates/gliff-vk` the Vulkan media pipeline: device, dmabuf import/export,
   split and recombine compute shaders, H.264 encode/decode, header parser.
-  The only crate with `unsafe`.
 - `crates/gliff-sw` the CPU fallback pipeline: OpenH264 encode/decode around
-  the `gliff-proto` colour and chroma reference code.
-- `crates/gliff` the GTK client, `crates/gliff-server`, `crates/gliff-probe`.
+  the `gliff-proto` colour and chroma reference code. One `unsafe` block sets
+  the OpenH264 trace level through its raw API.
+- `crates/gliff` the GTK client. One `unsafe` block gives GTK a dmabuf fd.
+- `crates/gliff-server`, `crates/gliff-probe`.

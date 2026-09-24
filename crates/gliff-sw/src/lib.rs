@@ -14,6 +14,7 @@ use openh264::encoder::{
 };
 use openh264::formats::YUVSource;
 use openh264::{OpenH264API, Timestamp};
+use openh264_sys2::{ENCODER_OPTION_TRACE_LEVEL, WELS_LOG_QUIET};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -229,7 +230,6 @@ fn new_h264_encoder(settings: &EncoderSettings) -> Result<H264Encoder> {
             settings.width, settings.height
         )));
     }
-    // Quiet: in `--stdio` mode nothing may write to the wire by accident.
     // Baseline profile: OpenH264's decoder skips its one-picture reorder
     // buffer only for Baseline streams, so they display with no delay.
     let config = EncoderConfig::new()
@@ -244,10 +244,21 @@ fn new_h264_encoder(settings: &EncoderSettings) -> Result<H264Encoder> {
         .skip_frames(false)
         .profile(Profile::Baseline)
         .vui(VuiConfig::bt709());
-    Ok(H264Encoder::with_api_config(
-        OpenH264API::from_source(),
-        config,
-    )?)
+    let mut encoder = H264Encoder::with_api_config(OpenH264API::from_source(), config)?;
+    // Quiet: in `--stdio` mode nothing may write to the wire by accident.
+    // `debug(false)` only takes effect after the codec initializes on the
+    // first encode, and initialization itself logs warnings, so set the
+    // level now as well.
+    let mut level = WELS_LOG_QUIET;
+    // SAFETY: the codec pointer is live for the encoder's lifetime, and
+    // OpenH264 accepts the trace level before initialization, reading one
+    // 32-bit value from the pointer during the call.
+    unsafe {
+        encoder
+            .raw_api()
+            .set_option(ENCODER_OPTION_TRACE_LEVEL, (&raw mut level).cast());
+    }
+    Ok(encoder)
 }
 
 fn encode_nv12(encoder: &mut H264Encoder, nv12: &Nv12, ts: Timestamp) -> Result<(Vec<u8>, bool)> {

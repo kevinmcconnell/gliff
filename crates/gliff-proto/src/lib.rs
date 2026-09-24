@@ -4,6 +4,8 @@
 //!
 //! No I/O here. `gliff-transport` moves bytes; this crate defines their shape.
 
+#![forbid(unsafe_code)]
+
 pub mod cbor;
 pub mod chroma;
 pub mod clipboard;
