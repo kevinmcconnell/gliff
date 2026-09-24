@@ -58,9 +58,17 @@ round-trip.
 - **SSH is the only transport.** The server opens no port in production; the
   client spawns `ssh -T host gliff-server --stdio` and the protocol runs over
   that pipe. `--listen`/`--connect` exist for local development only and have no
-  auth. TCP framing is length-prefixed postcard messages; large video and cursor
-  payloads ride outside the postcard body so the encoder output is sent with
-  `write_vectored` and read straight into the decoder.
+  auth. Each frame is a header (body and payload lengths), a CBOR message with
+  numeric keys, then any payload; large video and cursor payloads ride outside
+  the CBOR body so the encoder output is sent with `write_vectored` and read
+  straight into the decoder.
+
+- **The protocol evolves without version bumps.** Peers ignore fields they do
+  not know and skip whole messages they do not know, since the frame header
+  covers the payload too. Anything new is sent only to a peer that listed the
+  matching feature in the handshake. `PROTOCOL_VERSION` changes only for a
+  break those rules cannot absorb; the rules are at the top of
+  `crates/gliff-proto/src/msg.rs`.
 
 - **Why not UDP.** Measured on 2026-09-14 between two Wi-Fi machines over
   Tailscale's direct path (MTU 1280, 330-380 Mbit/s of SSH throughput, RTT

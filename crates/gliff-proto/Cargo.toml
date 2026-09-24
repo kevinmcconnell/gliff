@@ -9,8 +9,7 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
-serde.workspace = true
-postcard.workspace = true
+minicbor.workspace = true
 thiserror.workspace = true
 rayon.workspace = true
 

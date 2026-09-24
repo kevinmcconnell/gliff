@@ -586,8 +586,7 @@ fn schedule_reconnect(ui: Rc<App>, session: u64) {
     if n > MAX_RETRIES {
         ui.status
             .set_text("Disconnected — press Reconnect to retry");
-        ui.connect_btn.set_icon_name(RECONNECT_ICON);
-        ui.connect_btn.set_tooltip_text(Some("Reconnect"));
+        offer_reconnect(&ui);
         return;
     }
     let Some(endpoint) = ui.endpoint.borrow().clone() else {
@@ -600,6 +599,11 @@ fn schedule_reconnect(ui: Rc<App>, session: u64) {
             start_session(ui2, endpoint);
         }
     });
+}
+
+fn offer_reconnect(ui: &App) {
+    ui.connect_btn.set_icon_name(RECONNECT_ICON);
+    ui.connect_btn.set_tooltip_text(Some("Reconnect"));
 }
 
 /// Pull decoded frames on the GTK main loop, latest-wins, and paint them.
@@ -764,6 +768,13 @@ fn poll_status(ui: Rc<App>, rx: Receiver<Status>, session: u64) {
                     ui.status.set_text(&format!("Error: {e}"));
                     show_disconnected(&ui);
                     schedule_reconnect(ui.clone(), session);
+                    return glib::ControlFlow::Break;
+                }
+                Status::Incompatible(message) => {
+                    tracing::error!(error = %message, "incompatible server");
+                    ui.status.set_text(&message);
+                    show_disconnected(&ui);
+                    offer_reconnect(&ui);
                     return glib::ControlFlow::Break;
                 }
                 Status::Closed => {

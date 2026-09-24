@@ -166,7 +166,7 @@ mod tests {
             ServerMsg::StreamConfig {
                 codec: Codec::H264,
                 chroma: ChromaMode::Single420,
-                pipeline: VideoPipeline::Gpu,
+                pipeline: Some(VideoPipeline::Gpu),
                 width,
                 height: 480,
                 scale_milli: 1000,

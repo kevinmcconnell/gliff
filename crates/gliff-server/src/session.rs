@@ -13,8 +13,9 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use bytes::Bytes;
 use gliff_proto::clipboard::CHUNK;
 use gliff_proto::{
-    ChromaMode, ClientCaps, ClientMsg, ClipboardMsg, Codec, OutputInfo as ProtoOutput, Rect,
-    ServerMsg, SessionInfo, VideoPipeline, PROTOCOL_VERSION,
+    features, version_mismatch, ChromaMode, ClientCaps, ClientMsg, ClipboardMsg, Codec, Greeting,
+    OutputInfo as ProtoOutput, Rect, ServerMsg, SessionInfo, VideoPipeline, ERROR_NO_CHROMA,
+    ERROR_NO_CODEC, ERROR_VERSION, PROTOCOL_VERSION,
 };
 use gliff_sw::VideoMode;
 use gliff_transport::clipboard::progress::Jobs;
@@ -77,22 +78,31 @@ where
     let mut writer = Framed::new(wr);
 
     let (keymap, caps) = handshake(&mut reader, &mut writer).await?;
+    if !caps.codecs.contains(&Codec::H264) {
+        writer
+            .write_msg(&ServerMsg::error(
+                ERROR_NO_CODEC,
+                "No video codec in common",
+            ))
+            .await?;
+        anyhow::bail!("client advertises no codec this server speaks");
+    }
+    if !caps.chroma.contains(&ChromaMode::Dual420) && !caps.chroma.contains(&ChromaMode::Single420)
+    {
+        writer
+            .write_msg(&ServerMsg::error(
+                ERROR_NO_CHROMA,
+                "No chroma mode in common",
+            ))
+            .await?;
+        anyhow::bail!("client advertises no chroma mode this server speaks");
+    }
 
     let instance = cfg.target.instance().context("find Hyprland instance")?;
     let output = setup_output(&instance, &cfg, &caps)?;
     tracing::info!(output = %output.name, output.width, output.height, headless = output.is_headless(), "session output ready");
 
     let video = VideoTier::open(cfg.video, &cfg.render_node);
-    if !caps.chroma.contains(&ChromaMode::Dual420) && !caps.chroma.contains(&ChromaMode::Single420)
-    {
-        writer
-            .write_msg(&ServerMsg::Error {
-                code: 2,
-                message: "no common chroma mode".into(),
-            })
-            .await?;
-        anyhow::bail!("client advertises no chroma mode this server speaks");
-    }
     let codec = Codec::H264;
     writer
         .write_msg(&ServerMsg::HelloAck {
@@ -107,6 +117,7 @@ where
                 height: output.height,
                 scale_milli: (output.scale * 1000.0).round() as u32,
             }],
+            features: features(),
         })
         .await?;
     let ladder = Ladder::new(START_LEVEL);
@@ -323,24 +334,18 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    match reader.read_msg::<ClientMsg>().await.context("read Hello")? {
-        ClientMsg::Hello {
-            version,
-            keymap,
-            caps,
-        } => {
-            if version != PROTOCOL_VERSION {
-                writer
-                    .write_msg(&ServerMsg::Error {
-                        code: 1,
-                        message: format!("version {version} unsupported"),
-                    })
-                    .await?;
-                anyhow::bail!("client version {version} != {PROTOCOL_VERSION}");
-            }
+    match reader.read_msg::<Greeting>().await.context("read Hello")? {
+        Greeting::Hello { keymap, caps } => {
+            tracing::debug!(features = ?caps.features, "client features");
             Ok((keymap, caps))
         }
-        other => anyhow::bail!("expected Hello, got {other:?}"),
+        Greeting::OtherVersion(version) => {
+            let message = version_mismatch(version, PROTOCOL_VERSION);
+            writer
+                .write_msg(&ServerMsg::error(ERROR_VERSION, message))
+                .await?;
+            anyhow::bail!("{message}: client protocol {version}, server {PROTOCOL_VERSION}");
+        }
     }
 }
 
@@ -363,7 +368,11 @@ where
         loop {
             let msg = match reader.read_msg::<ClientMsg>().await {
                 Ok(m) => m,
-                Err(_) => break,
+                Err(gliff_transport::Error::Closed) => break,
+                Err(e) => {
+                    tracing::warn!(error = %e, "cannot read from the client");
+                    break;
+                }
             };
             let inbound = match msg.into_clipboard() {
                 Err(msg) => Inbound::Msg(msg),
@@ -1347,7 +1356,7 @@ fn stream_config(
     ServerMsg::StreamConfig {
         codec,
         chroma,
-        pipeline,
+        pipeline: Some(pipeline),
         width: stream.0,
         height: stream.1,
         scale_milli: (effective_scale * 1000.0).round() as u32,

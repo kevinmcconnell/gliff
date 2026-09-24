@@ -9,11 +9,12 @@ use std::rc::Rc;
 use std::sync::mpsc::{Sender as StdSender, SyncSender};
 use std::sync::Arc;
 
+use anyhow::Context;
 use bytes::Bytes;
 use gliff_proto::clipboard::CHUNK;
 use gliff_proto::{
-    ChromaMode, ClientCaps, ClientMsg, ClipboardFile, ClipboardMsg, Codec, ServerMsg,
-    PROTOCOL_VERSION,
+    features, is_incompatible, version_mismatch, ChromaMode, ClientCaps, ClientMsg, ClipboardFile,
+    ClipboardMsg, Codec, ServerMsg, VideoPipeline, PROTOCOL_VERSION,
 };
 use gliff_sw::VideoMode;
 use gliff_transport::clipboard::progress::Progress;
@@ -89,8 +90,15 @@ pub enum Status {
         progress: Progress,
     },
     Error(String),
+    /// The two ends speak different protocol versions, so retrying cannot
+    /// help.
+    Incompatible(String),
     Closed,
 }
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct Incompatible(String);
 
 /// How to reach the server.
 #[derive(Clone)]
@@ -165,7 +173,10 @@ impl Worker {
             }
         });
         if let Err(e) = result {
-            let _ = status.send(Status::Error(e.to_string()));
+            let _ = status.send(match e.downcast::<Incompatible>() {
+                Ok(Incompatible(message)) => Status::Incompatible(message),
+                Err(e) => Status::Error(e.to_string()),
+            });
         } else {
             let _ = status.send(Status::Closed);
         }
@@ -239,6 +250,7 @@ where
         } else {
             vec![ChromaMode::Single420]
         },
+        features: features(),
     };
     let _ = tokio::time::timeout(FIRST_KEYMAP_WAIT, keymap.wait_for(|k| !k.is_empty())).await;
     let first_keymap = keymap.borrow_and_update().clone();
@@ -260,10 +272,15 @@ where
     let mut got_ack = false;
     let (mut width, mut height, mut chroma, mut scale_milli, pipeline, mut view, mut fps_cap) = loop {
         match reader.read_msg::<ServerMsg>().await? {
-            ServerMsg::HelloAck { version, .. } => {
+            ServerMsg::HelloAck {
+                version, features, ..
+            } => {
                 if version != PROTOCOL_VERSION {
-                    anyhow::bail!("server version {version} != {PROTOCOL_VERSION}");
+                    return Err(
+                        Incompatible(version_mismatch(PROTOCOL_VERSION, version).into()).into(),
+                    );
                 }
+                tracing::debug!(?features, "server features");
                 got_ack = true;
             }
             ServerMsg::Ping { t } => writer.write_msg(&ClientMsg::Pong { t }).await?,
@@ -288,7 +305,10 @@ where
                     fps_cap,
                 )
             }
-            ServerMsg::Error { code, message } => {
+            ServerMsg::Error { code, message, .. } if is_incompatible(code) => {
+                return Err(Incompatible(message).into())
+            }
+            ServerMsg::Error { code, message, .. } => {
                 anyhow::bail!("server error {code}: {message}")
             }
             other => anyhow::bail!("unexpected message before StreamConfig: {other:?}"),
@@ -296,7 +316,7 @@ where
     };
     let mut decoder = new_decoder(&gpu, chroma, width, height)?;
     let local = if gpu.is_some() { "gpu" } else { "cpu" };
-    let mut video_label = format!("{} > {}", pipeline.label(), local);
+    let mut video_label = format!("{} > {}", pipeline.map_or("?", VideoPipeline::label), local);
     let _ = status.send(Status::Connected {
         video: video_label.clone(),
         view_width: view.0,
@@ -311,17 +331,15 @@ where
     // never block on a write and the two peers cannot deadlock. Both the reader
     // loop (acks, keyframe requests) and the UI thread (input) feed `out_tx`.
     let (out_tx, mut out_rx) = unbounded_channel::<(ClientMsg, Bytes)>();
-    tokio::task::spawn_local(async move {
+    let mut writes = tokio::task::spawn_local(async move {
         while let Some((m, payload)) = out_rx.recv().await {
-            let r = if payload.is_empty() {
-                writer.write_msg(&m).await
+            if payload.is_empty() {
+                writer.write_msg(&m).await?;
             } else {
-                writer.write_msg_with_payloads(&m, &[&payload]).await
-            };
-            if r.is_err() {
-                break;
+                writer.write_msg_with_payloads(&m, &[&payload]).await?;
             }
         }
+        Ok::<(), gliff_transport::Error>(())
     });
     // Clipboard transfers write through the same channel, in chunks.
     let (clip_out_tx, mut clip_out_rx) = outbound_channel();
@@ -402,6 +420,10 @@ where
         let read = tokio::select! {
             read = reader.read_msg::<ServerMsg>() => read,
             _ = &mut ui_gone => return Ok(()),
+            written = &mut writes => {
+                written.context("writer task")?.context("write to server")?;
+                return Ok(());
+            }
             _ = tokio::time::sleep_until(drain_at),
                 if undelivered.is_some()
                     || matches!(&decoder, VideoDecoder::Cpu(d) if d.has_pending()) =>
@@ -552,7 +574,7 @@ where
                 }
                 (width, height, chroma, scale_milli) = (w, h, c, s);
                 (view, fps_cap) = ((view_width, view_height), f);
-                video_label = format!("{} > {}", pipeline.label(), local);
+                video_label = format!("{} > {}", pipeline.map_or("?", VideoPipeline::label), local);
                 let _ = status.send(Status::Connected {
                     video: video_label.clone(),
                     view_width,
@@ -581,7 +603,12 @@ where
                 let _ = out_tx.send((ClientMsg::Pong { t }, Bytes::new()));
             }
             ServerMsg::CursorPos { .. } | ServerMsg::Pong { .. } => {}
-            ServerMsg::Error { code, message } => anyhow::bail!("server error {code}: {message}"),
+            ServerMsg::Error { code, message, .. } if is_incompatible(code) => {
+                return Err(Incompatible(message).into())
+            }
+            ServerMsg::Error { code, message, .. } => {
+                anyhow::bail!("server error {code}: {message}")
+            }
             ServerMsg::HelloAck { .. } => {}
             other => {
                 if let Ok(clip) = other.into_clipboard() {
