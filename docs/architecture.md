@@ -299,9 +299,12 @@ content, 2026-09-25:
 Before the fused kernels and the encoder threads the same runs took
 30-40 ms / 105-150 ms to encode and 9-12 ms / 28-35 ms to decode, with
 the conversion alone at ~4 ms / ~18 ms per side. The multi-slice stream
-is about 8% larger at the same quality. On a mostly still desktop the
-codec's share shrinks, so the conversion matters more than these numbers
-show. The server adapts the CBR
+is about 8% larger at the same quality. In the `lan` bench at 1080p with
+both ends on the CPU tier (a nested desktop, `--video cpu`,
+`GLIFF_VIDEO=cpu`), the server's per-frame time fell from p50 32.7 ms to
+21 ms, of which the capture-buffer read is 1.8 ms and the rest is
+OpenH264 (49.5 ms on one thread), and the client's decode from p50
+12.9 ms to 4.3 ms; the bench's damage cadence caps both runs near 30 fps. The server adapts the CBR
 target to the link (`gliff-server/src/rate.rs`); a slow link gives up frame
 rate first, then chroma, then resolution.
 
