@@ -1,12 +1,12 @@
 //! Software media pipeline: the CPU fallback for machines without Vulkan
-//! Video. BGRA conversion and the AVC444 split/recombine reuse the tested
-//! reference code in `gliff-proto`; H.264 encode/decode is OpenH264.
+//! Video. BGRA conversion and the AVC444 split run as fused fixed-point
+//! passes in `convert`, checked against the reference code in `gliff-proto`;
+//! H.264 encode/decode is OpenH264.
 //!
 //! Mirrors the shape of `gliff-vk`'s `Encoder`/`Decoder` so the server and
 //! client can hold either behind a small enum.
 
-use gliff_proto::chroma::{nv12_to_yuv444, recombine_yuv444, split_yuv444, yuv444_to_nv12, Nv12};
-use gliff_proto::color::{bgra_to_yuv444, yuv444_to_bgra};
+use gliff_proto::chroma::{recombine_yuv444, Nv12};
 use openh264::decoder::{DecodedYUV, Decoder as H264Decoder, DecoderConfig, Flush};
 use openh264::encoder::{
     BitRate, Encoder as H264Encoder, EncoderConfig, FrameRate, FrameType, Profile, QpRange,
@@ -15,6 +15,10 @@ use openh264::encoder::{
 use openh264::formats::YUVSource;
 use openh264::{OpenH264API, Timestamp};
 use openh264_sys2::{ENCODER_OPTION_TRACE_LEVEL, WELS_LOG_QUIET};
+
+pub mod convert;
+
+use convert::I420;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -77,34 +81,6 @@ pub struct BgraFrame {
     pub width: u32,
     pub height: u32,
     pub pixels: Vec<u8>,
-}
-
-/// A planar I420 frame the OpenH264 encoder reads directly.
-struct I420 {
-    width: usize,
-    height: usize,
-    y: Vec<u8>,
-    u: Vec<u8>,
-    v: Vec<u8>,
-}
-
-impl I420 {
-    fn from_nv12(nv12: &Nv12) -> Self {
-        let (w, h) = (nv12.width, nv12.height);
-        let mut u = vec![0u8; w * h / 4];
-        let mut v = vec![0u8; w * h / 4];
-        for (i, pair) in nv12.uv.chunks_exact(2).enumerate() {
-            u[i] = pair[0];
-            v[i] = pair[1];
-        }
-        Self {
-            width: w,
-            height: h,
-            y: nv12.y.clone(),
-            u,
-            v,
-        }
-    }
 }
 
 impl YUVSource for I420 {
@@ -183,12 +159,11 @@ impl Encoder {
     /// Encode packed BGRA pixels of exactly `settings` size, tightly packed.
     pub fn encode_bgra(&mut self, bgra: &[u8], force_keyframe: bool) -> Result<EncodedFrame> {
         let (w, h) = (self.settings.width as usize, self.settings.height as usize);
-        let yuv = bgra_to_yuv444(bgra, w * 4, w, h);
-        let (main_nv12, aux_nv12) = if self.aux.is_some() {
-            let (m, a) = split_yuv444(&yuv);
+        let (main_i420, aux_i420) = if self.aux.is_some() {
+            let (m, a) = convert::split_yuv444(&convert::bgra_to_yuv444(bgra, w * 4, w, h));
             (m, Some(a))
         } else {
-            (yuv444_to_nv12(&yuv), None)
+            (convert::bgra_to_i420(bgra, w * 4, w, h), None)
         };
         let ts = Timestamp::from_millis(self.frames * 1000 / self.settings.framerate.max(1) as u64);
         self.frames += 1;
@@ -198,9 +173,9 @@ impl Encoder {
                 a.force_intra_frame();
             }
         }
-        let (main, keyframe) = encode_nv12(&mut self.main, &main_nv12, ts)?;
-        let aux = match (&mut self.aux, &aux_nv12) {
-            (Some(enc), Some(nv12)) => Some(encode_nv12(enc, nv12, ts)?.0),
+        let (main, keyframe) = encode_i420(&mut self.main, &main_i420, ts)?;
+        let aux = match (&mut self.aux, &aux_i420) {
+            (Some(enc), Some(i420)) => Some(encode_i420(enc, i420, ts)?.0),
             _ => None,
         };
         Ok(EncodedFrame {
@@ -209,6 +184,19 @@ impl Encoder {
             keyframe,
         })
     }
+}
+
+/// OpenH264 stops at four encoder threads.
+const MAX_ENCODER_THREADS: u16 = 4;
+
+/// A slice size the encoder rarely reaches, so slicing follows the thread
+/// count rather than the byte count.
+const MAX_SLICE_BYTES: u32 = 1 << 20;
+
+fn encoder_threads() -> u16 {
+    std::thread::available_parallelism()
+        .map(|n| n.get().min(MAX_ENCODER_THREADS as usize) as u16)
+        .unwrap_or(1)
 }
 
 fn new_h264_encoder(settings: &EncoderSettings) -> Result<H264Encoder> {
@@ -222,8 +210,8 @@ fn new_h264_encoder(settings: &EncoderSettings) -> Result<H264Encoder> {
     // The 4:2:0 chroma split needs even dimensions.
     if settings.width == 0
         || settings.height == 0
-        || settings.width % 2 != 0
-        || settings.height % 2 != 0
+        || !settings.width.is_multiple_of(2)
+        || !settings.height.is_multiple_of(2)
     {
         return Err(Error::Unsupported(format!(
             "{}x{} is not an even, non-zero size",
@@ -232,8 +220,12 @@ fn new_h264_encoder(settings: &EncoderSettings) -> Result<H264Encoder> {
     }
     // Baseline profile: OpenH264's decoder skips its one-picture reorder
     // buffer only for Baseline streams, so they display with no delay.
+    // OpenH264 encodes a picture on several threads only when it may cut
+    // it into slices; a size limit turns that on.
     let config = EncoderConfig::new()
         .debug(false)
+        .num_threads(encoder_threads())
+        .max_slice_len(MAX_SLICE_BYTES)
         .usage_type(UsageType::ScreenContentRealTime)
         .rate_control_mode(RateControlMode::Bitrate)
         // Left unset, the range becomes 26..=35 for screen content, and QP 26
@@ -261,8 +253,8 @@ fn new_h264_encoder(settings: &EncoderSettings) -> Result<H264Encoder> {
     Ok(encoder)
 }
 
-fn encode_nv12(encoder: &mut H264Encoder, nv12: &Nv12, ts: Timestamp) -> Result<(Vec<u8>, bool)> {
-    let stream = encoder.encode_at(&I420::from_nv12(nv12), ts)?;
+fn encode_i420(encoder: &mut H264Encoder, i420: &I420, ts: Timestamp) -> Result<(Vec<u8>, bool)> {
+    let stream = encoder.encode_at(i420, ts)?;
     let keyframe = matches!(stream.frame_type(), FrameType::IDR | FrameType::I);
     Ok((stream.to_vec(), keyframe))
 }
@@ -298,63 +290,47 @@ impl Decoder {
     /// Both decoders are fed every unit so the pair stays in step.
     pub fn decode(&mut self, main: &[u8], aux: &[u8]) -> Result<Option<BgraFrame>> {
         self.held += 1;
-        let main_nv12 = decode_nv12(&mut self.main, main)?;
-        let yuv = match &mut self.aux {
-            Some(dec) => {
-                let aux_nv12 = decode_nv12(dec, aux)?;
-                let (main_nv12, aux_nv12) = match (main_nv12, aux_nv12) {
-                    (Some(m), Some(a)) => (m, a),
-                    (None, None) => return Ok(None),
-                    _ => {
-                        return Err(Error::Unsupported(
-                            "main and aux streams fell out of step".into(),
-                        ))
-                    }
-                };
-                if (aux_nv12.width, aux_nv12.height) != (main_nv12.width, main_nv12.height) {
+        let frame = match &mut self.aux {
+            Some(dec) => match (self.main.decode(main)?, dec.decode(aux)?) {
+                (Some(m), Some(a)) => Some(recombine_to_bgra(&m, &a)?),
+                (None, None) => None,
+                _ => {
                     return Err(Error::Unsupported(
-                        "main and aux stream sizes differ".into(),
-                    ));
+                        "main and aux streams fell out of step".into(),
+                    ))
                 }
-                recombine_yuv444(&main_nv12, &aux_nv12)
-            }
-            None => match main_nv12 {
-                Some(m) => nv12_to_yuv444(&m),
-                None => return Ok(None),
             },
+            None => self.main.decode(main)?.as_ref().map(decoded_to_bgra),
+        };
+        let Some(frame) = frame else {
+            return Ok(None);
         };
         self.held = self.held.saturating_sub(1);
-        Ok(Some(BgraFrame {
-            width: yuv.width as u32,
-            height: yuv.height as u32,
-            pixels: yuv444_to_bgra(&yuv),
-        }))
+        Ok(Some(frame))
     }
 
     /// Drain the picture still buffered in the decoders: for the last access
     /// unit of a run, or to put the newest picture on screen when the stream
     /// goes quiet. Decoding continues cleanly afterwards.
     pub fn flush(&mut self) -> Result<Option<BgraFrame>> {
-        let main = flush_nv12(&mut self.main)?;
-        let yuv = match &mut self.aux {
-            Some(dec) => match (main, flush_nv12(dec)?) {
-                (Some(m), Some(a)) => Some(recombine_yuv444(&m, &a)),
-                _ => None,
-            },
-            None => main.map(|m| nv12_to_yuv444(&m)),
+        let frame = match &mut self.aux {
+            Some(dec) => {
+                let (main, aux) = (self.main.flush_remaining()?, dec.flush_remaining()?);
+                match (main.first(), aux.first()) {
+                    (Some(m), Some(a)) => Some(recombine_to_bgra(m, a)?),
+                    _ => None,
+                }
+            }
+            None => self.main.flush_remaining()?.first().map(decoded_to_bgra),
         };
-        let Some(yuv) = yuv else {
+        let Some(frame) = frame else {
             // Nothing came out, so nothing is drainable: correct any drift
             // the counter picked up from failed decodes.
             self.held = 0;
             return Ok(None);
         };
         self.held = self.held.saturating_sub(1);
-        Ok(Some(BgraFrame {
-            width: yuv.width as u32,
-            height: yuv.height as u32,
-            pixels: yuv444_to_bgra(&yuv),
-        }))
+        Ok(Some(frame))
     }
 }
 
@@ -369,15 +345,33 @@ fn new_h264_decoder() -> Result<H264Decoder> {
     )?)
 }
 
-fn decode_nv12(decoder: &mut H264Decoder, packet: &[u8]) -> Result<Option<Nv12>> {
-    let Some(image) = decoder.decode(packet)? else {
-        return Ok(None);
-    };
-    Ok(Some(decoded_to_nv12(&image)))
+/// Convert a decoded picture straight to BGRA, cropped to even dimensions,
+/// with its chroma repeated over each 2x2 block.
+fn decoded_to_bgra(image: &DecodedYUV) -> BgraFrame {
+    let (w, h) = image.dimensions();
+    let (w, h) = (w & !1, h & !1);
+    let pixels = convert::i420_to_bgra(image.y(), image.u(), image.v(), image.strides(), w, h);
+    BgraFrame {
+        width: w as u32,
+        height: h as u32,
+        pixels,
+    }
 }
 
-fn flush_nv12(decoder: &mut H264Decoder) -> Result<Option<Nv12>> {
-    Ok(decoder.flush_remaining()?.first().map(decoded_to_nv12))
+/// Recombine a main and auxiliary picture into 4:4:4 and convert to BGRA.
+fn recombine_to_bgra(main: &DecodedYUV, aux: &DecodedYUV) -> Result<BgraFrame> {
+    let (main, aux) = (decoded_to_nv12(main), decoded_to_nv12(aux));
+    if (aux.width, aux.height) != (main.width, main.height) {
+        return Err(Error::Unsupported(
+            "main and aux stream sizes differ".into(),
+        ));
+    }
+    let yuv = recombine_yuv444(&main, &aux);
+    Ok(BgraFrame {
+        width: yuv.width as u32,
+        height: yuv.height as u32,
+        pixels: convert::yuv444_to_bgra(&yuv),
+    })
 }
 
 /// Copy a decoded I420 image (strides may exceed the width) into a tightly
@@ -405,7 +399,8 @@ fn decoded_to_nv12(image: &DecodedYUV) -> Nv12 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gliff_proto::color::psnr;
+    use gliff_proto::chroma::{nv12_to_yuv444, yuv444_to_nv12};
+    use gliff_proto::color::{bgra_to_yuv444, psnr, yuv444_to_bgra};
 
     fn synthetic_bgra(w: usize, h: usize, t: usize) -> Vec<u8> {
         let mut out = vec![0u8; w * h * 4];
@@ -436,7 +431,7 @@ mod tests {
             seed ^= seed << 13;
             seed ^= seed >> 17;
             seed ^= seed << 5;
-            let v = if seed % 3 == 0 { 230 } else { 20 };
+            let v = if seed.is_multiple_of(3) { 230 } else { 20 };
             px.copy_from_slice(&[v, v, v, 255]);
         }
         out

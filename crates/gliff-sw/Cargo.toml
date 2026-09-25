@@ -9,6 +9,7 @@ rust-version.workspace = true
 gliff-proto.workspace = true
 openh264.workspace = true
 openh264-sys2.workspace = true
+rayon.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 

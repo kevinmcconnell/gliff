@@ -587,7 +587,7 @@ mod tests {
             bits += "0"; // cropping
             bits += "0"; // vui
             bits += "1"; // stop bit
-            while bits.len() % 8 != 0 {
+            while !bits.len().is_multiple_of(8) {
                 bits += "0";
             }
             let mut out = vec![0x67, 100, 0, 40];

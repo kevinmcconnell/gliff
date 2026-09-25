@@ -1031,7 +1031,8 @@ fn clipboard(target: &Target, set: Option<String>, secs: u64) -> Result<()> {
 }
 
 fn bench(iters: usize) -> Result<()> {
-    use gliff_proto::chroma::{recombine_yuv444, split_yuv444, yuv444_to_nv12};
+    use gliff_proto::chroma::{nv12_to_yuv444, recombine_yuv444, split_yuv444, yuv444_to_nv12};
+    use gliff_sw::convert;
     use std::time::Instant;
     for (w, h) in [(1280usize, 720usize), (1920, 1080), (3840, 2160)] {
         // A representative BGRA frame.
@@ -1080,10 +1081,42 @@ fn bench(iters: usize) -> Result<()> {
                 let _ = recombine_yuv444(&m, &a);
             })
         });
+        time("upsample NV12->444 (single)", iters, {
+            let m = m.clone();
+            Box::new(move || {
+                let _ = nv12_to_yuv444(&m);
+            })
+        });
         time("yuv444->bgra (client)", iters, {
             let src = src.clone();
             Box::new(move || {
                 let _ = yuv444_to_bgra(&src);
+            })
+        });
+        println!("  fused fixed-point kernels (gliff-sw):");
+        time("bgra->i420 (server single)", iters, {
+            let bgra = bgra.clone();
+            Box::new(move || {
+                let _ = convert::bgra_to_i420(&bgra, w * 4, w, h);
+            })
+        });
+        time("bgra->444->2xi420 (server dual)", iters, {
+            let bgra = bgra.clone();
+            Box::new(move || {
+                let _ = convert::split_yuv444(&convert::bgra_to_yuv444(&bgra, w * 4, w, h));
+            })
+        });
+        let i420 = convert::bgra_to_i420(&bgra, w * 4, w, h);
+        time("i420->bgra (client single)", iters, {
+            let i420 = i420.clone();
+            Box::new(move || {
+                let _ = convert::i420_to_bgra(&i420.y, &i420.u, &i420.v, (w, w / 2, w / 2), w, h);
+            })
+        });
+        time("yuv444->bgra (client dual)", iters, {
+            let src = src.clone();
+            Box::new(move || {
+                let _ = convert::yuv444_to_bgra(&src);
             })
         });
     }

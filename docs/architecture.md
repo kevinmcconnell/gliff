@@ -29,6 +29,14 @@ images, and the encoders read them in place; only the coded bytes come back to
 the CPU. On the client the two decoders write NV12 images, the recombine shader
 writes a linear BGRX image, and GTK imports that image as a dmabuf texture.
 
+Without Vulkan Video, either end falls back to the CPU tier (`gliff-sw`,
+`--video cpu`): the server maps the captured buffer and converts BGRA to
+I420 in one fused fixed-point pass (AVX2 row kernels chosen at run time,
+rows spread over rayon), OpenH264 encodes it on up to four threads, and the
+client converts the decoded I420 straight back to BGRA the same way. The
+CPU tier prefers one 4:2:0 stream, since the second stream doubles the
+encode work; `--full-chroma` on a CPU server keeps Dual420 for a GPU client.
+
 Keyboard, pointer, resize, frame acks and keyframe requests flow client→server;
 video, cursor and pongs flow server→client.
 
@@ -43,7 +51,7 @@ video, cursor and pongs flow server→client.
 | `hypr-capture` | output + cursor capture into GBM dmabufs on a calloop thread | none |
 | `hypr-input` | virtual keyboard (xkb state) + virtual pointer + clipboard bridge (mime types and pipes) on calloop threads | none |
 | `gliff-vk` | Vulkan device, dmabuf import/export, split/recombine compute, H.264 encode/decode, header parser | yes, Vulkan API calls |
-| `gliff-sw` | CPU fallback with OpenH264 encode/decode | one block: sets the encoder trace level through the raw API |
+| `gliff-sw` | CPU fallback with OpenH264 encode/decode, fused BGRA<->I420 conversion | the encoder trace level through the raw API, and the AVX2 row kernels (pointer loads and stores) |
 | `gliff-server` | ties capture+input+encoder to the protocol; `--stdio`/`--listen` | none |
 | `gliff` | GTK4/libadwaita UI, decode worker | one block: hands GTK a dmabuf fd |
 | `gliff-probe` | environment checks and the headless test client | none |
@@ -235,6 +243,11 @@ runs clean on the probe round-trip.
 
 ## Testing
 
+- **`scripts/check.sh`** runs what CI runs (`cargo fmt --check`, `cargo
+  clippy --all-targets -- -D warnings`, `cargo test --workspace`); run it
+  before every push, and `scripts/check.sh --fix` to apply the rustfmt and
+  clippy fixes first. Clippy lints gated on the MSRV (`rust-version` in
+  `Cargo.toml`) switch on across the whole workspace when it is raised.
 - **Unit tests** cover the pure logic: AVC444 split/recombine losslessness,
   single-stream subsample/upsample, BGRA↔YUV444 colour round-trip, the H.264
   header parser against an x264 stream, framing with payloads and partial
@@ -275,7 +288,28 @@ Dual420, from `gliff-probe roundtrip`:
 
 No pixel work happens on the CPU at any resolution; the remaining cost is the
 encode hardware itself, which serialises the two streams, so a 1080p Dual420
-frame costs about two encodes' worth of time. The server adapts the CBR
+frame costs about two encodes' worth of time.
+
+The CPU tier on the same machine (Ryzen 7 7840U, 16 threads), Single420,
+from `gliff-probe --video cpu roundtrip --single` on moving synthetic
+content, 2026-09-25:
+
+| Stage | 1080p | 4K |
+|---|---|---|
+| BGRA -> I420 (fused, AVX2, rayon) | 0.2 ms | 1.3 ms |
+| encode, conversion included (OpenH264, 4 threads) | ~10 ms | ~35-43 ms |
+| I420 -> BGRA (fused, AVX2, rayon) | 0.4 ms | 1.8 ms |
+| decode, conversion included | ~6 ms | ~19 ms |
+
+Before the fused kernels and the encoder threads the same runs took
+30-40 ms / 105-150 ms to encode and 9-12 ms / 28-35 ms to decode, with
+the conversion alone at ~4 ms / ~18 ms per side. The multi-slice stream
+is about 8% larger at the same quality. In the `lan` bench at 1080p with
+both ends on the CPU tier (a nested desktop, `--video cpu`,
+`GLIFF_VIDEO=cpu`), the server's per-frame time fell from p50 32.7 ms to
+21 ms, of which the capture-buffer read is 1.8 ms and the rest is
+OpenH264 (49.5 ms on one thread), and the client's decode from p50
+12.9 ms to 4.3 ms; the bench's damage cadence caps both runs near 30 fps. The server adapts the CBR
 target to the link (`gliff-server/src/rate.rs`); a slow link gives up frame
 rate first, then chroma, then resolution.
 
