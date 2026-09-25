@@ -210,8 +210,8 @@ fn new_h264_encoder(settings: &EncoderSettings) -> Result<H264Encoder> {
     // The 4:2:0 chroma split needs even dimensions.
     if settings.width == 0
         || settings.height == 0
-        || settings.width % 2 != 0
-        || settings.height % 2 != 0
+        || !settings.width.is_multiple_of(2)
+        || !settings.height.is_multiple_of(2)
     {
         return Err(Error::Unsupported(format!(
             "{}x{} is not an even, non-zero size",
@@ -431,7 +431,7 @@ mod tests {
             seed ^= seed << 13;
             seed ^= seed >> 17;
             seed ^= seed << 5;
-            let v = if seed % 3 == 0 { 230 } else { 20 };
+            let v = if seed.is_multiple_of(3) { 230 } else { 20 };
             px.copy_from_slice(&[v, v, v, 255]);
         }
         out

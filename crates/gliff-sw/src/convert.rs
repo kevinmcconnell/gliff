@@ -57,7 +57,10 @@ const C_BIAS: i32 = (128 << FRAC) + HALF;
 /// top-left pixel, exactly as `gliff_proto::chroma::yuv444_to_nv12` does.
 /// Width and height must be even; `stride` is bytes per source row.
 pub fn bgra_to_i420(bgra: &[u8], stride: usize, width: usize, height: usize) -> I420 {
-    assert!(width % 2 == 0 && height % 2 == 0, "dimensions must be even");
+    assert!(
+        width.is_multiple_of(2) && height.is_multiple_of(2),
+        "dimensions must be even"
+    );
     let cw = width / 2;
     let mut out = I420::new(width, height);
     out.y
@@ -145,7 +148,10 @@ pub fn i420_to_bgra(
     width: usize,
     height: usize,
 ) -> Vec<u8> {
-    assert!(width % 2 == 0 && height % 2 == 0, "dimensions must be even");
+    assert!(
+        width.is_multiple_of(2) && height.is_multiple_of(2),
+        "dimensions must be even"
+    );
     let (sy, su, sv) = strides;
     let mut out = vec![0u8; width * height * 4];
     out.par_chunks_mut(width * 4)
@@ -171,7 +177,13 @@ pub fn yuv444_to_bgra(src: &Yuv444) -> Vec<u8> {
         .enumerate()
         .for_each(|(row, line)| {
             let at = row * w..row * w + w;
-            row_bgra(&src.y[at.clone()], &src.u[at.clone()], &src.v[at], line, false);
+            row_bgra(
+                &src.y[at.clone()],
+                &src.u[at.clone()],
+                &src.v[at],
+                line,
+                false,
+            );
         });
     out
 }
@@ -207,7 +219,7 @@ fn row_uv(bgra: &[u8], u: &mut [u8], v: &mut [u8], step: usize) {
 /// sample covers two pixels; `y.len()` must then be even.
 fn row_bgra(y: &[u8], u: &[u8], v: &[u8], out: &mut [u8], upsample: bool) {
     let samples = if upsample { y.len() / 2 } else { y.len() };
-    assert!(!upsample || y.len() % 2 == 0);
+    assert!(!upsample || y.len().is_multiple_of(2));
     assert!(out.len() >= y.len() * 4 && u.len() >= samples && v.len() >= samples);
     #[cfg(target_arch = "x86_64")]
     {
@@ -282,7 +294,12 @@ mod avx2 {
     #[target_feature(enable = "avx2")]
     unsafe fn load_even_8px(p: *const u8) -> (__m256i, __m256i) {
         // SAFETY: the caller guarantees 64 readable bytes.
-        let (a, b) = unsafe { (_mm256_loadu_si256(p.cast()), _mm256_loadu_si256(p.add(32).cast())) };
+        let (a, b) = unsafe {
+            (
+                _mm256_loadu_si256(p.cast()),
+                _mm256_loadu_si256(p.add(32).cast()),
+            )
+        };
         // Per 128-bit lane: pixels 0 and 2 to the low 8 bytes.
         let pick = _mm256_setr_epi8(
             0, 1, 2, 3, 8, 9, 10, 11, -1, -1, -1, -1, -1, -1, -1, -1, //
@@ -382,7 +399,8 @@ mod avx2 {
     #[target_feature(enable = "avx2")]
     fn chroma_8(samples: &[u8], upsample: bool) -> __m128i {
         let raw = if upsample {
-            let four = _mm_cvtsi32_si128(u32::from_ne_bytes(samples[..4].try_into().unwrap()) as i32);
+            let four =
+                _mm_cvtsi32_si128(u32::from_ne_bytes(samples[..4].try_into().unwrap()) as i32);
             _mm_unpacklo_epi8(four, four)
         } else {
             _mm_cvtsi64_si128(u64::from_ne_bytes(samples[..8].try_into().unwrap()) as i64)
@@ -395,10 +413,18 @@ mod avx2 {
     /// for them (half as many with `upsample`, `y.len()` even).
     #[target_feature(enable = "avx2")]
     pub unsafe fn row_bgra(y: &[u8], u: &[u8], v: &[u8], out: &mut [u8], upsample: bool) {
-        let kr = _mm256_setr_epi16(KY, KRV, KY, KRV, KY, KRV, KY, KRV, KY, KRV, KY, KRV, KY, KRV, KY, KRV);
-        let kb = _mm256_setr_epi16(KY, KBU, KY, KBU, KY, KBU, KY, KBU, KY, KBU, KY, KBU, KY, KBU, KY, KBU);
-        let kg1 = _mm256_setr_epi16(KY, KGU, KY, KGU, KY, KGU, KY, KGU, KY, KGU, KY, KGU, KY, KGU, KY, KGU);
-        let kg2 = _mm256_setr_epi16(0, KGV, 0, KGV, 0, KGV, 0, KGV, 0, KGV, 0, KGV, 0, KGV, 0, KGV);
+        let kr = _mm256_setr_epi16(
+            KY, KRV, KY, KRV, KY, KRV, KY, KRV, KY, KRV, KY, KRV, KY, KRV, KY, KRV,
+        );
+        let kb = _mm256_setr_epi16(
+            KY, KBU, KY, KBU, KY, KBU, KY, KBU, KY, KBU, KY, KBU, KY, KBU, KY, KBU,
+        );
+        let kg1 = _mm256_setr_epi16(
+            KY, KGU, KY, KGU, KY, KGU, KY, KGU, KY, KGU, KY, KGU, KY, KGU, KY, KGU,
+        );
+        let kg2 = _mm256_setr_epi16(
+            0, KGV, 0, KGV, 0, KGV, 0, KGV, 0, KGV, 0, KGV, 0, KGV, 0, KGV,
+        );
         let half = _mm256_set1_epi32(HALF);
         let alpha = _mm256_set1_epi32(255);
         // Per lane: b0-3 g0-3 r0-3 a0-3 to b0 g0 r0 a0 b1 g1 r1 a1 ...
@@ -427,7 +453,13 @@ mod avx2 {
             // SAFETY: out holds y.len() pixels, so bytes i*4..i*4+32 are in bounds.
             unsafe { _mm256_storeu_si256(out.as_mut_ptr().add(i * 4).cast(), px) };
         }
-        scalar::row_bgra(&y[n..], &u[n / per..], &v[n / per..], &mut out[n * 4..], upsample);
+        scalar::row_bgra(
+            &y[n..],
+            &u[n / per..],
+            &v[n / per..],
+            &mut out[n * 4..],
+            upsample,
+        );
     }
 }
 
@@ -451,11 +483,23 @@ mod tests {
         }
     }
 
-    const SIZES: [(usize, usize); 7] = [(2, 2), (6, 4), (16, 2), (34, 6), (66, 4), (100, 2), (640, 4)];
+    const SIZES: [(usize, usize); 7] = [
+        (2, 2),
+        (6, 4),
+        (16, 2),
+        (34, 6),
+        (66, 4),
+        (100, 2),
+        (640, 4),
+    ];
 
     fn max_diff(a: &[u8], b: &[u8]) -> u8 {
         assert_eq!(a.len(), b.len());
-        a.iter().zip(b).map(|(x, y)| x.abs_diff(*y)).max().unwrap_or(0)
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| x.abs_diff(*y))
+            .max()
+            .unwrap_or(0)
     }
 
     fn i420_from(nv12: &gliff_proto::chroma::Nv12) -> I420 {
@@ -541,7 +585,10 @@ mod tests {
             src.y = rng.bytes(w * h);
             src.u = rng.bytes(w * h);
             src.v = rng.bytes(w * h);
-            assert!(max_diff(&yuv444_to_bgra(&src), &color::yuv444_to_bgra(&src)) <= 1, "at {w}x{h}");
+            assert!(
+                max_diff(&yuv444_to_bgra(&src), &color::yuv444_to_bgra(&src)) <= 1,
+                "at {w}x{h}"
+            );
         }
     }
 
@@ -561,7 +608,8 @@ mod tests {
             assert_eq!(y_s, y_v, "luma at width {w}");
             for step in [1, 2] {
                 let n = w / step;
-                let (mut u_s, mut v_s, mut u_v, mut v_v) = (vec![0; n], vec![0; n], vec![0; n], vec![0; n]);
+                let (mut u_s, mut v_s, mut u_v, mut v_v) =
+                    (vec![0; n], vec![0; n], vec![0; n], vec![0; n]);
                 scalar::row_uv(&bgra, &mut u_s, &mut v_s, step);
                 // SAFETY: AVX2 was detected above.
                 unsafe { avx2::row_uv(&bgra, &mut u_v, &mut v_v, step) };

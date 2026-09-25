@@ -1283,7 +1283,10 @@ impl VideoEncoder {
             Self::Cpu(enc) => {
                 let t0 = Instant::now();
                 let image = frame.buffer.read_bgra()?;
-                tracing::debug!(read_us = t0.elapsed().as_micros(), "read the captured frame");
+                tracing::debug!(
+                    read_us = t0.elapsed().as_micros(),
+                    "read the captured frame"
+                );
                 let (w, h) = (stream.0 as usize, stream.1 as usize);
                 let pixels = if (image.width, image.height) == (w, h) {
                     image.pixels
