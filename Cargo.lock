@@ -773,6 +773,7 @@ dependencies = [
  "gliff-proto",
  "openh264",
  "openh264-sys2",
+ "rayon",
  "thiserror",
  "tracing",
 ]

@@ -1,7 +1,8 @@
 //! BGRA <-> planar YUV 4:4:4, BT.709 limited range, on the CPU with rayon.
 //!
-//! The reference the compute shaders in `gliff-vk` are checked against; the
-//! streaming path itself never runs it.
+//! The reference the compute shaders in `gliff-vk` and the fixed-point
+//! kernels in `gliff-sw` are checked against; the streaming paths themselves
+//! never run it.
 
 use rayon::prelude::*;
 
