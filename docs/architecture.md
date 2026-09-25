@@ -243,6 +243,11 @@ runs clean on the probe round-trip.
 
 ## Testing
 
+- **`scripts/check.sh`** runs what CI runs (`cargo fmt --check`, `cargo
+  clippy --all-targets -- -D warnings`, `cargo test --workspace`); run it
+  before every push, and `scripts/check.sh --fix` to apply the rustfmt and
+  clippy fixes first. Clippy lints gated on the MSRV (`rust-version` in
+  `Cargo.toml`) switch on across the whole workspace when it is raised.
 - **Unit tests** cover the pure logic: AVC444 split/recombine losslessness,
   single-stream subsample/upsample, BGRA↔YUV444 colour round-trip, the H.264
   header parser against an x264 stream, framing with payloads and partial
