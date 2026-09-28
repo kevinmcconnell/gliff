@@ -12,6 +12,7 @@ optdepends=('vulkan-radeon: Vulkan on AMD'
             'vulkan-intel: Vulkan on Intel'
             'vulkan-tools: vulkaninfo for debugging'
             'vulkan-validation-layers: driver call validation for development')
+options=(!lto)
 source=()
 
 build() {
