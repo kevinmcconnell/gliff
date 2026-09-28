@@ -135,13 +135,14 @@ fn main() -> glib::ExitCode {
         .init();
     let cli = Cli::parse();
     let app = adw::Application::builder()
-        .application_id("com.gliff.Client")
+        .application_id("com.github.omacom.Gliff")
         .build();
     // The theme is per display, so it is set up once. The monitor lives in
     // this closure for the app's lifetime; dropping it would stop theme
     // updates.
     let theme_monitor = RefCell::new(None);
     app.connect_startup(move |_| {
+        gtk::Window::set_default_icon_name("com.github.omacom.Gliff");
         *theme_monitor.borrow_mut() = theme::follow_omarchy_theme();
     });
     app.connect_activate(move |app| build_ui(app, &cli));

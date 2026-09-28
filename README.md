@@ -64,6 +64,10 @@ GPU server support; and testing on NVIDIA Vulkan drivers.
 Prebuilt x86_64 binaries are on the [releases
 page](https://github.com/kevinmcconnell/gliff/releases): every push to `main`
 updates the `latest` pre-release, and `v*` tags make permanent releases.
+The Arch package (`makepkg -si` with the repo `PKGBUILD`) also installs a
+launcher entry and icon. From a tarball, copy the two files in `data/` to
+`~/.local/share/applications/` and
+`~/.local/share/icons/hicolor/scalable/apps/`.
 
 To build from source:
 

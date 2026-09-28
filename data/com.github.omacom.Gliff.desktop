@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Gliff
+GenericName=Remote Desktop
+Comment=Remote-desktop a Hyprland session over SSH
+Exec=gliff
+Icon=com.github.omacom.Gliff
+Terminal=false
+Categories=Network;RemoteAccess;
+Keywords=remote;desktop;ssh;hyprland;
+StartupWMClass=com.github.omacom.Gliff

@@ -26,4 +26,6 @@ package() {
     install -Dm755 target/release/gliff-probe  "$pkgdir/usr/bin/gliff-probe"
     install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
     install -Dm644 docs/hardware-quirks.md "$pkgdir/usr/share/doc/$pkgname/hardware-quirks.md"
+    install -Dm644 data/com.github.omacom.Gliff.desktop "$pkgdir/usr/share/applications/com.github.omacom.Gliff.desktop"
+    install -Dm644 data/com.github.omacom.Gliff.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/com.github.omacom.Gliff.svg"
 }
