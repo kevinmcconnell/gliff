@@ -381,8 +381,10 @@ pub struct Decoder {
     main: H264Decoder,
     aux: Option<H264Decoder>,
     /// Access units fed minus pictures returned: what the decoders still
-    /// hold. Zero for Baseline streams; one for a High-profile stream, whose
-    /// newest picture waits for the next unit or a [`Decoder::flush`].
+    /// hold. Zero for Baseline streams. A High-profile stream holds its
+    /// first picture until the next unit or a [`Decoder::flush`]; after
+    /// that OpenH264 releases each picture at once, since our encoder steps
+    /// the POC by one (see `gliff_vk` encoder).
     held: u32,
 }
 
@@ -402,9 +404,9 @@ impl Decoder {
     }
 
     /// Decode one access unit pair and recombine to a BGRA frame. `None`
-    /// when no picture is ready yet: a stream without reordering hints
-    /// (hardware encoders emit no VUI) comes out one access unit late.
-    /// Both decoders are fed every unit so the pair stays in step.
+    /// when no picture is ready yet: the first picture of a High-profile
+    /// stream comes out one access unit late. Both decoders are fed every
+    /// unit so the pair stays in step.
     pub fn decode(&mut self, main: &[u8], aux: &[u8]) -> Result<Option<BgraFrame>> {
         self.held += 1;
         let frame = match &mut self.aux {
@@ -426,9 +428,11 @@ impl Decoder {
         Ok(Some(frame))
     }
 
-    /// Drain the picture still buffered in the decoders: for the last access
-    /// unit of a run, or to put the newest picture on screen when the stream
-    /// goes quiet. Decoding continues cleanly afterwards.
+    /// Drain the picture still buffered in the decoders, to put it on screen
+    /// when the stream goes quiet. Call it rarely: each OpenH264 flush leaks
+    /// one picture slot until the next IDR, and the fourth in a row fails
+    /// every following decode with `dsOutOfMemory`. With a POC step of one
+    /// only the first picture after a new decoder is ever held.
     pub fn flush(&mut self) -> Result<Option<BgraFrame>> {
         let frame = match &mut self.aux {
             Some(dec) => {
@@ -452,10 +456,10 @@ impl Decoder {
 }
 
 fn new_h264_decoder() -> Result<H264Decoder> {
-    // No flush after decode: a flush ejects pictures from the DPB, which
-    // breaks the reference chain of a low-delay stream (seen as
-    // dsOutOfMemory on the fourth frame of a hardware-encoded stream).
-    // Low-delay streams output every picture without it.
+    // No flush after decode: every OpenH264 flush leaks a picture slot in
+    // single-thread mode (the released picture's buffer is never unreferenced),
+    // and the pool is exhausted after three, seen as dsOutOfMemory on the
+    // fourth frame. Pictures come out without it, see `Decoder::flush`.
     Ok(H264Decoder::with_api_config(
         OpenH264API::from_source(),
         DecoderConfig::new().flush_after_decode(Flush::NoFlush),
