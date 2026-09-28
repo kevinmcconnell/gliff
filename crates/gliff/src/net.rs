@@ -424,6 +424,9 @@ where
     let mut in_decoder: std::collections::VecDeque<Geometry> = std::collections::VecDeque::new();
     let mut zoom = 1u32;
     let pool = gliff_sw::PixelPool::default();
+    // Geometry of the picture the GPU decoder holds, for a redraw: a
+    // geometry-only StreamConfig may have moved `view` on since.
+    let mut last_gpu_geometry: Option<Geometry> = None;
     loop {
         let read = tokio::select! {
             read = reader.read_msg::<ServerMsg>() => read,
@@ -453,9 +456,11 @@ where
                     }
                 };
                 if let Some(frame) = redrawn {
+                    let (stream, view, scale_milli) =
+                        last_gpu_geometry.unwrap_or(((width, height), view, scale_milli));
                     let picture = Picture {
                         frame,
-                        stream: (width, height),
+                        stream,
                         view,
                         scale_milli,
                     };
@@ -578,6 +583,9 @@ where
                             in_decoder
                                 .pop_front()
                                 .unwrap_or(((width, height), view, scale_milli));
+                        if matches!(frame, Frame::Dmabuf(_)) {
+                            last_gpu_geometry = Some((stream, pic_view, pic_scale));
+                        }
                         let picture = Picture {
                             frame,
                             stream,

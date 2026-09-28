@@ -1230,9 +1230,15 @@ fn install_fullscreen_bars(
     entry: &gtk::Entry,
     recent_popover: &gtk::Popover,
 ) {
+    // GTK4 focuses the text inside the entry, so ask for the focus widget
+    // and walk up.
     let address_bar_in_use = {
-        let (entry, popover) = (entry.clone(), recent_popover.clone());
-        Rc::new(move || popover.is_visible() || entry.has_focus())
+        let (window, entry, popover) = (window.clone(), entry.clone(), recent_popover.clone());
+        Rc::new(move || {
+            popover.is_visible()
+                || gtk::prelude::GtkWindowExt::focus(&window)
+                    .is_some_and(|f| f == entry || f.is_ancestor(&entry))
+        })
     };
     let top = gtk::Revealer::builder()
         .transition_type(gtk::RevealerTransitionType::SlideDown)
@@ -1314,6 +1320,30 @@ fn install_fullscreen_bars(
         });
     }
     overlay.add_controller(motion);
+
+    // Keyboard dismissal (Escape, Enter) moves focus without a pointer
+    // event; hide the header then, unless the pointer still rests on it.
+    let hide_when_free = {
+        let (window, top, header) = (window.clone(), top.clone(), header.clone());
+        Rc::new(move || {
+            if !window.is_fullscreen() || address_bar_in_use() {
+                return;
+            }
+            let pointer_on_header = WidgetExt::display(&window)
+                .default_seat()
+                .and_then(|s| s.pointer())
+                .and_then(|p| window.surface().and_then(|s| s.device_position(&p)))
+                .is_some_and(|(_, y, _)| y <= header.height() as f64 + LEAVE_MARGIN);
+            if !pointer_on_header {
+                top.set_reveal_child(false);
+            }
+        })
+    };
+    {
+        let hide = hide_when_free.clone();
+        window.connect_focus_widget_notify(move |_| hide());
+    }
+    recent_popover.connect_hide(move |_| hide_when_free());
 }
 
 /// Ask the server to match the window, once the size has settled for 200 ms

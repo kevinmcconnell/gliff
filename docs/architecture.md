@@ -193,7 +193,16 @@ runs clean on the probe round-trip.
   linear dmabuf and the UI wraps it in a `GdkDmabufTexture` on a
   `gtk::Picture`. GTK imports the dmabuf itself (through its GL/Vulkan renderer
   or, failing that, a CPU map), so the client needs no GL code and no fallback
-  path of its own.
+  path of its own. The CPU tier hands GTK a memory texture from a small pool
+  of pixel buffers instead. The frame is drawn at a whole number of device
+  pixels per stream pixel: the largest that fits the widget (`paintable::layout`),
+  else a fractional shrink. GTK cannot enlarge a texture sharply on a HiDPI
+  surface (its scaled-texture node renders through an offscreen at logical
+  resolution), so the client asks the decoder for that integer zoom and the
+  recombine shader, or a CPU row copy, replicates each pixel into a zoom x zoom
+  block; GTK then draws the device-sized texture 1:1. In fullscreen the header
+  and status bars leave the layout and slide in over the picture at the top
+  and bottom edges.
 
 - **Theme.** `theme.rs` reads Omarchy 4's `colors.toml` with the same lenient
   line parser and fallback chain as `omarchy-theme-color`, and emits a `:root`

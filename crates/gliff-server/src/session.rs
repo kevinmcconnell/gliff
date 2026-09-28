@@ -528,7 +528,15 @@ impl Session {
                     }
                 }
             }
-            ClientMsg::RequestKeyframe => self.want_keyframe = true,
+            ClientMsg::RequestKeyframe => {
+                self.want_keyframe = true;
+                // A still screen has no capture pending, so answer with the
+                // kept frame instead of waiting for the screen to change.
+                if self.pending.is_none() && self.last_frame.is_some() {
+                    self.refines = 0;
+                    self.next_refine_at = Instant::now();
+                }
+            }
             ClientMsg::Key { keycode, pressed } => self.inject(InputCmd::Key {
                 code: keycode,
                 pressed,
