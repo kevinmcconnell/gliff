@@ -77,7 +77,7 @@ struct App {
     window: adw::ApplicationWindow,
     /// The picture, upcast; input controllers attach to it and we measure it.
     video: gtk::Widget,
-    /// What the picture shows: the latest frame at 1:1 device pixels.
+    /// What the picture shows: the latest frame, fitted to the widget.
     frame: paintable::FramePaintable,
     stats: gtk::Label,
     status: gtk::Label,
@@ -242,12 +242,13 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
     let status = gtk::Label::builder().label("Not connected").build();
 
     // The video is a plain Picture: each decoded frame is a dmabuf that GTK
-    // imports as a texture and letterboxes with Contain.
+    // imports as a texture and letterboxes with Contain, so a screen smaller
+    // than the window is enlarged to fill it at its own aspect ratio.
     let picture = gtk::Picture::builder()
         .hexpand(true)
         .vexpand(true)
         .can_shrink(true)
-        .content_fit(gtk::ContentFit::ScaleDown)
+        .content_fit(gtk::ContentFit::Contain)
         .css_classes(["video"])
         .build();
     let frame = paintable::FramePaintable::default();
@@ -835,13 +836,13 @@ fn to_remote(ui: &App, x: f64, y: f64) -> (f64, f64) {
         return (0.0, 0.0);
     }
     // The frame is drawn into the view box (view / device scale in logical
-    // pixels), centred, and only ever shrunk to fit (ScaleDown). A
-    // reduced-resolution stream is stretched to the same box, so the
+    // pixels), centred, and scaled either way to fit the widget (Contain).
+    // A reduced-resolution stream is stretched to the same box, so the
     // letterbox comes from the view, and stream pixels from the ratio.
     let device = ui.video.scale_factor().max(1) as f64;
     let (lw, lh) = (vw as f64 / device, vh as f64 / device);
     let (aw, ah) = (ui.video.width() as f64, ui.video.height() as f64);
-    let fit = (aw / lw).min(ah / lh).min(1.0);
+    let fit = (aw / lw).min(ah / lh);
     let (fw, fh) = (lw * fit, lh * fit);
     let (ox, oy) = ((aw - fw) / 2.0, (ah - fh) / 2.0);
     let vx = (x - ox) / fit * device;

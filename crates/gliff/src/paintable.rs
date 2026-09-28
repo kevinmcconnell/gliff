@@ -3,12 +3,12 @@
 //! GTK measures a texture in logical pixels, so on a HiDPI display a 1:1
 //! stream would be drawn `scale_factor` times too large. This paintable
 //! reports its size as `view / scale_factor`, where `view` is the
-//! full-quality fit size the server declared; with `ContentFit::ScaleDown`
-//! the picture then shows the frame 1:1 when it fits and shrinks it when
-//! the window is smaller, but never enlarges it beyond the view. A stream
-//! sent at reduced resolution (view larger than the texture) is stretched
-//! up to the view size, so it fills the same area on screen instead of
-//! drawing small.
+//! full-quality fit size the server declared; with `ContentFit::Contain`
+//! the picture then shows the frame 1:1 when the window matches the view
+//! and otherwise scales it, up or down, to fill the window at the view's
+//! aspect ratio. A stream sent at reduced resolution (view larger than the
+//! texture) is stretched up to the view size, so it fills the same area on
+//! screen instead of drawing small.
 
 use std::cell::{Cell, RefCell};
 
