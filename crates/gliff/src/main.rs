@@ -77,7 +77,7 @@ struct App {
     window: adw::ApplicationWindow,
     /// The picture, upcast; input controllers attach to it and we measure it.
     video: gtk::Widget,
-    /// What the picture shows: the latest frame, fitted to the widget.
+    /// What the picture shows: the latest frame at an integer scale.
     frame: paintable::FramePaintable,
     stats: gtk::Label,
     status: gtk::Label,
@@ -241,14 +241,14 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         .build();
     let status = gtk::Label::builder().label("Not connected").build();
 
-    // The video is a plain Picture: each decoded frame is a dmabuf that GTK
-    // imports as a texture and letterboxes with Contain, so a screen smaller
-    // than the window is enlarged to fill it at its own aspect ratio.
+    // The video is a plain Picture given the whole allocation (Fill); the
+    // paintable places the frame itself at an integer scale, see
+    // paintable::layout.
     let picture = gtk::Picture::builder()
         .hexpand(true)
         .vexpand(true)
         .can_shrink(true)
-        .content_fit(gtk::ContentFit::Contain)
+        .content_fit(gtk::ContentFit::Fill)
         .css_classes(["video"])
         .build();
     let frame = paintable::FramePaintable::default();
@@ -266,6 +266,14 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
     content.append(&overlay);
     content.append(&status);
     window.set_content(Some(&content));
+    install_fullscreen_bars(
+        &window,
+        &content,
+        &overlay,
+        &header,
+        &status,
+        &fullscreen_btn,
+    );
 
     let ui = Rc::new(App {
         window: window.clone(),
@@ -320,6 +328,7 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
     let css = gtk::CssProvider::new();
     css.load_from_string(concat!(
         ".video { background: #000; }",
+        ".floating-status { background: var(--headerbar-bg-color); padding: 4px; }",
         ".stats { background: rgba(0,0,0,0.6); color: #fff; padding: 6px; margin: 6px; border-radius: 6px; font-family: monospace; }",
         ".transfers { margin: 6px; }",
         ".transfer { background: rgba(0,0,0,0.7); color: #fff; padding: 6px 8px; border-radius: 6px; }",
@@ -827,26 +836,22 @@ fn has_visible_shape(argb: &[u8]) -> bool {
 }
 
 /// Map a widget-space point to the remote output's logical coordinates:
-/// undo the letterbox to physical stream pixels, then divide by the remote
-/// scale, which is what the virtual pointer expects.
+/// invert the frame layout to view pixels, scale to physical stream pixels
+/// (a reduced-resolution stream is stretched to the view box), then divide
+/// by the remote scale, which is what the virtual pointer expects.
 fn to_remote(ui: &App, x: f64, y: f64) -> (f64, f64) {
     let (rw, rh) = ui.stream_size.get();
     let (vw, vh) = ui.stream_view.get();
-    if rw == 0 || rh == 0 || vw == 0 || vh == 0 {
+    if rw == 0 || rh == 0 {
         return (0.0, 0.0);
     }
-    // The frame is drawn into the view box (view / device scale in logical
-    // pixels), centred, and scaled either way to fit the widget (Contain).
-    // A reduced-resolution stream is stretched to the same box, so the
-    // letterbox comes from the view, and stream pixels from the ratio.
-    let device = ui.video.scale_factor().max(1) as f64;
-    let (lw, lh) = (vw as f64 / device, vh as f64 / device);
+    let device = ui.video.scale_factor().max(1);
     let (aw, ah) = (ui.video.width() as f64, ui.video.height() as f64);
-    let fit = (aw / lw).min(ah / lh);
-    let (fw, fh) = (lw * fit, lh * fit);
-    let (ox, oy) = ((aw - fw) / 2.0, (ah - fh) / 2.0);
-    let vx = (x - ox) / fit * device;
-    let vy = (y - oy) / fit * device;
+    let Some(l) = paintable::layout((vw, vh), device, aw, ah) else {
+        return (0.0, 0.0);
+    };
+    let vx = (x - l.x) / l.factor * device as f64;
+    let vy = (y - l.y) / l.factor * device as f64;
     let px = (vx * rw as f64 / vw as f64).clamp(0.0, rw as f64);
     let py = (vy * rh as f64 / vh as f64).clamp(0.0, rh as f64);
     let scale = ui.stream_scale.get().max(0.01) as f64;
@@ -1201,6 +1206,92 @@ fn install_input_handlers(
         });
     }
     video.add_controller(focus);
+}
+
+/// In fullscreen the header and status bars leave the layout, so the picture
+/// gets the whole screen, and slide in over it while the pointer is at the
+/// top or bottom edge.
+fn install_fullscreen_bars(
+    window: &adw::ApplicationWindow,
+    content: &gtk::Box,
+    overlay: &gtk::Overlay,
+    header: &adw::HeaderBar,
+    status: &gtk::Label,
+    fullscreen_btn: &gtk::ToggleButton,
+) {
+    let top = gtk::Revealer::builder()
+        .transition_type(gtk::RevealerTransitionType::SlideDown)
+        .valign(gtk::Align::Start)
+        .build();
+    let bottom = gtk::Revealer::builder()
+        .transition_type(gtk::RevealerTransitionType::SlideUp)
+        .valign(gtk::Align::End)
+        .build();
+    overlay.add_overlay(&top);
+    overlay.add_overlay(&bottom);
+
+    {
+        let (content, header, status) = (content.clone(), header.clone(), status.clone());
+        let (top, bottom, fullscreen_btn) = (top.clone(), bottom.clone(), fullscreen_btn.clone());
+        window.connect_fullscreened_notify(move |w| {
+            let full = w.is_fullscreen();
+            if fullscreen_btn.is_active() != full {
+                fullscreen_btn.set_active(full);
+            }
+            if full {
+                content.remove(&header);
+                content.remove(&status);
+                top.set_child(Some(&header));
+                bottom.set_child(Some(&status));
+                status.add_css_class("floating-status");
+            } else {
+                top.set_reveal_child(false);
+                bottom.set_reveal_child(false);
+                top.set_child(None::<&gtk::Widget>);
+                bottom.set_child(None::<&gtk::Widget>);
+                status.remove_css_class("floating-status");
+                content.prepend(&header);
+                content.append(&status);
+            }
+        });
+    }
+
+    const EDGE: f64 = 2.0;
+    const LEAVE_MARGIN: f64 = 8.0;
+    let motion = gtk::EventControllerMotion::new();
+    {
+        let (window, overlay, header, status) = (
+            window.clone(),
+            overlay.clone(),
+            header.clone(),
+            status.clone(),
+        );
+        let (top, bottom) = (top.clone(), bottom.clone());
+        motion.connect_motion(move |_, _, y| {
+            if !window.is_fullscreen() {
+                return;
+            }
+            let h = overlay.height() as f64;
+            if y <= EDGE {
+                top.set_reveal_child(true);
+            } else if top.reveals_child() && y > header.height() as f64 + LEAVE_MARGIN {
+                top.set_reveal_child(false);
+            }
+            if y >= h - EDGE {
+                bottom.set_reveal_child(true);
+            } else if bottom.reveals_child() && y < h - status.height() as f64 - LEAVE_MARGIN {
+                bottom.set_reveal_child(false);
+            }
+        });
+    }
+    {
+        let (top, bottom) = (top.clone(), bottom.clone());
+        motion.connect_leave(move |_| {
+            top.set_reveal_child(false);
+            bottom.set_reveal_child(false);
+        });
+    }
+    overlay.add_controller(motion);
 }
 
 /// Ask the server to match the window, once the size has settled for 200 ms
