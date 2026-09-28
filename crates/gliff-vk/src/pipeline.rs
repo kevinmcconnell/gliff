@@ -198,13 +198,16 @@ pub struct DisplayFrame {
     pub offset: u32,
     pub fourcc: drm_fourcc::DrmFourcc,
     pub modifier: u64,
+    /// Display pixels per stream pixel, see [`Decoder::set_zoom`].
+    pub zoom: u32,
+    ring: u64,
     index: usize,
-    release: Sender<usize>,
+    release: Sender<(u64, usize)>,
 }
 
 impl Drop for DisplayFrame {
     fn drop(&mut self) {
-        let _ = self.release.send(self.index);
+        let _ = self.release.send((self.ring, self.index));
     }
 }
 
@@ -221,28 +224,28 @@ pub struct Decoder {
     main: H264Decoder,
     aux: Option<H264Decoder>,
     outputs: Vec<(Image, ExportedDmabuf)>,
+    /// Counts output rings; a release from an older ring is ignored.
+    ring: u64,
     /// Images handed out as `DisplayFrame`s and not yet dropped.
     busy: Vec<bool>,
     /// Busy images in hand-out order, oldest first.
     handed_out: std::collections::VecDeque<usize>,
-    release_tx: Sender<usize>,
-    release_rx: Receiver<usize>,
+    release_tx: Sender<(u64, usize)>,
+    release_rx: Receiver<(u64, usize)>,
     /// CPU readback staging, allocated on first use (tests and the probe).
     readback: Option<HostBuffer>,
     width: u32,
     height: u32,
+    zoom: u32,
+    /// The last `decode_to_output` produced a picture pair that is complete
+    /// and in shader-read layout, so `redraw` may sample it.
+    last_complete: bool,
 }
 
 impl Decoder {
     pub fn new(gpu: &Arc<Gpu>, dual: bool, width: u32, height: u32) -> Result<Self> {
         let (release_tx, release_rx) = channel();
-        let outputs = (0..DISPLAY_RING)
-            .map(|_| {
-                let img = Image::exportable_bgra(gpu, width, height)?;
-                let dmabuf = img.export_dmabuf()?;
-                Ok((img, dmabuf))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let outputs = Self::output_ring(gpu, width, height)?;
         Ok(Self {
             gpu: gpu.clone(),
             timeline: Timeline::new(gpu)?,
@@ -255,6 +258,7 @@ impl Decoder {
                 None
             },
             outputs,
+            ring: 0,
             busy: vec![false; DISPLAY_RING],
             handed_out: std::collections::VecDeque::new(),
             release_tx,
@@ -262,6 +266,109 @@ impl Decoder {
             readback: None,
             width,
             height,
+            zoom: 1,
+            last_complete: false,
+        })
+    }
+
+    fn output_ring(
+        gpu: &Arc<Gpu>,
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<(Image, ExportedDmabuf)>> {
+        (0..DISPLAY_RING)
+            .map(|_| {
+                let img = Image::exportable_bgra(gpu, width, height)?;
+                let dmabuf = img.export_dmabuf()?;
+                Ok((img, dmabuf))
+            })
+            .collect()
+    }
+
+    /// Write each stream pixel as a `zoom` x `zoom` block, so the display
+    /// side shows the frame at that integer scale with no resampling. The
+    /// request is capped so the output fits the device's image size limit.
+    /// Returns the zoom in effect. Frames already handed out keep their old
+    /// images alive through their dmabuf fds.
+    pub fn set_zoom(&mut self, zoom: u32) -> Result<u32> {
+        // SAFETY: valid instance and physical device handles.
+        let max_side = unsafe {
+            self.gpu
+                .instance
+                .get_physical_device_properties(self.gpu.physical)
+                .limits
+                .max_image_dimension2_d
+        };
+        let cap = (max_side / self.width.max(1)).min(max_side / self.height.max(1));
+        let zoom = zoom.clamp(1, cap.max(1));
+        if zoom == self.zoom {
+            return Ok(zoom);
+        }
+        self.compute.wait()?;
+        let outputs = Self::output_ring(&self.gpu, self.width * zoom, self.height * zoom)?;
+        self.outputs = outputs;
+        self.ring += 1;
+        self.busy = vec![false; DISPLAY_RING];
+        self.handed_out.clear();
+        self.readback = None;
+        self.zoom = zoom;
+        Ok(zoom)
+    }
+
+    pub fn zoom(&self) -> u32 {
+        self.zoom
+    }
+
+    /// Recombine the last decoded picture again into a fresh display frame,
+    /// as after a zoom change on a still screen. `None` before the first
+    /// complete picture, or after a decode that failed part way.
+    pub fn redraw(&mut self) -> Result<Option<DisplayFrame>> {
+        if !self.last_complete {
+            return Ok(None);
+        }
+        let idx = self.free_output();
+        let (dst, _) = &self.outputs[idx];
+        let (recombine, w, h, zoom) = (&self.recombine, self.width, self.height, self.zoom);
+        let Some(main_img) = self.main.last_output() else {
+            return Ok(None);
+        };
+        let aux_img = match &self.aux {
+            Some(a) => match a.last_output() {
+                Some(img) => Some(img),
+                None => return Ok(None),
+            },
+            None => None,
+        };
+        self.compute
+            .run(self.timeline.semaphore, None, None, true, |cmd| {
+                main_img.transition(cmd, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+                if let Some(a) = aux_img {
+                    a.transition(cmd, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+                }
+                dst.transition(cmd, vk::ImageLayout::GENERAL);
+                recombine.record(cmd, main_img, aux_img, dst, (w, h), zoom)?;
+                dst.memory_barrier(cmd);
+                Ok(())
+            })?;
+        Ok(Some(self.hand_out(idx)?))
+    }
+
+    fn hand_out(&mut self, idx: usize) -> Result<DisplayFrame> {
+        let (_, dmabuf) = &self.outputs[idx];
+        self.busy[idx] = true;
+        self.handed_out.push_back(idx);
+        Ok(DisplayFrame {
+            fd: dmabuf.fd.as_fd().try_clone_to_owned()?,
+            width: dmabuf.width,
+            height: dmabuf.height,
+            stride: dmabuf.stride,
+            offset: dmabuf.offset,
+            fourcc: dmabuf.fourcc,
+            modifier: dmabuf.modifier,
+            zoom: self.zoom,
+            ring: self.ring,
+            index: idx,
+            release: self.release_tx.clone(),
         })
     }
 
@@ -270,20 +377,7 @@ impl Decoder {
     pub fn decode(&mut self, main: &[u8], aux: &[u8]) -> Result<Option<DisplayFrame>> {
         let idx = self.decode_to_output(main, aux)?;
         let Some(idx) = idx else { return Ok(None) };
-        let (_, dmabuf) = &self.outputs[idx];
-        self.busy[idx] = true;
-        self.handed_out.push_back(idx);
-        Ok(Some(DisplayFrame {
-            fd: dmabuf.fd.as_fd().try_clone_to_owned()?,
-            width: dmabuf.width,
-            height: dmabuf.height,
-            stride: dmabuf.stride,
-            offset: dmabuf.offset,
-            fourcc: dmabuf.fourcc,
-            modifier: dmabuf.modifier,
-            index: idx,
-            release: self.release_tx.clone(),
-        }))
+        Ok(Some(self.hand_out(idx)?))
     }
 
     /// Decode and read the BGRA pixels back to the CPU (tests and the probe).
@@ -292,7 +386,11 @@ impl Decoder {
             return Ok(None);
         };
         let (image, _) = &self.outputs[idx];
-        let size = (self.width * self.height * 4) as usize;
+        let (w, h) = (
+            self.width as usize * self.zoom as usize,
+            self.height as usize * self.zoom as usize,
+        );
+        let size = w * h * 4;
         if self.readback.is_none() {
             self.readback = Some(HostBuffer::new(
                 &self.gpu,
@@ -314,14 +412,14 @@ impl Decoder {
     /// when all are out; a display that never releases gets the oldest reused.
     fn free_output(&mut self) -> usize {
         loop {
-            while let Ok(i) = self.release_rx.try_recv() {
-                self.mark_free(i);
+            while let Ok(r) = self.release_rx.try_recv() {
+                self.mark_free(r);
             }
             if let Some(i) = self.busy.iter().position(|b| !b) {
                 return i;
             }
             match self.release_rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(i) => self.mark_free(i),
+                Ok(r) => self.mark_free(r),
                 Err(_) => {
                     // Reclaim only the image handed out longest ago: it is the
                     // one least likely to still be on screen.
@@ -334,13 +432,17 @@ impl Decoder {
         }
     }
 
-    fn mark_free(&mut self, i: usize) {
+    fn mark_free(&mut self, (ring, i): (u64, usize)) {
+        if ring != self.ring {
+            return;
+        }
         self.busy[i] = false;
         self.handed_out.retain(|&h| h != i);
     }
 
     fn decode_to_output(&mut self, main: &[u8], aux: &[u8]) -> Result<Option<usize>> {
         let t0 = std::time::Instant::now();
+        self.last_complete = false;
         let idx = self.free_output();
         let main_done = self.timeline.advance();
         let Some(main_img) = self.main.decode(main, &self.timeline, main_done)? else {
@@ -359,7 +461,7 @@ impl Decoder {
         };
         let t_aux = t0.elapsed() - t_main;
         let (dst, _) = &self.outputs[idx];
-        let (recombine, w, h) = (&self.recombine, self.width, self.height);
+        let (recombine, w, h, zoom) = (&self.recombine, self.width, self.height, self.zoom);
         self.compute
             .run(self.timeline.semaphore, Some(wait), None, true, |cmd| {
                 main_img.transition(cmd, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
@@ -367,10 +469,11 @@ impl Decoder {
                     a.transition(cmd, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
                 }
                 dst.transition(cmd, vk::ImageLayout::GENERAL);
-                recombine.record(cmd, main_img, aux_img, dst, w, h)?;
+                recombine.record(cmd, main_img, aux_img, dst, (w, h), zoom)?;
                 dst.memory_barrier(cmd);
                 Ok(())
             })?;
+        self.last_complete = true;
         tracing::debug!(
             submit_main_us = t_main.as_micros(),
             submit_aux_us = t_aux.as_micros(),

@@ -68,6 +68,8 @@ struct Stream {
     slots: Vec<Option<DpbPicture>>,
     coded: vk::Extent2D,
     started: bool,
+    /// The picture the last `decode` returned, valid until the next one.
+    last_output: Option<usize>,
 }
 
 pub struct H264Decoder {
@@ -464,7 +466,15 @@ impl H264Decoder {
         } else {
             header.frame_num
         };
+        stream.last_output = Some(output_index);
         Ok(Some(stream.pictures.output(output_index)))
+    }
+
+    /// The picture the last `decode` returned, if any; it stays valid until
+    /// the next `decode`.
+    pub(crate) fn last_output(&self) -> Option<&Image> {
+        let stream = self.stream.as_ref()?;
+        stream.last_output.map(|i| stream.pictures.output(i))
     }
 
     /// Wait for all submitted decodes to finish (before teardown or resize).
@@ -532,6 +542,7 @@ impl H264Decoder {
                 slots: vec![None; dpb_slots as usize],
                 coded,
                 started: false,
+                last_output: None,
             })
         })?;
         tracing::info!(

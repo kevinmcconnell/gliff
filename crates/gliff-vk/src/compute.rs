@@ -18,6 +18,8 @@ struct Push {
     width: i32,
     height: i32,
     has_aux: i32,
+    /// Output pixels per source pixel; only the recombine shader reads it.
+    zoom: i32,
 }
 
 /// One compute pipeline with a fixed descriptor layout: some sampled images
@@ -138,6 +140,7 @@ impl Pass {
         width: u32,
         height: u32,
         has_aux: bool,
+        zoom: u32,
     ) -> Result<()> {
         debug_assert_eq!(views.len() as u32, self.sampled + self.storage);
         let dev = &self.gpu.device;
@@ -197,6 +200,7 @@ impl Pass {
                 width: width as i32,
                 height: height as i32,
                 has_aux: has_aux as i32,
+                zoom: zoom.max(1) as i32,
             };
             let bytes = std::slice::from_raw_parts(
                 (&push as *const Push).cast::<u8>(),
@@ -259,7 +263,8 @@ impl Split {
             aux_views.0,
             aux_views.1,
         ];
-        self.0.dispatch(cmd, &views, width, height, aux.is_some())
+        self.0
+            .dispatch(cmd, &views, width, height, aux.is_some(), 1)
     }
 }
 
@@ -277,15 +282,16 @@ impl Recombine {
         )?))
     }
 
-    /// Inputs must be in SHADER_READ_ONLY_OPTIMAL and `dst` in GENERAL.
+    /// Inputs must be in SHADER_READ_ONLY_OPTIMAL and `dst` in GENERAL;
+    /// `dst` is `zoom` times the stream size in each direction.
     pub(crate) fn record(
         &self,
         cmd: vk::CommandBuffer,
         main: &Image,
         aux: Option<&Image>,
         dst: &Image,
-        width: u32,
-        height: u32,
+        (width, height): (u32, u32),
+        zoom: u32,
     ) -> Result<()> {
         let aux_views = aux
             .map(|a| (a.plane_views[0], a.plane_views[1]))
@@ -297,6 +303,7 @@ impl Recombine {
             aux_views.1,
             dst.view0(),
         ];
-        self.0.dispatch(cmd, &views, width, height, aux.is_some())
+        self.0
+            .dispatch(cmd, &views, width, height, aux.is_some(), zoom)
     }
 }

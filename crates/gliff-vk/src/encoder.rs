@@ -761,7 +761,11 @@ impl H264Encoder {
         self.slots[setup_slot] = Some(current);
         self.current_ref = Some(setup_slot);
         self.frame_num = (self.frame_num + 1) % (1 << (LOG2_MAX_FRAME_NUM_MINUS4 + 4));
-        self.poc += 2;
+        // One per frame, not the customary two: OpenH264 (the CPU client)
+        // buffers a non-Baseline picture until the next arrives unless its
+        // POC is at most one above the last one shown. A step of one lets
+        // it show each picture at once, so a still screen needs no flush.
+        self.poc += 1;
         self.started = true;
         Ok(PendingEncode { idr })
     }

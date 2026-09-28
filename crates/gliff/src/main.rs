@@ -77,7 +77,7 @@ struct App {
     window: adw::ApplicationWindow,
     /// The picture, upcast; input controllers attach to it and we measure it.
     video: gtk::Widget,
-    /// What the picture shows: the latest frame, fitted to the widget.
+    /// What the picture shows: the latest frame at an integer scale.
     frame: paintable::FramePaintable,
     stats: gtk::Label,
     status: gtk::Label,
@@ -106,6 +106,8 @@ struct App {
     view_size: Cell<(u32, u32)>,
     /// The size last asked of the server, so a pending resize is not repeated.
     resize_requested: Cell<(u32, u32)>,
+    /// The output zoom last asked of the decoder; a new worker starts at 1.
+    zoom: Cell<u32>,
     input_tx: RefCell<Option<OutSender>>,
     /// Evdev codes currently held on the remote, so they can all be released
     /// when the keyboard is handed back to the local compositor.
@@ -241,14 +243,14 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         .build();
     let status = gtk::Label::builder().label("Not connected").build();
 
-    // The video is a plain Picture: each decoded frame is a dmabuf that GTK
-    // imports as a texture and letterboxes with Contain, so a screen smaller
-    // than the window is enlarged to fill it at its own aspect ratio.
+    // The video is a plain Picture given the whole allocation (Fill); the
+    // paintable places the frame itself at an integer scale, see
+    // paintable::layout.
     let picture = gtk::Picture::builder()
         .hexpand(true)
         .vexpand(true)
         .can_shrink(true)
-        .content_fit(gtk::ContentFit::Contain)
+        .content_fit(gtk::ContentFit::Fill)
         .css_classes(["video"])
         .build();
     let frame = paintable::FramePaintable::default();
@@ -266,6 +268,16 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
     content.append(&overlay);
     content.append(&status);
     window.set_content(Some(&content));
+    install_fullscreen_bars(
+        &window,
+        &content,
+        &overlay,
+        &header,
+        &status,
+        &fullscreen_btn,
+        &entry,
+        &recent_popover,
+    );
 
     let ui = Rc::new(App {
         window: window.clone(),
@@ -284,6 +296,7 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         stream_scale: Cell::new(1.0),
         view_size: Cell::new((0, 0)),
         resize_requested: Cell::new((0, 0)),
+        zoom: Cell::new(1),
         input_tx: RefCell::new(None),
         pressed_keys: RefCell::new(BTreeSet::new()),
         endpoint: RefCell::new(None),
@@ -320,6 +333,7 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
     let css = gtk::CssProvider::new();
     css.load_from_string(concat!(
         ".video { background: #000; }",
+        ".floating-status { background: var(--headerbar-bg-color); padding: 4px; }",
         ".stats { background: rgba(0,0,0,0.6); color: #fff; padding: 6px; margin: 6px; border-radius: 6px; font-family: monospace; }",
         ".transfers { margin: 6px; }",
         ".transfer { background: rgba(0,0,0,0.7); color: #fff; padding: 6px 8px; border-radius: 6px; }",
@@ -537,6 +551,7 @@ fn start_session(ui: Rc<App>, endpoint: Endpoint) {
     // Replacing the sender closes the old worker's input, which ends it.
     *ui.input_tx.borrow_mut() = Some(input_tx);
     *ui.endpoint.borrow_mut() = Some(endpoint.clone());
+    ui.zoom.set(1);
     let session = ui.session.get() + 1;
     ui.session.set(session);
     ui.status.set_text("Connecting…");
@@ -827,26 +842,22 @@ fn has_visible_shape(argb: &[u8]) -> bool {
 }
 
 /// Map a widget-space point to the remote output's logical coordinates:
-/// undo the letterbox to physical stream pixels, then divide by the remote
-/// scale, which is what the virtual pointer expects.
+/// invert the frame layout to view pixels, scale to physical stream pixels
+/// (a reduced-resolution stream is stretched to the view box), then divide
+/// by the remote scale, which is what the virtual pointer expects.
 fn to_remote(ui: &App, x: f64, y: f64) -> (f64, f64) {
     let (rw, rh) = ui.stream_size.get();
     let (vw, vh) = ui.stream_view.get();
-    if rw == 0 || rh == 0 || vw == 0 || vh == 0 {
+    if rw == 0 || rh == 0 {
         return (0.0, 0.0);
     }
-    // The frame is drawn into the view box (view / device scale in logical
-    // pixels), centred, and scaled either way to fit the widget (Contain).
-    // A reduced-resolution stream is stretched to the same box, so the
-    // letterbox comes from the view, and stream pixels from the ratio.
-    let device = ui.video.scale_factor().max(1) as f64;
-    let (lw, lh) = (vw as f64 / device, vh as f64 / device);
+    let device = ui.video.scale_factor().max(1);
     let (aw, ah) = (ui.video.width() as f64, ui.video.height() as f64);
-    let fit = (aw / lw).min(ah / lh);
-    let (fw, fh) = (lw * fit, lh * fit);
-    let (ox, oy) = ((aw - fw) / 2.0, (ah - fh) / 2.0);
-    let vx = (x - ox) / fit * device;
-    let vy = (y - oy) / fit * device;
+    let Some(l) = paintable::layout((vw, vh), device, aw, ah) else {
+        return (0.0, 0.0);
+    };
+    let vx = (x - l.x) / l.factor * device as f64;
+    let vy = (y - l.y) / l.factor * device as f64;
     let px = (vx * rw as f64 / vw as f64).clamp(0.0, rw as f64);
     let py = (vy * rh as f64 / vh as f64).clamp(0.0, rh as f64);
     let scale = ui.stream_scale.get().max(0.01) as f64;
@@ -1203,14 +1214,152 @@ fn install_input_handlers(
     video.add_controller(focus);
 }
 
+/// In fullscreen the header and status bars leave the layout, so the picture
+/// gets the whole screen, and slide in over it while the pointer is at the
+/// top or bottom edge. The header stays while the address bar is in use:
+/// its recent-machines popover is a separate surface, so the pointer moving
+/// into it looks like leaving the window.
+#[allow(clippy::too_many_arguments)]
+fn install_fullscreen_bars(
+    window: &adw::ApplicationWindow,
+    content: &gtk::Box,
+    overlay: &gtk::Overlay,
+    header: &adw::HeaderBar,
+    status: &gtk::Label,
+    fullscreen_btn: &gtk::ToggleButton,
+    entry: &gtk::Entry,
+    recent_popover: &gtk::Popover,
+) {
+    // GTK4 focuses the text inside the entry, so ask for the focus widget
+    // and walk up.
+    let address_bar_in_use = {
+        let (window, entry, popover) = (window.clone(), entry.clone(), recent_popover.clone());
+        Rc::new(move || {
+            popover.is_visible()
+                || gtk::prelude::GtkWindowExt::focus(&window)
+                    .is_some_and(|f| f == entry || f.is_ancestor(&entry))
+        })
+    };
+    let top = gtk::Revealer::builder()
+        .transition_type(gtk::RevealerTransitionType::SlideDown)
+        .valign(gtk::Align::Start)
+        .build();
+    let bottom = gtk::Revealer::builder()
+        .transition_type(gtk::RevealerTransitionType::SlideUp)
+        .valign(gtk::Align::End)
+        .build();
+    overlay.add_overlay(&top);
+    overlay.add_overlay(&bottom);
+
+    {
+        let (content, header, status) = (content.clone(), header.clone(), status.clone());
+        let (top, bottom, fullscreen_btn) = (top.clone(), bottom.clone(), fullscreen_btn.clone());
+        window.connect_fullscreened_notify(move |w| {
+            let full = w.is_fullscreen();
+            if fullscreen_btn.is_active() != full {
+                fullscreen_btn.set_active(full);
+            }
+            if full {
+                content.remove(&header);
+                content.remove(&status);
+                top.set_child(Some(&header));
+                bottom.set_child(Some(&status));
+                status.add_css_class("floating-status");
+            } else {
+                top.set_reveal_child(false);
+                bottom.set_reveal_child(false);
+                top.set_child(None::<&gtk::Widget>);
+                bottom.set_child(None::<&gtk::Widget>);
+                status.remove_css_class("floating-status");
+                content.prepend(&header);
+                content.append(&status);
+            }
+        });
+    }
+
+    const EDGE: f64 = 2.0;
+    const LEAVE_MARGIN: f64 = 8.0;
+    let motion = gtk::EventControllerMotion::new();
+    {
+        let (window, overlay, header, status) = (
+            window.clone(),
+            overlay.clone(),
+            header.clone(),
+            status.clone(),
+        );
+        let (top, bottom) = (top.clone(), bottom.clone());
+        let address_bar_in_use = address_bar_in_use.clone();
+        motion.connect_motion(move |_, _, y| {
+            if !window.is_fullscreen() {
+                return;
+            }
+            let h = overlay.height() as f64;
+            if y <= EDGE {
+                top.set_reveal_child(true);
+            } else if top.reveals_child()
+                && y > header.height() as f64 + LEAVE_MARGIN
+                && !address_bar_in_use()
+            {
+                top.set_reveal_child(false);
+            }
+            if y >= h - EDGE {
+                bottom.set_reveal_child(true);
+            } else if bottom.reveals_child() && y < h - status.height() as f64 - LEAVE_MARGIN {
+                bottom.set_reveal_child(false);
+            }
+        });
+    }
+    {
+        let (top, bottom) = (top.clone(), bottom.clone());
+        let address_bar_in_use = address_bar_in_use.clone();
+        motion.connect_leave(move |_| {
+            if !address_bar_in_use() {
+                top.set_reveal_child(false);
+            }
+            bottom.set_reveal_child(false);
+        });
+    }
+    overlay.add_controller(motion);
+
+    // Keyboard dismissal (Escape, Enter) moves focus without a pointer
+    // event; hide the header then, unless the pointer still rests on it.
+    let hide_when_free = {
+        let (window, top, header) = (window.clone(), top.clone(), header.clone());
+        Rc::new(move || {
+            if !window.is_fullscreen() || address_bar_in_use() {
+                return;
+            }
+            let pointer_on_header = WidgetExt::display(&window)
+                .default_seat()
+                .and_then(|s| s.pointer())
+                .and_then(|p| window.surface().and_then(|s| s.device_position(&p)))
+                .is_some_and(|(_, y, _)| y <= header.height() as f64 + LEAVE_MARGIN);
+            if !pointer_on_header {
+                top.set_reveal_child(false);
+            }
+        })
+    };
+    {
+        let hide = hide_when_free.clone();
+        window.connect_focus_widget_notify(move |_| hide());
+    }
+    recent_popover.connect_hide(move |_| hide_when_free());
+}
+
 /// Ask the server to match the window, once the size has settled for 200 ms
-/// so a drag-resize does not restart the encoder on every step.
+/// so a drag-resize does not restart the encoder on every step. The
+/// decoder's output zoom is requested on each poll that changes it, with
+/// no settling delay: on the GPU tier the change costs only a reallocation
+/// of the display images and a redraw, and the CPU tier picks it up with
+/// its next frame.
 fn install_resize_handler(ui: &Rc<App>) {
     // A Picture has no resize signal, so poll its allocation; the one-shot
     // timer sends only once the size has held for 200 ms.
     let ui = ui.clone();
     glib::timeout_add_local(Duration::from_millis(100), move || {
         let scale = ui.video.scale_factor();
+        ui.frame.set_scale(scale);
+        request_zoom(&ui);
         let (w, h) = (ui.video.width() * scale, ui.video.height() * scale);
         let size = (w.max(0) as u32 & !1, h.max(0) as u32 & !1);
         if size != ui.view_size.get() {
@@ -1224,6 +1373,26 @@ fn install_resize_handler(ui: &Rc<App>) {
         }
         glib::ControlFlow::Continue
     });
+}
+
+/// Ask the decoder for the integer zoom the current window allows, when it
+/// differs from the last request. The view comes from the latest
+/// StreamConfig, falling back to the last painted frame.
+fn request_zoom(ui: &App) {
+    let mut view = ui.server_view.get();
+    if view == (0, 0) {
+        view = ui.stream_view.get();
+    }
+    let device = ui.video.scale_factor().max(1);
+    let (aw, ah) = (ui.video.width() as f64, ui.video.height() as f64);
+    let want = paintable::layout(view, device, aw, ah).map_or(1, |l| l.zoom());
+    if want == ui.zoom.get() {
+        return;
+    }
+    ui.zoom.set(want);
+    if let Some(tx) = ui.input_tx.borrow().as_ref() {
+        let _ = tx.send(clipboard::ToWorker::Zoom(want));
+    }
 }
 
 /// Send a Resize if the server's view does not already match the window.
