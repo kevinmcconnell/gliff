@@ -165,6 +165,17 @@ impl FramePaintable {
         self.invalidate_contents();
     }
 
+    /// Follow a display scale change without waiting for a new frame, so
+    /// the drawn rectangle and the pointer mapping agree.
+    pub fn set_scale(&self, scale_factor: i32) {
+        let imp = self.imp();
+        if imp.scale.get() != scale_factor {
+            imp.scale.set(scale_factor);
+            self.invalidate_size();
+            self.invalidate_contents();
+        }
+    }
+
     /// Show nothing, as when no machine is connected.
     pub fn clear(&self) {
         let imp = self.imp();

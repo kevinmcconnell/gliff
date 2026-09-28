@@ -1300,14 +1300,17 @@ fn install_fullscreen_bars(
 
 /// Ask the server to match the window, once the size has settled for 200 ms
 /// so a drag-resize does not restart the encoder on every step. The
-/// decoder's output zoom follows the window at once, since changing it only
-/// reallocates the display images.
+/// decoder's output zoom is requested on each poll that changes it, with
+/// no settling delay: on the GPU tier the change costs only a reallocation
+/// of the display images and a redraw, and the CPU tier picks it up with
+/// its next frame.
 fn install_resize_handler(ui: &Rc<App>) {
     // A Picture has no resize signal, so poll its allocation; the one-shot
     // timer sends only once the size has held for 200 ms.
     let ui = ui.clone();
     glib::timeout_add_local(Duration::from_millis(100), move || {
         let scale = ui.video.scale_factor();
+        ui.frame.set_scale(scale);
         request_zoom(&ui);
         let (w, h) = (ui.video.width() * scale, ui.video.height() * scale);
         let size = (w.max(0) as u32 & !1, h.max(0) as u32 & !1);

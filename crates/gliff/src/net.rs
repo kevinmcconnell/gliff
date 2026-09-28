@@ -459,10 +459,13 @@ where
                         view,
                         scale_milli,
                     };
-                    if let Err(std::sync::mpsc::TrySendError::Full(picture)) =
-                        frames.try_send(picture)
-                    {
-                        undelivered = Some(picture);
+                    // The redraw supersedes any older frame still waiting.
+                    match frames.try_send(picture) {
+                        Ok(()) => undelivered = None,
+                        Err(std::sync::mpsc::TrySendError::Full(picture)) => {
+                            undelivered = Some(picture)
+                        }
+                        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {}
                     }
                 }
                 continue;

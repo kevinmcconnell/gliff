@@ -237,6 +237,9 @@ pub struct Decoder {
     width: u32,
     height: u32,
     zoom: u32,
+    /// The last `decode_to_output` produced a picture pair that is complete
+    /// and in shader-read layout, so `redraw` may sample it.
+    last_complete: bool,
 }
 
 impl Decoder {
@@ -264,6 +267,7 @@ impl Decoder {
             width,
             height,
             zoom: 1,
+            last_complete: false,
         })
     }
 
@@ -317,21 +321,30 @@ impl Decoder {
 
     /// Recombine the last decoded picture again into a fresh display frame,
     /// as after a zoom change on a still screen. `None` before the first
-    /// picture.
+    /// complete picture, or after a decode that failed part way.
     pub fn redraw(&mut self) -> Result<Option<DisplayFrame>> {
-        let Some(_) = self.main.last_output() else {
-            return Ok(None);
-        };
-        if self.aux.as_ref().is_some_and(|a| a.last_output().is_none()) {
+        if !self.last_complete {
             return Ok(None);
         }
         let idx = self.free_output();
         let (dst, _) = &self.outputs[idx];
         let (recombine, w, h, zoom) = (&self.recombine, self.width, self.height, self.zoom);
-        let main_img = self.main.last_output().expect("checked above");
-        let aux_img = self.aux.as_ref().and_then(|a| a.last_output());
+        let Some(main_img) = self.main.last_output() else {
+            return Ok(None);
+        };
+        let aux_img = match &self.aux {
+            Some(a) => match a.last_output() {
+                Some(img) => Some(img),
+                None => return Ok(None),
+            },
+            None => None,
+        };
         self.compute
             .run(self.timeline.semaphore, None, None, true, |cmd| {
+                main_img.transition(cmd, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+                if let Some(a) = aux_img {
+                    a.transition(cmd, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+                }
                 dst.transition(cmd, vk::ImageLayout::GENERAL);
                 recombine.record(cmd, main_img, aux_img, dst, (w, h), zoom)?;
                 dst.memory_barrier(cmd);
@@ -373,7 +386,11 @@ impl Decoder {
             return Ok(None);
         };
         let (image, _) = &self.outputs[idx];
-        let size = (self.width * self.zoom * self.height * self.zoom * 4) as usize;
+        let (w, h) = (
+            self.width as usize * self.zoom as usize,
+            self.height as usize * self.zoom as usize,
+        );
+        let size = w * h * 4;
         if self.readback.is_none() {
             self.readback = Some(HostBuffer::new(
                 &self.gpu,
@@ -425,6 +442,7 @@ impl Decoder {
 
     fn decode_to_output(&mut self, main: &[u8], aux: &[u8]) -> Result<Option<usize>> {
         let t0 = std::time::Instant::now();
+        self.last_complete = false;
         let idx = self.free_output();
         let main_done = self.timeline.advance();
         let Some(main_img) = self.main.decode(main, &self.timeline, main_done)? else {
@@ -455,6 +473,7 @@ impl Decoder {
                 dst.memory_barrier(cmd);
                 Ok(())
             })?;
+        self.last_complete = true;
         tracing::debug!(
             submit_main_us = t_main.as_micros(),
             submit_aux_us = t_aux.as_micros(),
