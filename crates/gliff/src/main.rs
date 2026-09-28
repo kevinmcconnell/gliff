@@ -275,6 +275,8 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         &header,
         &status,
         &fullscreen_btn,
+        &entry,
+        &recent_popover,
     );
 
     let ui = Rc::new(App {
@@ -1214,7 +1216,10 @@ fn install_input_handlers(
 
 /// In fullscreen the header and status bars leave the layout, so the picture
 /// gets the whole screen, and slide in over it while the pointer is at the
-/// top or bottom edge.
+/// top or bottom edge. The header stays while the address bar is in use:
+/// its recent-machines popover is a separate surface, so the pointer moving
+/// into it looks like leaving the window.
+#[allow(clippy::too_many_arguments)]
 fn install_fullscreen_bars(
     window: &adw::ApplicationWindow,
     content: &gtk::Box,
@@ -1222,7 +1227,13 @@ fn install_fullscreen_bars(
     header: &adw::HeaderBar,
     status: &gtk::Label,
     fullscreen_btn: &gtk::ToggleButton,
+    entry: &gtk::Entry,
+    recent_popover: &gtk::Popover,
 ) {
+    let address_bar_in_use = {
+        let (entry, popover) = (entry.clone(), recent_popover.clone());
+        Rc::new(move || popover.is_visible() || entry.has_focus())
+    };
     let top = gtk::Revealer::builder()
         .transition_type(gtk::RevealerTransitionType::SlideDown)
         .valign(gtk::Align::Start)
@@ -1271,6 +1282,7 @@ fn install_fullscreen_bars(
             status.clone(),
         );
         let (top, bottom) = (top.clone(), bottom.clone());
+        let address_bar_in_use = address_bar_in_use.clone();
         motion.connect_motion(move |_, _, y| {
             if !window.is_fullscreen() {
                 return;
@@ -1278,7 +1290,10 @@ fn install_fullscreen_bars(
             let h = overlay.height() as f64;
             if y <= EDGE {
                 top.set_reveal_child(true);
-            } else if top.reveals_child() && y > header.height() as f64 + LEAVE_MARGIN {
+            } else if top.reveals_child()
+                && y > header.height() as f64 + LEAVE_MARGIN
+                && !address_bar_in_use()
+            {
                 top.set_reveal_child(false);
             }
             if y >= h - EDGE {
@@ -1290,8 +1305,11 @@ fn install_fullscreen_bars(
     }
     {
         let (top, bottom) = (top.clone(), bottom.clone());
+        let address_bar_in_use = address_bar_in_use.clone();
         motion.connect_leave(move |_| {
-            top.set_reveal_child(false);
+            if !address_bar_in_use() {
+                top.set_reveal_child(false);
+            }
             bottom.set_reveal_child(false);
         });
     }
