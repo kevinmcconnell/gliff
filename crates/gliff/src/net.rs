@@ -111,7 +111,7 @@ pub enum Endpoint {
 /// BGRA pixels from the CPU tier.
 pub enum Frame {
     Dmabuf(DisplayFrame),
-    Bgra(gliff_sw::BgraFrame),
+    Bgra(gliff_sw::PooledFrame),
 }
 
 pub struct Worker {
@@ -423,6 +423,7 @@ where
     // config it was encoded under, not whatever is current when it emerges.
     let mut in_decoder: std::collections::VecDeque<Geometry> = std::collections::VecDeque::new();
     let mut zoom = 1u32;
+    let pool = gliff_sw::PixelPool::default();
     loop {
         let read = tokio::select! {
             read = reader.read_msg::<ServerMsg>() => read,
@@ -484,7 +485,7 @@ where
                                     .pop_front()
                                     .unwrap_or(((width, height), view, scale_milli));
                                 Picture {
-                                    frame: Frame::Bgra(f.zoomed(zoom)),
+                                    frame: Frame::Bgra(f.zoomed(zoom, &pool)),
                                     stream,
                                     view,
                                     scale_milli,
@@ -545,7 +546,7 @@ where
                     }
                     VideoDecoder::Cpu(d) => d
                         .decode(&main, &aux)
-                        .map(|f| f.map(|f| Frame::Bgra(f.zoomed(zoom))))
+                        .map(|f| f.map(|f| Frame::Bgra(f.zoomed(zoom, &pool))))
                         .map_err(anyhow::Error::from),
                 };
                 let dec_ms = t0.elapsed().as_secs_f32() * 1000.0;
