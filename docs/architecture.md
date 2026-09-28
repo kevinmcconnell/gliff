@@ -171,9 +171,9 @@ runs clean on the probe round-trip.
   freely (the seed jump), so a LAN reaches full quality in under a second
   and a slow link lands on its level at the first real measurement; after
   that, step-ups need 1.25x headroom and a hold that doubles on a flap. The
-  client draws a reduced-resolution stream into the full-quality view size
-  (`StreamConfig.view_width/height`), so a rung change never shrinks the
-  picture on screen, and an fps-only rung change reprograms the rate without
+  client stretches a reduced-resolution stream to the full-quality view size
+  (`StreamConfig.view_width/height`) before fitting it to the window, so a
+  rung change never shrinks the picture on screen, and an fps-only rung change reprograms the rate without
   an encoder rebuild, a keyframe, or a client decoder reset.
   When the screen is still and the link has room, the last frame is
   re-encoded (at most 8 times, 200 ms apart, stopping once a pass codes
