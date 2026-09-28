@@ -106,6 +106,8 @@ struct App {
     view_size: Cell<(u32, u32)>,
     /// The size last asked of the server, so a pending resize is not repeated.
     resize_requested: Cell<(u32, u32)>,
+    /// The output zoom last asked of the decoder; a new worker starts at 1.
+    zoom: Cell<u32>,
     input_tx: RefCell<Option<OutSender>>,
     /// Evdev codes currently held on the remote, so they can all be released
     /// when the keyboard is handed back to the local compositor.
@@ -292,6 +294,7 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         stream_scale: Cell::new(1.0),
         view_size: Cell::new((0, 0)),
         resize_requested: Cell::new((0, 0)),
+        zoom: Cell::new(1),
         input_tx: RefCell::new(None),
         pressed_keys: RefCell::new(BTreeSet::new()),
         endpoint: RefCell::new(None),
@@ -546,6 +549,7 @@ fn start_session(ui: Rc<App>, endpoint: Endpoint) {
     // Replacing the sender closes the old worker's input, which ends it.
     *ui.input_tx.borrow_mut() = Some(input_tx);
     *ui.endpoint.borrow_mut() = Some(endpoint.clone());
+    ui.zoom.set(1);
     let session = ui.session.get() + 1;
     ui.session.set(session);
     ui.status.set_text("Connecting…");
@@ -1295,13 +1299,16 @@ fn install_fullscreen_bars(
 }
 
 /// Ask the server to match the window, once the size has settled for 200 ms
-/// so a drag-resize does not restart the encoder on every step.
+/// so a drag-resize does not restart the encoder on every step. The
+/// decoder's output zoom follows the window at once, since changing it only
+/// reallocates the display images.
 fn install_resize_handler(ui: &Rc<App>) {
     // A Picture has no resize signal, so poll its allocation; the one-shot
     // timer sends only once the size has held for 200 ms.
     let ui = ui.clone();
     glib::timeout_add_local(Duration::from_millis(100), move || {
         let scale = ui.video.scale_factor();
+        request_zoom(&ui);
         let (w, h) = (ui.video.width() * scale, ui.video.height() * scale);
         let size = (w.max(0) as u32 & !1, h.max(0) as u32 & !1);
         if size != ui.view_size.get() {
@@ -1315,6 +1322,26 @@ fn install_resize_handler(ui: &Rc<App>) {
         }
         glib::ControlFlow::Continue
     });
+}
+
+/// Ask the decoder for the integer zoom the current window allows, when it
+/// differs from the last request. The view comes from the latest
+/// StreamConfig, falling back to the last painted frame.
+fn request_zoom(ui: &App) {
+    let mut view = ui.server_view.get();
+    if view == (0, 0) {
+        view = ui.stream_view.get();
+    }
+    let device = ui.video.scale_factor().max(1);
+    let (aw, ah) = (ui.video.width() as f64, ui.video.height() as f64);
+    let want = paintable::layout(view, device, aw, ah).map_or(1, |l| l.zoom());
+    if want == ui.zoom.get() {
+        return;
+    }
+    ui.zoom.set(want);
+    if let Some(tx) = ui.input_tx.borrow().as_ref() {
+        let _ = tx.send(clipboard::ToWorker::Zoom(want));
+    }
 }
 
 /// Send a Resize if the server's view does not already match the window.

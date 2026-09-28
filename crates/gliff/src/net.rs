@@ -363,9 +363,13 @@ where
     // ssh child. Keymap changes share the task and go first, so a key from
     // a newly used keyboard never reaches the server ahead of its keymap.
     let (ui_gone_tx, mut ui_gone) = tokio::sync::oneshot::channel::<()>();
+    // Display pixels per stream pixel the UI wants; applied at the next
+    // decode.
+    let zoom = Rc::new(std::cell::Cell::new(1u32));
     {
         let out_tx = out_tx.clone();
         let clipboard = clipboard.clone();
+        let zoom = zoom.clone();
         tokio::task::spawn_local(async move {
             let mut follow_keymap = true;
             loop {
@@ -382,6 +386,10 @@ where
                     }
                     cmd = input.recv() => match cmd {
                         Some(ToWorker::Send(m)) => m,
+                        Some(ToWorker::Zoom(z)) => {
+                            zoom.set(z.max(1));
+                            continue;
+                        }
                         Some(other) => {
                             clipboard.on_ui(other);
                             continue;
@@ -438,7 +446,7 @@ where
                                     .pop_front()
                                     .unwrap_or(((width, height), view, scale_milli));
                                 Picture {
-                                    frame: Frame::Bgra(f),
+                                    frame: Frame::Bgra(f.zoomed(zoom.get())),
                                     stream,
                                     view,
                                     scale_milli,
@@ -485,14 +493,24 @@ where
                 drain_at = tokio::time::Instant::now() + IDLE_DRAIN;
                 in_decoder.push_back(((width, height), view, scale_milli));
                 let t0 = std::time::Instant::now();
+                let want_zoom = zoom.get();
                 let decoded = match &mut decoder {
-                    VideoDecoder::Gpu(d) => d
-                        .decode(&main, &aux)
-                        .map(|f| f.map(Frame::Dmabuf))
-                        .map_err(anyhow::Error::from),
+                    VideoDecoder::Gpu(d) => {
+                        if d.zoom() != want_zoom {
+                            match d.set_zoom(want_zoom) {
+                                Ok(z) => tracing::info!(zoom = z, "decoder output zoom"),
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "could not change the output zoom")
+                                }
+                            }
+                        }
+                        d.decode(&main, &aux)
+                            .map(|f| f.map(Frame::Dmabuf))
+                            .map_err(anyhow::Error::from)
+                    }
                     VideoDecoder::Cpu(d) => d
                         .decode(&main, &aux)
-                        .map(|f| f.map(Frame::Bgra))
+                        .map(|f| f.map(|f| Frame::Bgra(f.zoomed(want_zoom))))
                         .map_err(anyhow::Error::from),
                 };
                 let dec_ms = t0.elapsed().as_secs_f32() * 1000.0;

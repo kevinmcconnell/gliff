@@ -83,6 +83,41 @@ pub struct BgraFrame {
     pub pixels: Vec<u8>,
 }
 
+impl BgraFrame {
+    /// Replicate every pixel into a `zoom` x `zoom` block, so the display
+    /// side can show the frame at an integer scale without resampling.
+    pub fn zoomed(self, zoom: u32) -> BgraFrame {
+        if zoom <= 1 {
+            return self;
+        }
+        let z = zoom as usize;
+        let (w, h) = (self.width as usize, self.height as usize);
+        let src_stride = w * 4;
+        let dst_stride = src_stride * z;
+        let mut pixels = vec![0u8; dst_stride * h * z];
+        use rayon::prelude::*;
+        pixels
+            .par_chunks_exact_mut(dst_stride * z)
+            .zip(self.pixels.par_chunks_exact(src_stride))
+            .for_each(|(block, src_row)| {
+                let (first, rest) = block.split_at_mut(dst_stride);
+                for (dst, px) in first.chunks_exact_mut(4 * z).zip(src_row.chunks_exact(4)) {
+                    for out in dst.chunks_exact_mut(4) {
+                        out.copy_from_slice(px);
+                    }
+                }
+                for row in rest.chunks_exact_mut(dst_stride) {
+                    row.copy_from_slice(first);
+                }
+            });
+        BgraFrame {
+            width: self.width * zoom,
+            height: self.height * zoom,
+            pixels,
+        }
+    }
+}
+
 impl YUVSource for I420 {
     fn dimensions(&self) -> (usize, usize) {
         (self.width, self.height)
@@ -398,6 +433,31 @@ fn decoded_to_nv12(image: &DecodedYUV) -> Nv12 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn zoomed_replicates_each_pixel_into_a_block() {
+        let frame = super::BgraFrame {
+            width: 2,
+            height: 1,
+            pixels: vec![1, 2, 3, 4, 5, 6, 7, 8],
+        };
+        let z = frame.zoomed(2);
+        assert_eq!((z.width, z.height), (4, 2));
+        let row = [1, 2, 3, 4, 1, 2, 3, 4, 5, 6, 7, 8, 5, 6, 7, 8];
+        assert_eq!(&z.pixels[..16], &row);
+        assert_eq!(&z.pixels[16..], &row);
+    }
+
+    #[test]
+    fn zoom_one_is_a_no_op() {
+        let frame = super::BgraFrame {
+            width: 1,
+            height: 1,
+            pixels: vec![9, 9, 9, 9],
+        };
+        let z = frame.zoomed(1);
+        assert_eq!((z.width, z.height, z.pixels), (1, 1, vec![9, 9, 9, 9]));
+    }
+
     use super::*;
     use gliff_proto::chroma::{nv12_to_yuv444, yuv444_to_nv12};
     use gliff_proto::color::{bgra_to_yuv444, psnr, yuv444_to_bgra};

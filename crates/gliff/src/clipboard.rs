@@ -35,6 +35,9 @@ use crate::net::Status;
 /// What the UI thread sends the worker.
 pub enum ToWorker {
     Send(ClientMsg),
+    /// Display pixels per stream pixel the decoder should write, so the
+    /// picture is drawn 1:1 at an integer scale (see `paintable::layout`).
+    Zoom(u32),
     /// The local clipboard changed to these forwardable mime types and files.
     LocalOffer {
         mime_types: Vec<String>,
@@ -157,7 +160,7 @@ impl Bridge {
     /// A clipboard command from the UI; `Send` is handled by the caller.
     pub fn on_ui(&self, cmd: ToWorker) {
         match cmd {
-            ToWorker::Send(_) => {}
+            ToWorker::Send(_) | ToWorker::Zoom(_) => {}
             ToWorker::LocalOffer { mime_types, files } => {
                 let serial = self.local_serial.get().wrapping_add(1);
                 self.local_serial.set(serial);

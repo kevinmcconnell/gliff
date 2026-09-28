@@ -3,22 +3,25 @@
 //!
 //! The server declares a full-quality `view` size in device pixels. When
 //! the widget has room, the frame is drawn at the largest integer factor
-//! that fits (1x, 2x, ...) and centred, with nearest-neighbour filtering so
-//! a 1:1 stream stays pixel-exact instead of being resampled into a blur.
-//! When the widget is smaller than the view, the frame shrinks to fit with
-//! linear filtering. A stream sent at reduced resolution (view larger than
-//! the texture) is stretched to the view box either way, so a quality
-//! change never moves the picture on screen.
+//! that fits (1x, 2x, ...) and centred. The decoder is asked to write its
+//! output at that same factor (pixel replication in the recombine shader,
+//! or on the CPU), so the texture GTK receives is already device sized and
+//! is drawn 1:1 with a plain texture node, which stays pixel-exact. GTK's
+//! own nearest-neighbour scaling is not used: on a HiDPI surface its
+//! renderer draws a scaled texture through an offscreen at logical
+//! resolution, which blurs the result. When the widget is smaller than the
+//! view, the frame shrinks to fit with linear filtering. A stream sent at
+//! reduced resolution (view larger than the texture) is stretched to the
+//! view box either way, so a quality change never moves the picture.
 //!
 //! [`layout`] is the single source of the frame's rectangle; the pointer
-//! mapping in `main.rs` inverts it.
+//! mapping and the zoom request in `main.rs` derive from it.
 
 use std::cell::{Cell, RefCell};
 
 use gtk::gdk;
 use gtk::glib;
 use gtk::graphene;
-use gtk::gsk;
 use gtk::prelude::*;
 use gtk::subclass::prelude::*;
 use gtk4 as gtk;
@@ -32,6 +35,18 @@ pub struct Layout {
     pub height: f64,
     /// Device pixels per view pixel; a whole number when the view fits.
     pub factor: f64,
+}
+
+impl Layout {
+    /// The integer zoom to ask of the decoder: the factor when the view
+    /// fits, else 1 (a shrunk frame is resampled anyway).
+    pub fn zoom(&self) -> u32 {
+        if self.factor >= 1.0 {
+            self.factor as u32
+        } else {
+            1
+        }
+    }
 }
 
 /// Fit a `view` (device pixels) into a widget of `width` x `height` logical
@@ -116,15 +131,9 @@ mod imp {
             let Some(l) = layout((vw as u32, vh as u32), self.scale.get(), width, height) else {
                 return;
             };
-            let pixel_exact = l.factor >= 1.0 && (t.width(), t.height()) == (vw, vh);
-            let filter = if pixel_exact {
-                gsk::ScalingFilter::Nearest
-            } else {
-                gsk::ScalingFilter::Linear
-            };
             let bounds =
                 graphene::Rect::new(l.x as f32, l.y as f32, l.width as f32, l.height as f32);
-            snapshot.append_scaled_texture(&t, filter, &bounds);
+            snapshot.append_texture(&t, &bounds);
         }
     }
 }
@@ -200,6 +209,13 @@ mod tests {
         assert_eq!(l.factor, 1.0);
         assert_eq!(l.x * 2.0, (l.x * 2.0).floor());
         assert_eq!(l.y * 2.0, (l.y * 2.0).floor());
+    }
+
+    #[test]
+    fn zoom_is_the_integer_factor_or_one() {
+        assert_eq!(layout((2560, 1440), 2, 2560.0, 1440.0).unwrap().zoom(), 2);
+        assert_eq!(layout((2560, 1440), 2, 2560.0, 1400.0).unwrap().zoom(), 1);
+        assert_eq!(layout((2560, 1440), 1, 1280.0, 1000.0).unwrap().zoom(), 1);
     }
 
     #[test]
