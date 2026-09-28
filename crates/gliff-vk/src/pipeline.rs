@@ -315,15 +315,36 @@ impl Decoder {
         self.zoom
     }
 
-    /// Decode one access unit pair and recombine to a display frame. Blocks
-    /// until the frame is complete. `None` when the unit had no picture.
-    pub fn decode(&mut self, main: &[u8], aux: &[u8]) -> Result<Option<DisplayFrame>> {
-        let idx = self.decode_to_output(main, aux)?;
-        let Some(idx) = idx else { return Ok(None) };
+    /// Recombine the last decoded picture again into a fresh display frame,
+    /// as after a zoom change on a still screen. `None` before the first
+    /// picture.
+    pub fn redraw(&mut self) -> Result<Option<DisplayFrame>> {
+        let Some(_) = self.main.last_output() else {
+            return Ok(None);
+        };
+        if self.aux.as_ref().is_some_and(|a| a.last_output().is_none()) {
+            return Ok(None);
+        }
+        let idx = self.free_output();
+        let (dst, _) = &self.outputs[idx];
+        let (recombine, w, h, zoom) = (&self.recombine, self.width, self.height, self.zoom);
+        let main_img = self.main.last_output().expect("checked above");
+        let aux_img = self.aux.as_ref().and_then(|a| a.last_output());
+        self.compute
+            .run(self.timeline.semaphore, None, None, true, |cmd| {
+                dst.transition(cmd, vk::ImageLayout::GENERAL);
+                recombine.record(cmd, main_img, aux_img, dst, (w, h), zoom)?;
+                dst.memory_barrier(cmd);
+                Ok(())
+            })?;
+        Ok(Some(self.hand_out(idx)?))
+    }
+
+    fn hand_out(&mut self, idx: usize) -> Result<DisplayFrame> {
         let (_, dmabuf) = &self.outputs[idx];
         self.busy[idx] = true;
         self.handed_out.push_back(idx);
-        Ok(Some(DisplayFrame {
+        Ok(DisplayFrame {
             fd: dmabuf.fd.as_fd().try_clone_to_owned()?,
             width: dmabuf.width,
             height: dmabuf.height,
@@ -335,7 +356,15 @@ impl Decoder {
             ring: self.ring,
             index: idx,
             release: self.release_tx.clone(),
-        }))
+        })
+    }
+
+    /// Decode one access unit pair and recombine to a display frame. Blocks
+    /// until the frame is complete. `None` when the unit had no picture.
+    pub fn decode(&mut self, main: &[u8], aux: &[u8]) -> Result<Option<DisplayFrame>> {
+        let idx = self.decode_to_output(main, aux)?;
+        let Some(idx) = idx else { return Ok(None) };
+        Ok(Some(self.hand_out(idx)?))
     }
 
     /// Decode and read the BGRA pixels back to the CPU (tests and the probe).

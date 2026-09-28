@@ -363,13 +363,11 @@ where
     // ssh child. Keymap changes share the task and go first, so a key from
     // a newly used keyboard never reaches the server ahead of its keymap.
     let (ui_gone_tx, mut ui_gone) = tokio::sync::oneshot::channel::<()>();
-    // Display pixels per stream pixel the UI wants; applied at the next
-    // decode.
-    let zoom = Rc::new(std::cell::Cell::new(1u32));
+    // Display pixels per stream pixel the UI wants; the main loop applies it.
+    let (zoom_tx, mut zoom_rx) = unbounded_channel::<u32>();
     {
         let out_tx = out_tx.clone();
         let clipboard = clipboard.clone();
-        let zoom = zoom.clone();
         tokio::task::spawn_local(async move {
             let mut follow_keymap = true;
             loop {
@@ -387,7 +385,7 @@ where
                     cmd = input.recv() => match cmd {
                         Some(ToWorker::Send(m)) => m,
                         Some(ToWorker::Zoom(z)) => {
-                            zoom.set(z.max(1));
+                            let _ = zoom_tx.send(z.max(1));
                             continue;
                         }
                         Some(other) => {
@@ -424,10 +422,50 @@ where
     // config can land in between: a picture must carry the geometry of the
     // config it was encoded under, not whatever is current when it emerges.
     let mut in_decoder: std::collections::VecDeque<Geometry> = std::collections::VecDeque::new();
+    let mut zoom = 1u32;
     loop {
         let read = tokio::select! {
             read = reader.read_msg::<ServerMsg>() => read,
             _ = &mut ui_gone => return Ok(()),
+            Some(z) = zoom_rx.recv() => {
+                if z == zoom {
+                    continue;
+                }
+                zoom = z;
+                // A still screen sends no frame, so redraw the last picture
+                // at the new zoom now. The CPU tier has no copy to redraw
+                // and asks for a keyframe instead.
+                let redrawn = match &mut decoder {
+                    VideoDecoder::Gpu(d) => match d.set_zoom(zoom).and_then(|_| d.redraw()) {
+                        Ok(frame) => {
+                            tracing::info!(zoom = d.zoom(), "decoder output zoom");
+                            frame.map(Frame::Dmabuf)
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "could not change the output zoom");
+                            None
+                        }
+                    },
+                    VideoDecoder::Cpu(_) => {
+                        let _ = out_tx.send((ClientMsg::RequestKeyframe, Bytes::new()));
+                        None
+                    }
+                };
+                if let Some(frame) = redrawn {
+                    let picture = Picture {
+                        frame,
+                        stream: (width, height),
+                        view,
+                        scale_milli,
+                    };
+                    if let Err(std::sync::mpsc::TrySendError::Full(picture)) =
+                        frames.try_send(picture)
+                    {
+                        undelivered = Some(picture);
+                    }
+                }
+                continue;
+            }
             written = &mut writes => {
                 written.context("writer task")?.context("write to server")?;
                 return Ok(());
@@ -446,7 +484,7 @@ where
                                     .pop_front()
                                     .unwrap_or(((width, height), view, scale_milli));
                                 Picture {
-                                    frame: Frame::Bgra(f.zoomed(zoom.get())),
+                                    frame: Frame::Bgra(f.zoomed(zoom)),
                                     stream,
                                     view,
                                     scale_milli,
@@ -493,15 +531,12 @@ where
                 drain_at = tokio::time::Instant::now() + IDLE_DRAIN;
                 in_decoder.push_back(((width, height), view, scale_milli));
                 let t0 = std::time::Instant::now();
-                let want_zoom = zoom.get();
                 let decoded = match &mut decoder {
                     VideoDecoder::Gpu(d) => {
-                        if d.zoom() != want_zoom {
-                            match d.set_zoom(want_zoom) {
-                                Ok(z) => tracing::info!(zoom = z, "decoder output zoom"),
-                                Err(e) => {
-                                    tracing::warn!(error = %e, "could not change the output zoom")
-                                }
+                        // A decoder made by a StreamConfig starts at zoom 1.
+                        if d.zoom() != zoom {
+                            if let Err(e) = d.set_zoom(zoom) {
+                                tracing::warn!(error = %e, "could not change the output zoom");
                             }
                         }
                         d.decode(&main, &aux)
@@ -510,7 +545,7 @@ where
                     }
                     VideoDecoder::Cpu(d) => d
                         .decode(&main, &aux)
-                        .map(|f| f.map(|f| Frame::Bgra(f.zoomed(want_zoom))))
+                        .map(|f| f.map(|f| Frame::Bgra(f.zoomed(zoom))))
                         .map_err(anyhow::Error::from),
                 };
                 let dec_ms = t0.elapsed().as_secs_f32() * 1000.0;
