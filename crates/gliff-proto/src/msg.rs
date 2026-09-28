@@ -338,9 +338,10 @@ pub enum ServerMsg {
         #[n(7)]
         #[cbor(with = "minicbor::bytes")]
         aux_extradata: Option<Vec<u8>>,
-        /// The full-quality fit size in physical pixels: the area the client
-        /// should draw the stream into. Equal to the stream size unless the
-        /// server sends a reduced-resolution stream.
+        /// The full-quality fit size in physical pixels: the box the client
+        /// stretches the stream to before fitting it to the window. Equal to
+        /// the stream size unless the server sends a reduced-resolution
+        /// stream.
         #[n(8)]
         view_width: u32,
         #[n(9)]
