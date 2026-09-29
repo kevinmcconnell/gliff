@@ -49,7 +49,7 @@ pub struct Picture {
 /// maps clicks against a configuration whose frame is not on screen yet.
 pub enum Status {
     Connected {
-        /// "server pipeline > client pipeline", e.g. "gpu > cpu".
+        /// "server tier→client tier", e.g. "GPU→CPU".
         video: String,
         view_width: u32,
         view_height: u32,
@@ -59,7 +59,7 @@ pub enum Status {
         fps: f32,
         mbit: f32,
         decode_ms: f32,
-        /// "server pipeline > client pipeline", e.g. "gpu > cpu".
+        /// "server tier→client tier", e.g. "GPU→CPU".
         video: String,
     },
     /// The remote cursor image, for the client to set as its widget cursor.
@@ -231,10 +231,20 @@ fn new_decoder(
 impl VideoDecoder {
     fn label(&self) -> &'static str {
         match self {
-            Self::Gpu(_) => "gpu",
-            Self::Cpu(_) => "cpu",
+            Self::Gpu(_) => "GPU",
+            Self::Cpu(_) => "CPU",
         }
     }
+}
+
+/// The tiers in use, server then client, as the stats line shows them:
+/// "GPU→GPU".
+fn tier_label(pipeline: Option<VideoPipeline>, decoder: &VideoDecoder) -> String {
+    let server = pipeline.map_or("?", |p| match p {
+        VideoPipeline::Gpu => "GPU",
+        VideoPipeline::Cpu => "CPU",
+    });
+    format!("{server}→{}", decoder.label())
 }
 
 async fn session<R, W>(
@@ -330,11 +340,7 @@ where
         }
     };
     let mut decoder = new_decoder(&gpu, chroma, width, height)?;
-    let mut video_label = format!(
-        "{} > {}",
-        pipeline.map_or("?", VideoPipeline::label),
-        decoder.label()
-    );
+    let mut video_label = tier_label(pipeline, &decoder);
     let _ = status.send(Status::Connected {
         video: video_label.clone(),
         view_width: view.0,
@@ -660,11 +666,7 @@ where
                 }
                 (width, height, chroma, scale_milli) = (w, h, c, s);
                 (view, fps_cap) = ((view_width, view_height), f);
-                video_label = format!(
-                    "{} > {}",
-                    pipeline.map_or("?", VideoPipeline::label),
-                    decoder.label()
-                );
+                video_label = tier_label(pipeline, &decoder);
                 let _ = status.send(Status::Connected {
                     video: video_label.clone(),
                     view_width,
