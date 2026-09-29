@@ -20,7 +20,7 @@ use crate::compute::{Recombine, Split};
 use crate::decoder::H264Decoder;
 use crate::device::{Commands, Gpu, Timeline};
 use crate::encoder::{EncoderSettings, H264Encoder};
-use crate::image::{DmabufPlane, ExportedDmabuf, HostBuffer, Image};
+use crate::image::{DmabufPlane, ExportedDmabuf, HostBuffer, Image, Role};
 use crate::Result;
 
 pub struct EncodedFrame {
@@ -498,4 +498,68 @@ impl Drop for Encoder {
     fn drop(&mut self) {
         let _ = self.compute.wait();
     }
+}
+
+/// How the split shader's output reaches a VA-API surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SurfacePath {
+    /// The shader writes the imported surface directly.
+    Storage,
+    /// The shader writes a Vulkan image that is then copied into the surface.
+    Copy,
+}
+
+/// Probe helper: import an exported VA-API surface and write the 4:2:0
+/// split of `bgra` (`width` x `height`) into it, taking the storage path
+/// when the driver allows it. Returns the path used; the caller reads the
+/// surface back through VA-API to check the pixels.
+pub fn split_into_surface(
+    gpu: &Arc<Gpu>,
+    desc: &gliff_va::PrimeDescriptor,
+    bgra: &[u8],
+    width: u32,
+    height: u32,
+) -> Result<SurfacePath> {
+    let (target, path) = match Image::import_nv12(gpu, desc, true) {
+        Ok(img) => (img, SurfacePath::Storage),
+        Err(e) => {
+            tracing::info!(error = %e, "surface import with STORAGE refused; using a copy");
+            (Image::import_nv12(gpu, desc, false)?, SurfacePath::Copy)
+        }
+    };
+    let staging = HostBuffer::new(gpu, bgra.len(), vk::BufferUsageFlags::TRANSFER_SRC, None)?;
+    staging.write(0, bgra);
+    let src = Image::bgra_upload(gpu, width, height)?;
+    let scratch = match path {
+        SurfacePath::Storage => None,
+        SurfacePath::Copy => Some(Image::nv12(
+            gpu,
+            Role::EncodeSource,
+            target.width,
+            target.height,
+            1,
+            None,
+        )?),
+    };
+    let timeline = Timeline::new(gpu)?;
+    let compute = Commands::new(gpu, gpu.families.compute, gpu.compute_queue)?;
+    let split = Split::new(gpu)?;
+    compute.run(timeline.semaphore, None, None, true, |cmd| {
+        src.transition(cmd, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+        src.copy_rgba_from_buffer(cmd, &staging);
+        src.transition(cmd, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        let out = scratch.as_ref().unwrap_or(&target);
+        out.transition(cmd, vk::ImageLayout::GENERAL);
+        split.record(cmd, &src, out, None, width, height)?;
+        out.memory_barrier(cmd);
+        if let Some(s) = &scratch {
+            s.transition(cmd, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+            target.transition(cmd, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+            target.copy_nv12_from(cmd, s);
+        }
+        target.transition(cmd, vk::ImageLayout::GENERAL);
+        Ok(())
+    })?;
+    compute.wait()?;
+    Ok(path)
 }

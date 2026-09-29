@@ -1,5 +1,5 @@
-//! Minimal H.264 header parser: the SPS, PPS and slice-header fields a Vulkan
-//! decoder must supply. Slice *data* is never parsed; the hardware does that.
+//! Minimal H.264 header parser: the SPS, PPS and slice-header fields a
+//! hardware decoder must be given. Slice *data* is never parsed.
 //!
 //! The parser covers the syntax our own encoder can emit plus the common
 //! optional parts (scaling lists, VUI presence), and rejects what it cannot
@@ -133,6 +133,29 @@ pub struct Mmco {
     pub max_long_term_frame_idx_plus1: u32,
 }
 
+/// One `ref_pic_list_modification` step: `modification_of_pic_nums_idc`
+/// and its operand (`abs_diff_pic_num_minus1` or `long_term_pic_num`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefListMod {
+    pub idc: u32,
+    pub value: u32,
+}
+
+/// Explicit weights for one reference picture (`pred_weight_table`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PredWeight {
+    pub luma: Option<(i16, i16)>,
+    pub chroma: Option<[(i16, i16); 2]>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PredWeightTable {
+    pub luma_log2_weight_denom: u8,
+    pub chroma_log2_weight_denom: u8,
+    pub l0: Vec<PredWeight>,
+    pub l1: Vec<PredWeight>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SliceHeader {
     pub nal_type: u8,
@@ -145,11 +168,25 @@ pub struct SliceHeader {
     pub pic_order_cnt_lsb: u32,
     pub delta_pic_order_cnt_bottom: i32,
     pub delta_pic_order_cnt: [i32; 2],
+    pub direct_spatial_mv_pred: bool,
+    pub num_ref_idx_active_override: bool,
     pub num_ref_idx_l0_active_minus1: u8,
+    pub num_ref_idx_l1_active_minus1: u8,
+    pub ref_list_mods_l0: Vec<RefListMod>,
+    pub ref_list_mods_l1: Vec<RefListMod>,
+    pub pred_weights: Option<PredWeightTable>,
     pub no_output_of_prior_pics: bool,
     pub long_term_reference: bool,
     /// `None` = sliding window; `Some` = adaptive marking with these ops.
     pub mmcos: Option<Vec<Mmco>>,
+    pub cabac_init_idc: u8,
+    pub slice_qp_delta: i8,
+    pub disable_deblocking_filter_idc: u8,
+    pub slice_alpha_c0_offset_div2: i8,
+    pub slice_beta_offset_div2: i8,
+    /// Bits of `slice_header()` after the NAL header byte, in the
+    /// unescaped payload: where `slice_data()` starts.
+    pub header_bits: u32,
 }
 
 impl SliceHeader {
@@ -380,33 +417,37 @@ pub fn parse_slice_header(
         r.ue()?;
     }
     if slice_type == SliceType::B {
-        r.bit()?; // direct_spatial_mv_pred_flag
+        sh.direct_spatial_mv_pred = r.bit()?;
     }
     sh.num_ref_idx_l0_active_minus1 = pps.num_ref_idx_l0_default_active_minus1;
-    let mut num_l1 = pps.num_ref_idx_l1_default_active_minus1;
-    if slice_type != SliceType::I && r.bit()? {
-        sh.num_ref_idx_l0_active_minus1 = r.ue()? as u8;
-        if slice_type == SliceType::B {
-            num_l1 = r.ue()? as u8;
+    sh.num_ref_idx_l1_active_minus1 = pps.num_ref_idx_l1_default_active_minus1;
+    if slice_type != SliceType::I {
+        sh.num_ref_idx_active_override = r.bit()?;
+        if sh.num_ref_idx_active_override {
+            sh.num_ref_idx_l0_active_minus1 =
+                ue_max(&mut r, 31, "num_ref_idx_l0_active_minus1")? as u8;
+            if slice_type == SliceType::B {
+                sh.num_ref_idx_l1_active_minus1 =
+                    ue_max(&mut r, 31, "num_ref_idx_l1_active_minus1")? as u8;
+            }
         }
     }
-    // ref_pic_list_modification
     if slice_type != SliceType::I {
-        skip_ref_pic_list_modification(&mut r)?;
+        sh.ref_list_mods_l0 = ref_pic_list_modification(&mut r)?;
     }
     if slice_type == SliceType::B {
-        skip_ref_pic_list_modification(&mut r)?;
+        sh.ref_list_mods_l1 = ref_pic_list_modification(&mut r)?;
     }
     if (pps.weighted_pred && slice_type == SliceType::P)
         || (pps.weighted_bipred_idc == 1 && slice_type == SliceType::B)
     {
-        skip_pred_weight_table(
+        sh.pred_weights = Some(pred_weight_table(
             &mut r,
             &sps,
             sh.num_ref_idx_l0_active_minus1,
-            num_l1,
+            sh.num_ref_idx_l1_active_minus1,
             slice_type == SliceType::B,
-        )?;
+        )?);
     }
     if sh.is_reference() {
         if sh.is_idr() {
@@ -450,51 +491,74 @@ pub fn parse_slice_header(
             sh.mmcos = Some(ops);
         }
     }
+    if pps.entropy_coding_mode && slice_type != SliceType::I {
+        sh.cabac_init_idc = ue_max(&mut r, 2, "cabac_init_idc")? as u8;
+    }
+    sh.slice_qp_delta = r.se()? as i8;
+    if pps.deblocking_filter_control_present {
+        sh.disable_deblocking_filter_idc =
+            ue_max(&mut r, 2, "disable_deblocking_filter_idc")? as u8;
+        if sh.disable_deblocking_filter_idc != 1 {
+            sh.slice_alpha_c0_offset_div2 = r.se()? as i8;
+            sh.slice_beta_offset_div2 = r.se()? as i8;
+        }
+    }
+    sh.header_bits = r.position() as u32;
     Ok(sh)
 }
 
-fn skip_ref_pic_list_modification(r: &mut BitReader) -> Result<()> {
+fn ref_pic_list_modification(r: &mut BitReader) -> Result<Vec<RefListMod>> {
+    let mut mods = Vec::new();
     if r.bit()? {
         loop {
             let idc = r.ue()?;
             if idc == 3 {
                 break;
             }
-            if idc > 5 {
+            if idc > 5 || mods.len() >= 64 {
                 return Err(Error::Bitstream("bad modification_of_pic_nums_idc"));
             }
-            r.ue()?;
+            mods.push(RefListMod {
+                idc,
+                value: r.ue()?,
+            });
         }
     }
-    Ok(())
+    Ok(mods)
 }
 
-fn skip_pred_weight_table(
+fn pred_weight_table(
     r: &mut BitReader,
     sps: &Sps,
     num_l0: u8,
     num_l1: u8,
     b: bool,
-) -> Result<()> {
-    r.ue()?; // luma_log2_weight_denom
+) -> Result<PredWeightTable> {
+    let mut t = PredWeightTable {
+        luma_log2_weight_denom: ue_max(r, 7, "luma_log2_weight_denom")? as u8,
+        ..Default::default()
+    };
     if sps.chroma_format_idc != 0 {
-        r.ue()?;
+        t.chroma_log2_weight_denom = ue_max(r, 7, "chroma_log2_weight_denom")? as u8;
     }
-    for count in [Some(num_l0), b.then_some(num_l1)].into_iter().flatten() {
+    for (count, list) in [(Some(num_l0), &mut t.l0), (b.then_some(num_l1), &mut t.l1)] {
+        let Some(count) = count else { continue };
         for _ in 0..=count {
+            let mut w = PredWeight::default();
             if r.bit()? {
-                r.se()?;
-                r.se()?;
+                w.luma = Some((r.se()? as i16, r.se()? as i16));
             }
             if sps.chroma_format_idc != 0 && r.bit()? {
-                for _ in 0..2 {
-                    r.se()?;
-                    r.se()?;
+                let mut c = [(0i16, 0i16); 2];
+                for e in &mut c {
+                    *e = (r.se()? as i16, r.se()? as i16);
                 }
+                w.chroma = Some(c);
             }
+            list.push(w);
         }
     }
-    Ok(())
+    Ok(t)
 }
 
 #[cfg(test)]

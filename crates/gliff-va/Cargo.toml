@@ -1,17 +1,17 @@
 [package]
-name = "gliff-vk"
+name = "gliff-va"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+build = "build.rs"
 
 [lints]
 workspace = true
 
 [dependencies]
-ash = "0.38"
-drm-fourcc.workspace = true
-gliff-proto.workspace = true
-gliff-va.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[build-dependencies]
+pkg-config = "0.3"

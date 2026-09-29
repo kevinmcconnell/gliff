@@ -51,6 +51,14 @@ enum Cmd {
     Permissions,
     /// Vulkan: device, queues and video capabilities
     Vulkan,
+    /// VA-API: driver, H.264 capabilities, and a surface written by the
+    /// Vulkan split shader and read back through the driver
+    Surfaces {
+        #[arg(long, default_value_t = 640)]
+        width: u32,
+        #[arg(long, default_value_t = 360)]
+        height: u32,
+    },
     /// Encode and decode synthetic BGRA frames end to end on the GPU
     Roundtrip {
         #[arg(long, default_value_t = 640)]
@@ -171,6 +179,7 @@ fn main() -> Result<()> {
         Cmd::Outputs => outputs(&target)?,
         Cmd::Permissions => permissions(&target)?,
         Cmd::Vulkan => vulkan_info(&node)?,
+        Cmd::Surfaces { width, height } => surfaces(&node, width, height)?,
         Cmd::Roundtrip {
             width,
             height,
@@ -1134,6 +1143,82 @@ fn vulkan_info(node: &std::path::Path) -> Result<()> {
         }
     }
     status(gpu.can_decode(), "Vulkan H.264 decode queue");
+    Ok(())
+}
+
+/// VA-API driver capabilities, then the hand-off: a driver-owned NV12
+/// surface exported as a dmabuf, imported into Vulkan, written by the split
+/// shader, and read back through the driver to compare with the CPU split.
+fn surfaces(node: &std::path::Path, width: u32, height: u32) -> Result<()> {
+    use gliff_proto::chroma::yuv444_to_nv12;
+    use gliff_va::{Display, Surface, UsageHint};
+
+    let gpu = Gpu::open(Some(node))?;
+    println!("  vulkan: {} ({})", gpu.name, gpu.driver);
+    let display = Display::open(node)?;
+    println!(
+        "  va-api: {} (libva {}.{})",
+        display.vendor, display.version.0, display.version.1
+    );
+    let caps = display.caps()?;
+    if let Some(e) = caps.encode_entrypoint {
+        println!(
+            "  H.264 encode: entrypoint {}, rate control {}, packed headers {:#x}, max {}x{}",
+            gliff_va::display::entrypoint_name(e),
+            gliff_va::display::rate_control_names(caps.rate_control).join("|"),
+            caps.packed_headers,
+            caps.max_width,
+            caps.max_height
+        );
+    }
+    match caps.can_encode() {
+        Ok(()) => status(true, "VA-API H.264 encode"),
+        Err(e) => status(false, &format!("VA-API H.264 encode: {e}")),
+    }
+    match caps.can_decode() {
+        Ok(()) => status(true, "VA-API H.264 decode"),
+        Err(e) => status(false, &format!("VA-API H.264 decode: {e}")),
+    }
+
+    let surface = Surface::new_nv12(&display, width, height, UsageHint::Encoder)?;
+    let desc = surface.export()?;
+    println!(
+        "  surface {}x{} exported: modifier {:#x}, {} object(s) of {:?} bytes, planes {:?}",
+        desc.width,
+        desc.height,
+        desc.modifier,
+        desc.objects.len(),
+        desc.object_sizes,
+        desc.planes
+            .iter()
+            .map(|p| (p.object, p.offset, p.pitch))
+            .collect::<Vec<_>>()
+    );
+    let (w, h) = (width as usize, height as usize);
+    let bgra = synthetic_bgra(w, h, 0);
+    let path = gliff_vk::split_into_surface(&gpu, &desc, &bgra, width, height)
+        .context("split into the VA surface")?;
+    println!("  split path: {path:?}");
+    surface.sync()?;
+    let (y, uv) = surface.read_nv12()?;
+    let reference = yuv444_to_nv12(&bgra_to_yuv444(&bgra, w * 4, w, h));
+    let max_diff = |a: &[u8], b: &[u8]| {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (*x as i32 - *y as i32).unsigned_abs())
+            .max()
+            .unwrap_or(0)
+    };
+    let (py, puv) = (psnr(&y, &reference.y), psnr(&uv, &reference.uv));
+    println!(
+        "  Y psnr {py:.1} dB (max diff {}), UV psnr {puv:.1} dB (max diff {})",
+        max_diff(&y, &reference.y),
+        max_diff(&uv, &reference.uv)
+    );
+    status(
+        py > 45.0 && puv > 45.0,
+        "Vulkan split shader output read back through VA-API",
+    );
     Ok(())
 }
 

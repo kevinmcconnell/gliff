@@ -241,6 +241,32 @@ impl Gpu {
         Ok(unsafe { self.device.allocate_memory(&info, None) }?)
     }
 
+    /// How many memory planes an image of `format` with `modifier` has, or
+    /// `None` when the driver does not list the modifier for the format.
+    pub(crate) fn modifier_memory_planes(&self, format: vk::Format, modifier: u64) -> Option<u32> {
+        // SAFETY: two-call pattern on a valid physical device; the list is
+        // sized from the first call before the second fills it.
+        unsafe {
+            let mut list = vk::DrmFormatModifierPropertiesListEXT::default();
+            let mut props = vk::FormatProperties2::default().push_next(&mut list);
+            self.instance
+                .get_physical_device_format_properties2(self.physical, format, &mut props);
+            let mut entries = vec![
+                vk::DrmFormatModifierPropertiesEXT::default();
+                list.drm_format_modifier_count as usize
+            ];
+            let mut list = vk::DrmFormatModifierPropertiesListEXT::default()
+                .drm_format_modifier_properties(&mut entries);
+            let mut props = vk::FormatProperties2::default().push_next(&mut list);
+            self.instance
+                .get_physical_device_format_properties2(self.physical, format, &mut props);
+            entries
+                .iter()
+                .find(|e| e.drm_format_modifier == modifier)
+                .map(|e| e.drm_format_modifier_plane_count)
+        }
+    }
+
     /// Wait for the whole device to go idle (teardown, resize).
     pub fn wait_idle(&self) {
         // SAFETY: valid device.

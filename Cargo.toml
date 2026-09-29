@@ -7,6 +7,7 @@ members = [
     "crates/hypr-wl",
     "crates/hypr-capture",
     "crates/hypr-input",
+    "crates/gliff-va",
     "crates/gliff-vk",
     "crates/gliff-sw",
     "crates/gliff",
@@ -33,6 +34,7 @@ hypr-ipc = { path = "crates/hypr-ipc" }
 hypr-wl = { path = "crates/hypr-wl" }
 hypr-capture = { path = "crates/hypr-capture" }
 hypr-input = { path = "crates/hypr-input" }
+gliff-va = { path = "crates/gliff-va" }
 gliff-vk = { path = "crates/gliff-vk" }
 gliff-sw = { path = "crates/gliff-sw" }
 openh264 = { version = "0.9", features = ["source"] }

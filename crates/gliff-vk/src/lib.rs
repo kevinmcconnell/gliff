@@ -5,7 +5,7 @@
 
 use ash::vk::native as std_video;
 
-pub mod h264;
+pub use gliff_va::h264;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -19,6 +19,8 @@ pub enum Error {
     Bitstream(&'static str),
     #[error("unsupported: {0}")]
     Unsupported(String),
+    #[error("va-api: {0}")]
+    Va(#[from] gliff_va::Error),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -52,4 +54,4 @@ pub mod pipeline;
 pub use device::Gpu;
 pub use encoder::EncoderSettings;
 pub use image::{DmabufPlane, ExportedDmabuf};
-pub use pipeline::{Decoder, DisplayFrame, EncodedFrame, Encoder};
+pub use pipeline::{split_into_surface, Decoder, DisplayFrame, EncodedFrame, Encoder, SurfacePath};
