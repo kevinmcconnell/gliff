@@ -190,7 +190,8 @@ enum VideoDecoder {
 }
 
 /// Open the GPU for decoding, or `None` for the CPU tier. In `Gpu` mode a
-/// machine without a usable Vulkan Video decoder falls back to the CPU.
+/// machine without Vulkan compute or a VA-API H.264 decoder falls back to
+/// the CPU.
 fn open_gpu(mode: VideoMode) -> Option<Arc<Gpu>> {
     if mode == VideoMode::Cpu {
         tracing::info!("using the CPU video pipeline as requested");
@@ -199,11 +200,11 @@ fn open_gpu(mode: VideoMode) -> Option<Arc<Gpu>> {
     match Gpu::open(Some(&hypr_capture::render_node(None))) {
         Ok(gpu) if gpu.can_decode() => Some(gpu),
         Ok(gpu) => {
-            tracing::warn!(gpu = %gpu.name, "no Vulkan H.264 decode queue; falling back to the CPU pipeline");
+            tracing::warn!(gpu = %gpu.name, "no VA-API H.264 decoder; falling back to the CPU pipeline");
             None
         }
         Err(e) => {
-            tracing::warn!(error = %e, "no usable Vulkan device; falling back to the CPU pipeline");
+            tracing::warn!(error = %e, "no usable GPU; falling back to the CPU pipeline");
             None
         }
     }
@@ -216,10 +217,24 @@ fn new_decoder(
     height: u32,
 ) -> anyhow::Result<VideoDecoder> {
     let dual = chroma != ChromaMode::Single420;
-    Ok(match gpu {
-        Some(gpu) => VideoDecoder::Gpu(Box::new(Decoder::new(gpu, dual, width, height)?)),
-        None => VideoDecoder::Cpu(Box::new(gliff_sw::Decoder::new(dual)?)),
-    })
+    if let Some(gpu) = gpu {
+        match Decoder::new(gpu, dual, width, height) {
+            Ok(d) => return Ok(VideoDecoder::Gpu(Box::new(d))),
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot create the GPU decoder; falling back to the CPU pipeline");
+            }
+        }
+    }
+    Ok(VideoDecoder::Cpu(Box::new(gliff_sw::Decoder::new(dual)?)))
+}
+
+impl VideoDecoder {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Gpu(_) => "gpu",
+            Self::Cpu(_) => "cpu",
+        }
+    }
 }
 
 async fn session<R, W>(
@@ -315,15 +330,21 @@ where
         }
     };
     let mut decoder = new_decoder(&gpu, chroma, width, height)?;
-    let local = if gpu.is_some() { "gpu" } else { "cpu" };
-    let mut video_label = format!("{} > {}", pipeline.map_or("?", VideoPipeline::label), local);
+    let mut video_label = format!(
+        "{} > {}",
+        pipeline.map_or("?", VideoPipeline::label),
+        decoder.label()
+    );
     let _ = status.send(Status::Connected {
         video: video_label.clone(),
         view_width: view.0,
         view_height: view.1,
         fps_cap,
     });
-    let decode_on = gpu.as_ref().map_or("cpu", |g| g.name.as_str());
+    let decode_on = match (&decoder, &gpu) {
+        (VideoDecoder::Gpu(_), Some(g)) => g.name.as_str(),
+        _ => "cpu",
+    };
     tracing::info!(width, height, scale_milli, decode_on, video = %video_label, "connected");
     let mut logged_first = false;
 
@@ -639,7 +660,11 @@ where
                 }
                 (width, height, chroma, scale_milli) = (w, h, c, s);
                 (view, fps_cap) = ((view_width, view_height), f);
-                video_label = format!("{} > {}", pipeline.map_or("?", VideoPipeline::label), local);
+                video_label = format!(
+                    "{} > {}",
+                    pipeline.map_or("?", VideoPipeline::label),
+                    decoder.label()
+                );
                 let _ = status.send(Status::Connected {
                     video: video_label.clone(),
                     view_width,

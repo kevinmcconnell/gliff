@@ -209,6 +209,7 @@ where
         output,
         stream,
         encoder_max,
+        gpu_encoded: false,
         client_extent: (caps.max_width, caps.max_height),
         caps,
         link: LinkEstimator::new(),
@@ -409,6 +410,9 @@ struct Session {
     stream: (u32, u32),
     /// The largest size the encoder accepts.
     encoder_max: (u32, u32),
+    /// A GPU encode has succeeded, so a later failure is not a broken
+    /// driver path to fall back from.
+    gpu_encoded: bool,
     caps: ClientCaps,
     /// The client's last reported window size, so a mirrored output that
     /// changes mode can be refitted to the window.
@@ -1046,7 +1050,23 @@ impl Session {
         let (width, height) = self.stream;
         let key = std::mem::take(&mut self.want_keyframe);
         let t0 = Instant::now();
-        let encoded = self.encoder.encode(frame, self.stream, key)?;
+        let encoded = match self.encoder.encode(frame, self.stream, key) {
+            Ok(e) => e,
+            Err(e) if matches!(self.video, VideoTier::Gpu(_)) && !self.gpu_encoded => {
+                tracing::warn!(error = %format!("{e:#}"), "the first GPU encode failed; falling back to the CPU pipeline");
+                self.video = VideoTier::Cpu;
+                self.encoder_max = gliff_sw::Encoder::MAX_SIZE;
+                self.encoder = VideoEncoder::new(
+                    &self.video,
+                    &self.settings,
+                    self.chroma == ChromaMode::Dual420,
+                )?;
+                self.send_config();
+                self.encoder.encode(frame, self.stream, true)?
+            }
+            Err(e) => return Err(e),
+        };
+        self.gpu_encoded = true;
         let enc_us = t0.elapsed().as_micros();
         let aux = encoded.aux.unwrap_or_default();
         let msg = ServerMsg::VideoFrame {
@@ -1104,9 +1124,10 @@ enum VideoTier {
 }
 
 impl VideoTier {
-    /// Open the requested tier. In `Gpu` mode a machine without a usable
-    /// Vulkan Video encoder falls back to the CPU instead of failing; a GPU
-    /// whose encoder cannot then be created falls back in `VideoStart`.
+    /// Open the requested tier. In `Gpu` mode a machine without Vulkan
+    /// compute or a VA-API H.264 encoder falls back to the CPU instead of
+    /// failing; a GPU whose encoder cannot then be created falls back in
+    /// `VideoStart`, and one whose first encode fails in `encode_and_send`.
     fn open(mode: VideoMode, render_node: &std::path::Path) -> Self {
         if mode == VideoMode::Cpu {
             tracing::info!("using the CPU video pipeline as requested");
@@ -1114,15 +1135,21 @@ impl VideoTier {
         }
         match Gpu::open(Some(render_node)) {
             Ok(gpu) if gpu.can_encode() => {
-                tracing::info!(gpu = %gpu.name, "using the GPU video pipeline");
+                tracing::info!(gpu = %gpu.name, va = %gpu.va.vendor, "using the GPU video pipeline");
                 Self::Gpu(gpu)
             }
             Ok(gpu) => {
-                tracing::warn!(gpu = %gpu.name, "no Vulkan H.264 encode queue; falling back to the CPU pipeline");
+                let why = gpu
+                    .va_caps
+                    .can_encode()
+                    .err()
+                    .map(|e| e.to_string())
+                    .unwrap_or_default();
+                tracing::warn!(gpu = %gpu.name, %why, "no VA-API H.264 encoder; falling back to the CPU pipeline");
                 Self::Cpu
             }
             Err(e) => {
-                tracing::warn!(error = %e, "no usable Vulkan device; falling back to the CPU pipeline");
+                tracing::warn!(error = %e, "no usable GPU; falling back to the CPU pipeline");
                 Self::Cpu
             }
         }

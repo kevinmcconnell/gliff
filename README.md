@@ -3,13 +3,15 @@
 [![CI](https://github.com/kevinmcconnell/gliff/actions/workflows/ci.yml/badge.svg)](https://github.com/kevinmcconnell/gliff/actions/workflows/ci.yml)
 
 Remote-desktop a Hyprland session from another Hyprland machine, over SSH only.
-Custom wire protocol, Vulkan Video hardware encode and decode, full-resolution
-4:4:4 colour by the RDP AVC444 technique (two 4:2:0 H.264 streams recombined on
-the client). The whole media path stays on the GPU: the captured dmabuf is
-imported into Vulkan, split by a compute shader, encoded, and on the client
-decoded, recombined by a compute shader and handed to GTK as a dmabuf.
+Custom wire protocol, hardware H.264 encode and decode through VA-API,
+full-resolution 4:4:4 colour by the RDP AVC444 technique (two 4:2:0 H.264
+streams recombined on the client). The whole media path stays on the GPU: the
+captured dmabuf is imported into Vulkan, split by a compute shader straight
+into the encoder's surfaces, encoded by the VA-API driver, and on the client
+decoded by VA-API, recombined by a Vulkan compute shader and handed to GTK
+as a dmabuf.
 
-Machines without Vulkan Video fall back to a CPU pipeline (OpenH264), so
+Machines without a VA-API H.264 codec fall back to a CPU pipeline (OpenH264), so
 gliff runs anywhere Hyprland runs; `--video cpu` (or `GLIFF_VIDEO=cpu`)
 forces it for testing. The CPU tier streams a single 4:2:0 stream by default
 (`--full-chroma` on the server keeps 4:4:4). Server and client pick their
@@ -18,15 +20,16 @@ reverse.
 
 ## Status
 
-Working and validated on AMD (Ryzen Granite Ridge, Mesa RADV):
+Working and validated on AMD (Mesa RADV for compute, Mesa radeonsi for the
+codec):
 
 - Capture of a Hyprland output via `ext-image-copy-capture-v1` into GBM dmabufs.
 - Keyboard and pointer injection, with the client's xkb keymap uploaded so keys
   map identically on both ends, and sent again when the local keyboard or
   layout changes.
-- Vulkan Video H.264 encode and decode (`VK_KHR_video_encode_h264`,
-  `VK_KHR_video_decode_h264`); Dual420 4:4:4 round-trips near-lossless, plus a
-  `--low-bandwidth` single 4:2:0 stream.
+- VA-API H.264 encode and decode on driver-owned surfaces that the Vulkan
+  compute shaders write and read in place; Dual420 4:4:4 round-trips
+  near-lossless, plus a `--low-bandwidth` single 4:2:0 stream.
 - The full server pipeline (capture -> dmabuf import -> GPU split -> two H.264
   streams -> protocol) and a GTK4 client that decodes, recombines on the GPU,
   displays through a dmabuf texture, forwards input, shows the remote cursor,
@@ -39,11 +42,12 @@ Working and validated on AMD (Ryzen Granite Ridge, Mesa RADV):
   `omarchy theme set`. Without Omarchy it is stock Adwaita and follows the
   desktop dark/light preference.
 
-On Intel (Mesa ANV) the client has been tested and works, but the server
-has no GPU support there yet: ANV's encoder lacks CBR rate control, so the
-server uses the CPU pipeline. The client needs
-`ANV_DEBUG=video-decode,video-encode` set; `docs/hardware-quirks.md` explains
-why.
+Intel GPUs take the same path through `intel-media-driver` (every generation
+from Skylake on, including Lunar Lake, Battlemage and Panther Lake, which
+have no Vulkan Video encode in Mesa). The Intel path is built from the Mesa
+and libva sources and awaits its first run on Intel hardware;
+`docs/hardware-quirks.md` lists what to check. NVIDIA has no VA-API encoder,
+so both ends use the CPU tier there.
 
 Design and the full picture are in `docs/architecture.md`; driver-specific
 behaviour and test gaps are in `docs/hardware-quirks.md`.
@@ -56,8 +60,8 @@ A paste that takes more than a second shows progress and a cancel button: a
 bar in the gliff window, or a desktop notification on the server.
 
 Not done yet: AV1 for outputs above 4096 wide (H.264 is scaled to fit today)
-and native single-stream 4:4:4; a verified ssh-from-cold-machine path; Intel
-GPU server support; and testing on NVIDIA Vulkan drivers.
+and native single-stream 4:4:4; a verified ssh-from-cold-machine path; and a
+test run on Intel hardware.
 
 ## Build
 
@@ -77,13 +81,14 @@ cargo build --release
 
 Needs Rust, a C++ toolchain (the vendored OpenH264 build; nasm speeds it up),
 and the runtime libraries in the PKGBUILD `depends`. The GPU tier needs a
-Vulkan loader and a driver with Vulkan Video (Mesa RADV 24+ on AMD); without
-one, gliff uses the CPU tier. The compute shaders are committed as SPIR-V
+Vulkan driver for compute (Mesa RADV or ANV) and a VA-API H.264 driver on the
+same GPU (`libva-mesa-driver` on AMD, `intel-media-driver` on Intel); without
+both, gliff uses the CPU tier. The compute shaders are committed as SPIR-V
 (`crates/gliff-vk/shaders/build.sh` rebuilds them with `glslc`). Verify the
 machine first:
 
 ```
-gliff-probe all                  # protocols, outputs, Vulkan, GPU + CPU round-trips
+gliff-probe all                  # protocols, outputs, GPU tier, GPU + CPU round-trips
 gliff-probe pipeline             # capture one frame and run the whole 4:4:4 path
 gliff-probe --video cpu roundtrip  # the CPU (OpenH264) tier alone
 ```
@@ -139,7 +144,7 @@ cargo fmt --all --check    # formatting (rustfmt defaults)
 and asserts the probe checks, the 4:4:4 capture pipeline, and both Dual420 and
 Single420 server-plus-client streams, including continued decoding after a
 mirrored output changes size. It also runs the CPU tier matrix (cpu<->cpu and
-each mixed pairing); on a machine without Vulkan Video the GPU cases are
+each mixed pairing); on a machine without the GPU tier the GPU cases are
 skipped and the CPU cases still run.
 
 ## Layout

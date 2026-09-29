@@ -33,7 +33,8 @@ struct Cli {
     /// DRM render node for GBM and Vulkan
     #[arg(long, global = true)]
     render_node: Option<PathBuf>,
-    /// Video pipeline to probe: `gpu` (Vulkan Video) or `cpu` (OpenH264).
+    /// Video pipeline to probe: `gpu` (Vulkan compute + VA-API) or `cpu`
+    /// (OpenH264).
     /// Overrides the GLIFF_VIDEO environment variable.
     #[arg(long, global = true, value_parser = ["gpu", "cpu"])]
     video: Option<String>,
@@ -49,10 +50,11 @@ enum Cmd {
     Outputs,
     /// Report Hyprland permission settings that can block capture
     Permissions,
-    /// Vulkan: device, queues and video capabilities
-    Vulkan,
-    /// VA-API: driver, H.264 capabilities, and a surface written by the
-    /// Vulkan split shader and read back through the driver
+    /// GPU tier: the Vulkan compute device and the VA-API H.264 codec
+    #[command(alias = "vulkan")]
+    Gpu,
+    /// The GPU hand-off: a VA-API surface written by the Vulkan split
+    /// shader and read back through the driver
     Surfaces {
         #[arg(long, default_value_t = 640)]
         width: u32,
@@ -178,7 +180,7 @@ fn main() -> Result<()> {
         Cmd::Protocols => protocols(&target)?,
         Cmd::Outputs => outputs(&target)?,
         Cmd::Permissions => permissions(&target)?,
-        Cmd::Vulkan => vulkan_info(&node)?,
+        Cmd::Gpu => gpu_info(&node)?,
         Cmd::Surfaces { width, height } => surfaces(&node, width, height)?,
         Cmd::Roundtrip {
             width,
@@ -225,12 +227,12 @@ fn main() -> Result<()> {
             protocols(&target)?;
             outputs(&target)?;
             permissions(&target)?;
-            let gpu_ok = match vulkan_info(&node) {
+            let gpu_ok = match gpu_info(&node) {
                 Ok(()) => true,
                 Err(e) => {
                     status(
                         false,
-                        &format!("Vulkan Video unavailable ({e}); the CPU pipeline will be used"),
+                        &format!("GPU tier unavailable ({e}); the CPU pipeline will be used"),
                     );
                     false
                 }
@@ -1132,38 +1134,21 @@ fn bench(iters: usize) -> Result<()> {
     Ok(())
 }
 
-fn vulkan_info(node: &std::path::Path) -> Result<()> {
+fn gpu_info(node: &std::path::Path) -> Result<()> {
     let gpu = Gpu::open(Some(node))?;
-    println!("  {} ({})", gpu.name, gpu.driver);
-    status(gpu.can_encode(), "Vulkan H.264 encode queue");
-    if gpu.can_encode() {
-        match Encoder::max_size(&gpu) {
-            Ok((w, h)) => println!("  H.264 encode maximum {w}x{h}"),
-            Err(e) => println!("  H.264 encode maximum unknown: {e}"),
-        }
-    }
-    status(gpu.can_decode(), "Vulkan H.264 decode queue");
+    println!("  vulkan: {} ({})", gpu.name, gpu.driver);
+    println!(
+        "  va-api: {} (libva {}.{})",
+        gpu.va.vendor, gpu.va.version.0, gpu.va.version.1
+    );
+    print_caps(&gpu.va_caps);
     Ok(())
 }
 
-/// VA-API driver capabilities, then the hand-off: a driver-owned NV12
-/// surface exported as a dmabuf, imported into Vulkan, written by the split
-/// shader, and read back through the driver to compare with the CPU split.
-fn surfaces(node: &std::path::Path, width: u32, height: u32) -> Result<()> {
-    use gliff_proto::chroma::yuv444_to_nv12;
-    use gliff_va::{Display, Surface, UsageHint};
-
-    let gpu = Gpu::open(Some(node))?;
-    println!("  vulkan: {} ({})", gpu.name, gpu.driver);
-    let display = Display::open(node)?;
-    println!(
-        "  va-api: {} (libva {}.{})",
-        display.vendor, display.version.0, display.version.1
-    );
-    let caps = display.caps()?;
+fn print_caps(caps: &gliff_va::Caps) {
     if let Some(e) = caps.encode_entrypoint {
         println!(
-            "  H.264 encode: entrypoint {}, rate control {}, packed headers {:#x}, max {}x{}",
+            "  H.264 encode: entrypoint {}, rate control {}, packed headers {:#x}, maximum {}x{}",
             gliff_va::display::entrypoint_name(e),
             gliff_va::display::rate_control_names(caps.rate_control).join("|"),
             caps.packed_headers,
@@ -1179,7 +1164,17 @@ fn surfaces(node: &std::path::Path, width: u32, height: u32) -> Result<()> {
         Ok(()) => status(true, "VA-API H.264 decode"),
         Err(e) => status(false, &format!("VA-API H.264 decode: {e}")),
     }
+}
 
+/// The hand-off: a driver-owned NV12 surface exported as a dmabuf, imported
+/// into Vulkan, written by the split shader, and read back through the
+/// driver to compare with the CPU split.
+fn surfaces(node: &std::path::Path, width: u32, height: u32) -> Result<()> {
+    use gliff_proto::chroma::yuv444_to_nv12;
+    use gliff_va::{Surface, UsageHint};
+
+    let gpu = Gpu::open(Some(node))?;
+    let display = gpu.va.clone();
     let surface = Surface::new_nv12(&display, width, height, UsageHint::Encoder)?;
     let desc = surface.export()?;
     println!(

@@ -1,77 +1,113 @@
 # Hardware and driver quirks
 
-gliff targets Vulkan Video on both ends, with a CPU fallback (OpenH264 in
-`gliff-sw`) for machines without it: in the default `--video gpu` mode a
-failed device open, a missing encode/decode queue, or a failure to create
-the encoder drops to the CPU tier with a log line, and `--video cpu` /
-`GLIFF_VIDEO=cpu` forces it. Driver behaviour differs, so this file
-records what we have found and where more testing is needed. Findings so
-far come from **two** machines:
+gliff runs its pixel work in Vulkan compute and its H.264 codec through
+VA-API, with a CPU fallback (OpenH264 in `gliff-sw`) for machines without
+the codec: in the default `--video gpu` mode a failed device open, a VA-API
+driver without H.264 High encode (or decode, on the client), a failure to
+create the encoder, or a failed first encode drops to the CPU tier with a
+log line, and `--video cpu` / `GLIFF_VIDEO=cpu` forces it. Driver behaviour
+differs, so this file records what we have found and where more testing is
+needed. Findings so far come from AMD:
 
-- GPU: AMD Granite Ridge iGPU (Ryzen 9 9955HX), VCN 4 class.
-  Driver: Mesa RADV 26.2 (Vulkan 1.4), kernel 7.2.
+- GPU: AMD Radeon RX 7600 (Navi 33) and Granite Ridge iGPU (Ryzen 9 9955HX).
+  Drivers: Mesa RADV 26.2 for compute, Mesa `radeonsi` VA-API 26.2 (libva
+  2.24) for the codec, kernel 7.2.
   Compositor: Hyprland 0.56.2.
-- GPU: Intel Gen12 iGPU.
-  Driver: Mesa ANV 26.2 on the i915 KMD, kernel 7.2.
-  Compositor: Hyprland 0.56.2.
 
-`gliff-probe vulkan` prints the device and its video queues.
+`gliff-probe gpu` prints the Vulkan device, the VA-API driver and its H.264
+capabilities; `gliff-probe surfaces` proves the hand-off between the two.
 
-## Confirmed on AMD RADV
+## Confirmed on AMD (RADV + radeonsi)
 
-### Encode input images may carry STORAGE usage (used)
-The `VK_KHR_video_encode_h264` input format query accepts
-`VIDEO_ENCODE_SRC | STORAGE` on `G8_B8R8_2PLANE_420_UNORM` with
-`MUTABLE_FORMAT | EXTENDED_USAGE`, so the split shader writes straight into
-the encoder's input planes through R8 / R8G8 plane views. Each view must be
-limited with `VkImageViewUsageCreateInfo`: the plane formats have no video
-usage and NV12 has no storage usage, so a view that inherits the image's full
-usage is invalid.
-- **Needs testing on Intel/NVIDIA:** if STORAGE is refused, fall back to
-  writing R8/R8G8 images and `vkCmdCopyImage` into the NV12 planes.
+### Codec surfaces must be VA-API allocations
+The `radeonsi` encoder refuses an external linear dmabuf as its input (found
+on the project's first day with GBM buffers). A surface the driver allocated,
+exported with `vaExportSurfaceHandle` (`DRM_PRIME_2`, separate layers, read
+and write) and written through its dmabuf encodes fine. Every codec surface
+is therefore VA-owned and imported into Vulkan, never the reverse. The
+export gives one object holding both NV12 planes with a tiled modifier
+(`0x200000018601b04` on Navi 33); Vulkan imports it as one
+`G8_B8R8_2PLANE_420_UNORM` image with two explicit plane layouts.
 
-### H.264 encode maximum is 4096x4096
-`maxCodedExtent` for H.264 encode is 4096x4096 on VCN 4.0 (RX 7600). The
-value is the kernel's static codec table for the VCN generation
-(`drivers/gpu/drm/amd/amdgpu/soc21.c`), read by Mesa through
-`AMDGPU_INFO_VIDEO_CAPS_ENCODE` and passed on by RADV. No AMD generation
-encodes H.264 above 4096 in either dimension; HEVC and AV1 on the same
-engine reach 8192x4352. The server and `gliff-probe pipeline` scale a
-larger output down to fit (5120x2880 becomes 4096x2304), and
-`gliff-probe vulkan` prints the limit.
+### The imported surface takes STORAGE usage
+RADV accepts `STORAGE | SAMPLED | TRANSFER` with `MUTABLE_FORMAT |
+EXTENDED_USAGE` on the imported NV12 image, so the split shader writes the
+encoder input in place through R8 / R8G8 plane views, and the readback
+through `vaGetImage` matches the CPU split exactly. When a driver refuses
+STORAGE the pipeline writes a Vulkan-owned NV12 image and copies it into
+the surface plane by plane (`Image::copy_nv12_from`); `gliff-probe surfaces`
+prints which path was taken.
 
-### Decode DPB and output are distinct
-`VK_VIDEO_DECODE_CAPABILITY_DPB_AND_OUTPUT_DISTINCT_BIT_KHR` only. The decoder
-keeps a DPB array image (`VIDEO_DECODE_DPB`) and a separate ring of output
-images (`VIDEO_DECODE_DST | SAMPLED`) the recombine shader samples. Distinct is
-preferred whenever it is offered.
+### Packed headers are accepted
+`VAConfigAttribEncPackedHeaders` reports SEQUENCE | PICTURE | SLICE | MISC |
+RAW (0x1f), so gliff writes the SPS, PPS and every slice header itself
+(`gliff-va/src/h264/writer.rs`), unescaped with `has_emulation_bytes = 0`,
+and the driver inserts them into the coded buffer: an IDR access unit comes
+back with the SPS and PPS in front. The encoder still prepends its own copy
+when a driver leaves them out.
 
-### Encode DPB must be one array image
-The encode capabilities report no `SEPARATE_REFERENCE_IMAGES`, so the two
-reference slots are layers of one image. Decode allows separate images but the
-same array layout is used for both.
+### Rate control
+`VAConfigAttribRateControl` reports CQP | CBR | VBR | QVBR; gliff uses CBR
+with `disable_frame_skip` and `disable_bit_stuffing` set, a `window_size`
+of the rate controller's VBV and an HRD buffer of the same size. A rate
+change re-sends the three misc buffers with the next frame and takes effect
+at once (`gliff-probe roundtrip --adapt`).
 
-### Rate control must ride on every begin
-Once CBR is set with `vkCmdControlVideoCodingKHR`, every later
-`vkCmdBeginVideoCodingKHR` must carry the same `VkVideoEncodeRateControlInfoKHR`
-(+ H.264 layer info) in its pNext, or validation flags VUID 08253 and the
-result is undefined. The encoder rebuilds the chain per frame.
+### Encode entrypoint and limits
+`VAEntrypointEncSlice` (the full-featured one), maximum 4096x4096 for both
+encode and decode. Larger outputs are scaled to fit as before.
 
-### Encoded parameter sets and slices carry no start codes
-`vkGetEncodedVideoSessionParametersKHR` and the slice output are raw NAL units;
-gliff prepends `00 00 00 01` when a start code is absent, and asks for the SPS
-and PPS in two calls so each can be framed.
+### Decode
+`VAEntrypointVLD` with one surface per DPB slot plus a spare; the decoder
+hands VA-API the whole slice NAL and `slice_data_bit_offset = 8 +` the
+parsed header length. `radeonsi` parses the headers itself and ignores the
+offset; Intel uses it.
 
-### Quality level and virtual buffer size barely matter
-On synthetic stress content the three quality levels and buffer sizes from
-500 ms to 2 s change PSNR by less than 1 dB; bitrate is what matters. The
-encoder uses quality level 0 and a 500 ms buffer.
+### Cross-API synchronisation
+Vulkan and VA-API share no fences. The split submission blocks on its fence
+before `vaBeginPicture`, and `vaSyncSurface` runs before the recombine
+reads a decoded surface. Ownership crosses with `VK_QUEUE_FAMILY_FOREIGN_EXT`
+barriers (`EXTERNAL` when the extension is missing), contents preserved.
 
 ### Host memory for readback should be cached
 Reading 8 MB of BGRA back through write-combined host memory took ~25 ms;
 through `HOST_CACHED` memory it takes ~1 ms. `HostBuffer` prefers cached
-memory and falls back to write-combined. The encoder's bitstream buffer uses
-the same path.
+memory and falls back to write-combined.
+
+## Intel (built from the sources, not yet run)
+
+The Intel path uses Mesa ANV for the Vulkan compute stages and
+`intel-media-driver` (iHD) for the codec, which covers every generation from
+Skylake on, including Lunar Lake, Battlemage and Panther Lake. Vulkan Video
+is not used, so the `ANV_DEBUG` flags that used to be needed are gone. What
+the first run must confirm, in the order `gliff-probe gpu`, `surfaces`,
+`roundtrip`, `pipeline`, `scripts/e2e.sh`:
+
+- **Entrypoint.** On Gen12 and later iHD offers `VAEntrypointEncSliceLP`
+  (VDEnc) for H.264, which gliff takes when `EncSlice` is absent. CBR on it
+  needs the HuC firmware; a FAIL with "no CBR" means `dmesg | grep -i huc`.
+- **Packed headers.** iHD requires them and gliff always supplies them.
+- **The hand-off.** iHD exports NV12 with a Y-tiled or Tile4 modifier; ANV
+  must import it with STORAGE for the direct path, else the copy path runs.
+  `gliff-probe surfaces` reports both.
+- **Slice data offset.** iHD reads `slice_data_bit_offset`; the value follows
+  ffmpeg's convention (NAL header bits plus the unescaped header bits).
+- **Coded buffer status.** `VA_CODED_BUF_STATUS_*` bits are logged; a
+  `BAD_BITSTREAM` status fails the encode and the server falls back to CPU.
+
+## Not yet tested anywhere
+- Intel, for every item above.
+- NVIDIA has no VA-API encoder; both ends take the CPU tier there. Decode
+  through `nvidia-vaapi-driver` is untried.
+- Baseline-profile streams (the CPU tier's output) through the VA-API High
+  decode config: radeonsi accepts them (the e2e cpu-server -> gpu-client
+  case), Intel is unverified.
+- Native 4:4:4 encode (HEVC 4:4:4 on Intel) to retire the dual-stream split.
+- Tiled capture buffers. The capture ring prefers linear modifiers and the
+  dmabuf import passes the modifier through, but only linear has been run.
+- Multiple GPUs / non-renderD128 nodes: `--render-node` matches the DRM
+  device number to the Vulkan physical device and opens the VA display on
+  the same node, untested with two GPUs.
 
 ## OpenH264 (the CPU tier)
 
@@ -142,46 +178,6 @@ position = "auto", scale = ... })`, which applies at runtime. `output create
 headless` and `output remove` are hyprctl commands and work with both config
 types. The server reads back the mode Hyprland applied instead of assuming
 the request took effect.
-
-## Confirmed on Intel ANV
-
-### Vulkan Video stays hidden until `ANV_DEBUG` asks for it
-ANV compiles video support in but gates it off, so every gliff binary
-reports `no suitable GPU: no Vulkan device with a compute queue, dmabuf
-import and video queues` and falls back to the CPU tier until the
-environment carries `ANV_DEBUG=video-decode,video-encode`. With it set ANV advertises
-`VK_KHR_video_queue`, `VK_KHR_video_decode_queue`, `VK_KHR_video_encode_queue`,
-`VK_KHR_video_decode_h264` and `VK_KHR_video_encode_h264`, plus a second queue
-family carrying `VIDEO_DECODE_KHR | VIDEO_ENCODE_KHR`, and `gliff-probe vulkan`
-then passes on both the H.264 decode and encode queues. Nothing in the kernel
-withholds this: the `vcs0`, `vcs1` and `vecs0` engines are present and GuC and
-HuC are authenticated without the variable.
-
-`ANV_VIDEO_DECODE=1` and `ANV_VIDEO_ENCODE=1`, which most search results still
-name, do nothing on Mesa 26.2.
-
-### Decode DPB and output coincide
-`VK_VIDEO_DECODE_CAPABILITY_DPB_AND_OUTPUT_COINCIDE_BIT_KHR` only, so the
-decoder gives each DPB slot its own image with `VIDEO_DECODE_DPB |
-VIDEO_DECODE_DST | SAMPLED` usage, decodes into the slot being set up, and
-hands that slot to the recombine pass. A spare image past the last slot takes
-pictures that are not references.
-- **Needs testing:** the Khronos validation layer, which is not installed on
-  the Intel machine, so the coincide-mode VUIDs are unchecked.
-
-## Not yet tested anywhere
-- NVIDIA (proprietary and NVK) for every item above, and Intel ANV for every
-  item not listed under "Confirmed on Intel ANV".
-- Baseline-profile streams (the CPU tier's output) through Vulkan decode
-  sessions created with the fixed High decode profile: RADV accepts them
-  (the e2e cpu-server -> gpu-client case), other drivers are unverified.
-- Native 4:4:4 encode (HEVC 4:4:4 / AV1) to retire the dual-stream split.
-- `VK_VALVE_video_encode_rgb_conversion` (exposed by RADV here): the encoder
-  converts RGB itself, which would remove the split pass for `Single420`.
-- Tiled capture buffers. The capture ring prefers linear modifiers and the
-  dmabuf import passes the modifier through, but only linear has been run.
-- Multiple GPUs / non-renderD128 nodes: `--render-node` matches the DRM
-  device number to the Vulkan physical device, untested with two GPUs.
 
 ## Known limitations recorded from code review (not yet fixed)
 

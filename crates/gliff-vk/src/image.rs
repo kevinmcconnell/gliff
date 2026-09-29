@@ -42,68 +42,17 @@ pub struct Image {
     pub(crate) layout: std::cell::Cell<vk::ImageLayout>,
 }
 
-/// How an image is used, which decides its usage flags and sharing.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Role {
-    /// Encoder input: written by the split shader, read by the encoder.
-    EncodeSource,
-    /// Encoder reference pictures (one array image, one layer per slot).
-    EncodeDpb,
-    /// Decoder output: written by the decoder, read by the recombine shader.
-    DecodeOutput,
-    /// Decoder reference pictures.
-    DecodeDpb,
-    /// Decoder reference picture that is also the decode output and is
-    /// read by the recombine shader.
-    DecodeDpbAndOutput,
-}
-
 impl Image {
-    /// Create an NV12 image for a video role. `profile` is the video profile
-    /// the image will be used with (required by the video extensions).
-    pub(crate) fn nv12(
-        gpu: &Arc<Gpu>,
-        role: Role,
-        width: u32,
-        height: u32,
-        layers: u32,
-        profile: Option<&vk::VideoProfileInfoKHR>,
-    ) -> Result<Self> {
-        let (usage, flags) = match role {
-            Role::EncodeSource => (
-                vk::ImageUsageFlags::VIDEO_ENCODE_SRC_KHR
-                    | vk::ImageUsageFlags::STORAGE
-                    | vk::ImageUsageFlags::TRANSFER_DST
-                    | vk::ImageUsageFlags::TRANSFER_SRC,
-                vk::ImageCreateFlags::MUTABLE_FORMAT | vk::ImageCreateFlags::EXTENDED_USAGE,
-            ),
-            Role::EncodeDpb => (
-                vk::ImageUsageFlags::VIDEO_ENCODE_DPB_KHR,
-                vk::ImageCreateFlags::empty(),
-            ),
-            Role::DecodeOutput => (
-                vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR
-                    | vk::ImageUsageFlags::SAMPLED
-                    | vk::ImageUsageFlags::TRANSFER_SRC,
-                vk::ImageCreateFlags::MUTABLE_FORMAT | vk::ImageCreateFlags::EXTENDED_USAGE,
-            ),
-            Role::DecodeDpb => (
-                vk::ImageUsageFlags::VIDEO_DECODE_DPB_KHR,
-                vk::ImageCreateFlags::empty(),
-            ),
-            Role::DecodeDpbAndOutput => (
-                vk::ImageUsageFlags::VIDEO_DECODE_DPB_KHR
-                    | vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR
-                    | vk::ImageUsageFlags::SAMPLED
-                    | vk::ImageUsageFlags::TRANSFER_SRC,
-                vk::ImageCreateFlags::MUTABLE_FORMAT | vk::ImageCreateFlags::EXTENDED_USAGE,
-            ),
-        };
+    /// Create an NV12 image the compute shaders read and write through its
+    /// plane views, and that copies to and from imported surfaces.
+    pub(crate) fn nv12(gpu: &Arc<Gpu>, width: u32, height: u32) -> Result<Self> {
+        let usage = vk::ImageUsageFlags::STORAGE
+            | vk::ImageUsageFlags::SAMPLED
+            | vk::ImageUsageFlags::TRANSFER_DST
+            | vk::ImageUsageFlags::TRANSFER_SRC;
         let families = gpu.families.all();
-        let profiles = profile.map(|p| vec![*p]).unwrap_or_default();
-        let mut profile_list = vk::VideoProfileListInfoKHR::default().profiles(&profiles);
         let mut info = vk::ImageCreateInfo::default()
-            .flags(flags)
+            .flags(vk::ImageCreateFlags::MUTABLE_FORMAT | vk::ImageCreateFlags::EXTENDED_USAGE)
             .image_type(vk::ImageType::TYPE_2D)
             .format(NV12)
             .extent(vk::Extent3D {
@@ -112,7 +61,7 @@ impl Image {
                 depth: 1,
             })
             .mip_levels(1)
-            .array_layers(layers)
+            .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::OPTIMAL)
             .usage(usage)
@@ -121,9 +70,6 @@ impl Image {
             info = info
                 .sharing_mode(vk::SharingMode::CONCURRENT)
                 .queue_family_indices(&families);
-        }
-        if profile.is_some() {
-            info = info.push_next(&mut profile_list);
         }
         // SAFETY: valid create info; memory is bound before any use.
         let (image, memory) = unsafe {
@@ -140,39 +86,24 @@ impl Image {
             format: NV12,
             width,
             height,
-            layers,
+            layers: 1,
             layer_views: Vec::new(),
             plane_views: Vec::new(),
             layout: vk::ImageLayout::UNDEFINED.into(),
         };
-        let compute_usage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED;
-        let video_usage = usage & !compute_usage;
-        for layer in 0..layers {
-            img.layer_views.push(img.view(
-                NV12,
-                vk::ImageAspectFlags::COLOR,
-                layer,
-                video_usage,
-            )?);
-        }
-        if matches!(
-            role,
-            Role::EncodeSource | Role::DecodeOutput | Role::DecodeDpbAndOutput
-        ) {
-            let plane_usage = usage & compute_usage;
-            img.plane_views.push(img.view(
-                vk::Format::R8_UNORM,
-                vk::ImageAspectFlags::PLANE_0,
-                0,
-                plane_usage,
-            )?);
-            img.plane_views.push(img.view(
-                vk::Format::R8G8_UNORM,
-                vk::ImageAspectFlags::PLANE_1,
-                0,
-                plane_usage,
-            )?);
-        }
+        let plane_usage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED;
+        img.plane_views.push(img.view(
+            vk::Format::R8_UNORM,
+            vk::ImageAspectFlags::PLANE_0,
+            0,
+            plane_usage,
+        )?);
+        img.plane_views.push(img.view(
+            vk::Format::R8G8_UNORM,
+            vk::ImageAspectFlags::PLANE_1,
+            0,
+            plane_usage,
+        )?);
         Ok(img)
     }
 
@@ -492,7 +423,7 @@ impl Image {
             layers: 1,
             layer_views: Vec::new(),
             plane_views: Vec::new(),
-            layout: vk::ImageLayout::UNDEFINED.into(),
+            layout: vk::ImageLayout::GENERAL.into(),
         };
         let plane_usage = usage & (vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED);
         img.plane_views.push(img.view(
@@ -530,7 +461,13 @@ impl Image {
                 gpu.device.destroy_image(image, None);
                 return Err(e.into());
             }
-            let dup = libc_dup(fd)?;
+            let dup = match libc_dup(fd) {
+                Ok(d) => d,
+                Err(e) => {
+                    gpu.device.destroy_image(image, None);
+                    return Err(e);
+                }
+            };
             let mut import = vk::ImportMemoryFdInfoKHR::default()
                 .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
                 .fd(dup.as_raw_fd());
@@ -671,6 +608,48 @@ impl Image {
         self.layout.set(new);
     }
 
+    /// Take the image back from another API (VA-API), with its contents
+    /// kept, and move it to `new` for this queue. Imported surfaces start
+    /// out owned by that API, in GENERAL layout.
+    pub(crate) fn acquire_foreign(&self, cmd: vk::CommandBuffer, new: vk::ImageLayout) {
+        self.foreign_barrier(cmd, self.gpu.foreign_family, self.gpu.families.compute, new);
+    }
+
+    /// Hand the image to another API (VA-API) to read, contents kept.
+    pub(crate) fn release_foreign(&self, cmd: vk::CommandBuffer) {
+        self.foreign_barrier(
+            cmd,
+            self.gpu.families.compute,
+            self.gpu.foreign_family,
+            vk::ImageLayout::GENERAL,
+        );
+    }
+
+    fn foreign_barrier(&self, cmd: vk::CommandBuffer, src: u32, dst: u32, new: vk::ImageLayout) {
+        let barrier = vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+            .src_access_mask(vk::AccessFlags2::MEMORY_WRITE | vk::AccessFlags2::MEMORY_READ)
+            .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+            .dst_access_mask(vk::AccessFlags2::MEMORY_WRITE | vk::AccessFlags2::MEMORY_READ)
+            .old_layout(self.layout.get())
+            .new_layout(new)
+            .src_queue_family_index(src)
+            .dst_queue_family_index(dst)
+            .image(self.image)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: self.layers,
+            });
+        let barriers = [barrier];
+        let dep = vk::DependencyInfo::default().image_memory_barriers(&barriers);
+        // SAFETY: recording into a command buffer in the recording state.
+        unsafe { self.gpu.device.cmd_pipeline_barrier2(cmd, &dep) };
+        self.layout.set(new);
+    }
+
     /// Full memory barrier without a layout change (between a write and a
     /// read of the same image in the same layout).
     pub(crate) fn memory_barrier(&self, cmd: vk::CommandBuffer) {
@@ -786,20 +765,10 @@ pub struct HostBuffer {
 }
 
 impl HostBuffer {
-    pub(crate) fn new(
-        gpu: &Arc<Gpu>,
-        size: usize,
-        usage: vk::BufferUsageFlags,
-        profile: Option<&vk::VideoProfileInfoKHR>,
-    ) -> Result<Self> {
-        let profiles = profile.map(|p| vec![*p]).unwrap_or_default();
-        let mut list = vk::VideoProfileListInfoKHR::default().profiles(&profiles);
-        let mut info = vk::BufferCreateInfo::default()
+    pub(crate) fn new(gpu: &Arc<Gpu>, size: usize, usage: vk::BufferUsageFlags) -> Result<Self> {
+        let info = vk::BufferCreateInfo::default()
             .size(size as u64)
             .usage(usage);
-        if profile.is_some() {
-            info = info.push_next(&mut list);
-        }
         // SAFETY: valid create info; the mapping lives as long as the buffer.
         let (buffer, memory, ptr) = unsafe {
             let buffer = gpu.device.create_buffer(&info, None)?;

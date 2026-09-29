@@ -2,15 +2,18 @@
 pkgname=gliff
 pkgver=0.1.0
 pkgrel=1
-pkgdesc="Hyprland remote desktop over SSH (Vulkan Video, 4:4:4)"
+pkgdesc="Hyprland remote desktop over SSH (GPU H.264, 4:4:4)"
 arch=('x86_64')
 url="https://github.com/kevinmcconnell/gliff"
 license=('MIT')
-depends=('wayland' 'libxkbcommon' 'libdrm' 'mesa' 'gtk4' 'libadwaita' 'vulkan-icd-loader')
+depends=('wayland' 'libxkbcommon' 'libdrm' 'mesa' 'gtk4' 'libadwaita' 'vulkan-icd-loader' 'libva')
 makedepends=('rust' 'cargo' 'pkgconf' 'gcc' 'nasm')
-optdepends=('vulkan-radeon: Vulkan on AMD'
-            'vulkan-intel: Vulkan on Intel'
+optdepends=('vulkan-radeon: Vulkan compute on AMD'
+            'vulkan-intel: Vulkan compute on Intel'
+            'libva-mesa-driver: VA-API H.264 codec on AMD'
+            'intel-media-driver: VA-API H.264 codec on Intel'
             'vulkan-tools: vulkaninfo for debugging'
+            'libva-utils: vainfo for debugging'
             'vulkan-validation-layers: driver call validation for development')
 options=(!lto)
 source=()
