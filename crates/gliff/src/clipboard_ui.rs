@@ -36,6 +36,10 @@ fn clipboard() -> Option<gdk::Clipboard> {
     gdk::Display::default().map(|d| d.clipboard())
 }
 
+fn holds_remote_offer(cb: &gdk::Clipboard) -> bool {
+    cb.content().is_some_and(|p| p.is::<RemoteProvider>())
+}
+
 /// Report every change of the local clipboard to the worker, except changes
 /// made by our own proxy provider.
 pub fn watch_local(sender: impl Fn() -> Option<UnboundedSender<ToWorker>> + 'static) {
@@ -48,14 +52,14 @@ pub fn watch_local(sender: impl Fn() -> Option<UnboundedSender<ToWorker>> + 'sta
     cb.connect_changed(move |cb| {
         // Only our own proxy for the server's offer must not echo back;
         // a copy from another gliff widget is a real local change.
-        if cb.content().is_some_and(|p| p.is::<RemoteProvider>()) {
+        let gen = selection_gen.get() + 1;
+        selection_gen.set(gen);
+        if holds_remote_offer(cb) {
             return;
         }
         let Some(tx) = sender() else {
             return;
         };
-        let gen = selection_gen.get() + 1;
-        selection_gen.set(gen);
         let selection_gen = selection_gen.clone();
         let mimes: Vec<String> = cb
             .formats()
@@ -126,12 +130,19 @@ async fn local_files(cb: &gdk::Clipboard, mimes: &[String]) -> LocalFiles {
 }
 
 /// Stream the local clipboard's `mime_type` into `reply` for the server;
-/// dropping `reply` marks the end. An error is sent as such.
+/// dropping `reply` marks the end. An error is sent as such. The server's
+/// own offer is refused: reading it would fetch the item back from the
+/// server, which would ask us for it again.
 pub fn read_local(mime_type: String, reply: Sender<std::io::Result<Bytes>>) {
     glib::MainContext::default().spawn_local(async move {
         let Some(cb) = clipboard() else {
             return;
         };
+        if holds_remote_offer(&cb) {
+            let error = std::io::Error::other("clipboard holds the server's offer");
+            let _ = reply.send(Err(error)).await;
+            return;
+        }
         // A text request may name a flavour the local source does not
         // advertise; any text flavour it does have will do.
         let available: Vec<String> = cb
@@ -188,7 +199,7 @@ pub fn set_remote_offer(
     };
     let mimes = local_mimes_for_offer(&mime_types, !files.is_empty());
     if mimes.is_empty() {
-        if cb.is_local() {
+        if holds_remote_offer(&cb) {
             let _ = cb.set_content(gdk::ContentProvider::NONE);
         }
         return;
