@@ -722,6 +722,7 @@ dependencies = [
  "gliff-proto",
  "gliff-sw",
  "gliff-transport",
+ "gliff-va",
  "gliff-vk",
  "hypr-capture",
  "hypr-input",
@@ -792,12 +793,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "gliff-va"
+version = "0.1.0"
+dependencies = [
+ "pkg-config",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "gliff-vk"
 version = "0.1.0"
 dependencies = [
  "ash",
  "drm-fourcc",
  "gliff-proto",
+ "gliff-va",
  "thiserror",
  "tracing",
 ]

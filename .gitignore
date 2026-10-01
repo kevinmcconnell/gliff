@@ -1,5 +1,5 @@
 target/
 *.png
-pkg/
-src/
+/pkg/
+/src/
 *.pkg.tar.zst

@@ -72,6 +72,11 @@ impl<'a> BitReader<'a> {
         Ok(if k % 2 == 1 { (k + 1) / 2 } else { -(k / 2) } as i32)
     }
 
+    /// Bits consumed so far.
+    pub fn position(&self) -> usize {
+        self.pos
+    }
+
     pub fn more_rbsp_data(&self) -> bool {
         // True while there are bits before the trailing stop bit.
         let total = self.data.len() * 8;

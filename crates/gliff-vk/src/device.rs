@@ -9,24 +9,16 @@ use ash::vk;
 
 use crate::{Error, Result};
 
-/// Queue family indices; encode and decode are absent on GPUs without them.
+/// Queue family indices.
 #[derive(Debug, Clone, Copy)]
 pub struct Families {
     pub compute: u32,
-    pub encode: Option<u32>,
-    pub decode: Option<u32>,
 }
 
 impl Families {
     /// Distinct families, for `SHARING_MODE_CONCURRENT` image creation.
     pub fn all(&self) -> Vec<u32> {
-        let mut v = vec![self.compute];
-        for f in [self.encode, self.decode].into_iter().flatten() {
-            if !v.contains(&f) {
-                v.push(f);
-            }
-        }
-        v
+        vec![self.compute]
     }
 }
 
@@ -39,37 +31,35 @@ pub struct Gpu {
     pub(crate) device: ash::Device,
     pub(crate) families: Families,
     pub(crate) compute_queue: vk::Queue,
-    pub(crate) encode_queue: Option<vk::Queue>,
-    pub(crate) decode_queue: Option<vk::Queue>,
     pub(crate) memory: vk::PhysicalDeviceMemoryProperties,
-    pub(crate) video_instance: ash::khr::video_queue::Instance,
-    pub(crate) video: ash::khr::video_queue::Device,
-    pub(crate) encode: ash::khr::video_encode_queue::Device,
-    pub(crate) decode: ash::khr::video_decode_queue::Device,
     pub(crate) external_fd: ash::khr::external_memory_fd::Device,
     pub(crate) drm_modifier: ash::ext::image_drm_format_modifier::Device,
     pub name: String,
     pub driver: String,
+    /// The VA-API display on the same render node, and what it offers.
+    pub va: Arc<gliff_va::Display>,
+    pub va_caps: gliff_va::Caps,
+    /// The queue family index that stands for VA-API in ownership
+    /// transfers: FOREIGN when the driver has it, else EXTERNAL.
+    pub(crate) foreign_family: u32,
     _entry: ash::Entry,
 }
 
 const REQUIRED_EXTENSIONS: &[&CStr] = &[
-    ash::khr::video_queue::NAME,
     ash::khr::external_memory_fd::NAME,
     ash::ext::external_memory_dma_buf::NAME,
     ash::ext::image_drm_format_modifier::NAME,
 ];
 
-const OPTIONAL_EXTENSIONS: &[&CStr] = &[
-    ash::khr::video_encode_queue::NAME,
-    ash::khr::video_encode_h264::NAME,
-    ash::khr::video_decode_queue::NAME,
-    ash::khr::video_decode_h264::NAME,
-];
+const OPTIONAL_EXTENSIONS: &[&CStr] = &[ash::ext::queue_family_foreign::NAME];
 
 impl Gpu {
     /// Open the GPU behind `render_node` (any suitable one when `None`).
     pub fn open(render_node: Option<&Path>) -> Result<Arc<Self>> {
+        let node = render_node.unwrap_or(Path::new("/dev/dri/renderD128"));
+        let va = gliff_va::Display::open(node)?;
+        let va_caps = va.caps()?;
+        tracing::info!(vendor = %va.vendor, ?va_caps, "va-api driver");
         // SAFETY: loading libvulkan and creating an instance with valid,
         // NUL-terminated names; nothing outlives the entry it came from.
         unsafe {
@@ -118,7 +108,7 @@ impl Gpu {
             let Some((physical, families, exts)) = chosen else {
                 instance.destroy_instance(None);
                 return Err(Error::NoDevice(
-                    "no Vulkan device with a compute queue, dmabuf import and video queues",
+                    "no Vulkan device with a compute queue and dmabuf import",
                 ));
             };
             let has = |n: &CStr| exts.iter().any(|e| e.as_str() == n.to_str().unwrap_or(""));
@@ -149,6 +139,11 @@ impl Gpu {
                 .push_next(&mut f12)
                 .push_next(&mut f13);
             let device = instance.create_device(physical, &create, None)?;
+            let foreign_family = if has(ash::ext::queue_family_foreign::NAME) {
+                vk::QUEUE_FAMILY_FOREIGN_EXT
+            } else {
+                vk::QUEUE_FAMILY_EXTERNAL
+            };
 
             let props = instance.get_physical_device_properties(physical);
             let mut drv = vk::PhysicalDeviceDriverProperties::default();
@@ -166,17 +161,14 @@ impl Gpu {
 
             let gpu = Self {
                 compute_queue: device.get_device_queue(families.compute, 0),
-                encode_queue: families.encode.map(|f| device.get_device_queue(f, 0)),
-                decode_queue: families.decode.map(|f| device.get_device_queue(f, 0)),
                 memory: instance.get_physical_device_memory_properties(physical),
-                video_instance: ash::khr::video_queue::Instance::new(&entry, &instance),
-                video: ash::khr::video_queue::Device::new(&instance, &device),
-                encode: ash::khr::video_encode_queue::Device::new(&instance, &device),
-                decode: ash::khr::video_decode_queue::Device::new(&instance, &device),
                 external_fd: ash::khr::external_memory_fd::Device::new(&instance, &device),
                 drm_modifier: ash::ext::image_drm_format_modifier::Device::new(&instance, &device),
                 name,
                 driver,
+                va,
+                va_caps,
+                foreign_family,
                 families,
                 instance,
                 physical,
@@ -188,23 +180,11 @@ impl Gpu {
     }
 
     pub fn can_encode(&self) -> bool {
-        self.encode_queue.is_some()
+        self.va_caps.can_encode().is_ok()
     }
 
     pub fn can_decode(&self) -> bool {
-        self.decode_queue.is_some()
-    }
-
-    pub(crate) fn encode_family(&self) -> Result<u32> {
-        self.families
-            .encode
-            .ok_or_else(|| Error::Unsupported("no video encode queue".into()))
-    }
-
-    pub(crate) fn decode_family(&self) -> Result<u32> {
-        self.families
-            .decode
-            .ok_or_else(|| Error::Unsupported("no video decode queue".into()))
+        self.va_caps.can_decode().is_ok()
     }
 
     /// Index of a memory type allowed by `type_bits` with all of `flags`.
@@ -241,6 +221,32 @@ impl Gpu {
         Ok(unsafe { self.device.allocate_memory(&info, None) }?)
     }
 
+    /// How many memory planes an image of `format` with `modifier` has, or
+    /// `None` when the driver does not list the modifier for the format.
+    pub(crate) fn modifier_memory_planes(&self, format: vk::Format, modifier: u64) -> Option<u32> {
+        // SAFETY: two-call pattern on a valid physical device; the list is
+        // sized from the first call before the second fills it.
+        unsafe {
+            let mut list = vk::DrmFormatModifierPropertiesListEXT::default();
+            let mut props = vk::FormatProperties2::default().push_next(&mut list);
+            self.instance
+                .get_physical_device_format_properties2(self.physical, format, &mut props);
+            let mut entries = vec![
+                vk::DrmFormatModifierPropertiesEXT::default();
+                list.drm_format_modifier_count as usize
+            ];
+            let mut list = vk::DrmFormatModifierPropertiesListEXT::default()
+                .drm_format_modifier_properties(&mut entries);
+            let mut props = vk::FormatProperties2::default().push_next(&mut list);
+            self.instance
+                .get_physical_device_format_properties2(self.physical, format, &mut props);
+            entries
+                .iter()
+                .find(|e| e.drm_format_modifier == modifier)
+                .map(|e| e.drm_format_modifier_plane_count)
+        }
+    }
+
     /// Wait for the whole device to go idle (teardown, resize).
     pub fn wait_idle(&self) {
         // SAFETY: valid device.
@@ -269,43 +275,20 @@ fn drm_dev_number(path: &Path) -> Option<(i64, i64)> {
     Some((major as i64, minor as i64))
 }
 
-/// Choose a compute family (no graphics preferred, so it never competes with
-/// the compositor) and the video families.
+/// Choose a compute family, with no graphics preferred so it never
+/// competes with the compositor.
 fn pick_families(instance: &ash::Instance, pd: vk::PhysicalDevice) -> Option<Families> {
-    // SAFETY: valid physical device; the structs are properly chained.
-    let (props, video) = unsafe {
-        let n = instance
-            .get_physical_device_queue_family_properties(pd)
-            .len();
-        let mut video = vec![vk::QueueFamilyVideoPropertiesKHR::default(); n];
-        let mut props = vec![vk::QueueFamilyProperties2::default(); n];
-        for (p, v) in props.iter_mut().zip(video.iter_mut()) {
-            p.p_next = (v as *mut vk::QueueFamilyVideoPropertiesKHR).cast();
-        }
-        instance.get_physical_device_queue_family_properties2(pd, &mut props);
-        (props, video)
-    };
-    let flags = |i: usize| props[i].queue_family_properties.queue_flags;
+    // SAFETY: valid physical device.
+    let props = unsafe { instance.get_physical_device_queue_family_properties(pd) };
+    let flags = |i: usize| props[i].queue_flags;
     let compute = (0..props.len())
         .find(|&i| {
             flags(i).contains(vk::QueueFlags::COMPUTE)
                 && !flags(i).contains(vk::QueueFlags::GRAPHICS)
         })
         .or_else(|| (0..props.len()).find(|&i| flags(i).contains(vk::QueueFlags::COMPUTE)))?;
-    let encode = (0..props.len()).find(|&i| {
-        video[i]
-            .video_codec_operations
-            .contains(vk::VideoCodecOperationFlagsKHR::ENCODE_H264)
-    });
-    let decode = (0..props.len()).find(|&i| {
-        video[i]
-            .video_codec_operations
-            .contains(vk::VideoCodecOperationFlagsKHR::DECODE_H264)
-    });
     Some(Families {
         compute: compute as u32,
-        encode: encode.map(|i| i as u32),
-        decode: decode.map(|i| i as u32),
     })
 }
 
@@ -427,11 +410,10 @@ impl Drop for Commands {
     }
 }
 
-/// A timeline semaphore that orders compute and video work across queues.
+/// A timeline semaphore the compute submissions can be ordered by.
 pub(crate) struct Timeline {
     gpu: Arc<Gpu>,
     pub(crate) semaphore: vk::Semaphore,
-    next: u64,
 }
 
 impl Timeline {
@@ -445,14 +427,7 @@ impl Timeline {
         Ok(Self {
             gpu: gpu.clone(),
             semaphore,
-            next: 0,
         })
-    }
-
-    /// The next value to signal.
-    pub(crate) fn advance(&mut self) -> u64 {
-        self.next += 1;
-        self.next
     }
 }
 

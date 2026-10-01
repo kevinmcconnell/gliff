@@ -16,8 +16,8 @@ still pending.
     │ VkImage (sampled)          │              │        ▲
     ▼ split.comp (BT.709 + AVC444)│             │   recombine.comp
   main NV12 + aux NV12           │   protocol   │        ▲
-    │ (encoder input images)     │  over TCP    │   two NV12 ◄ two Vulkan decoders
-    ▼ two VK_KHR_video_encode_h264│   or ssh     │        ▲
+    │ (VA-API surfaces, imported)│  over TCP    │   two NV12 ◄ two VA-API decoders
+    ▼ two VA-API H.264 encoders  │   or ssh     │        ▲ (surfaces, imported)
   VideoFrame{main,aux} ──────────┼──────────────┼────────┘ payloads
                                  │              │
   hypr-input ◄ Key/Pointer ◄─────┼──────────────┼──◄ GTK event controllers
@@ -25,11 +25,13 @@ still pending.
 
 Nothing touches pixels on the CPU. On the server the captured dmabuf is
 imported once per ring buffer, the split shader writes the encoders' input
-images, and the encoders read them in place; only the coded bytes come back to
-the CPU. On the client the two decoders write NV12 images, the recombine shader
+surfaces (VA-API allocations, exported as dmabufs and imported into Vulkan
+once), and the VA-API encoders read them in place; only the coded bytes come
+back to the CPU. On the client the two VA-API decoders write their surfaces,
+the recombine shader samples them through the same kind of import and
 writes a linear BGRX image, and GTK imports that image as a dmabuf texture.
 
-Without Vulkan Video, either end falls back to the CPU tier (`gliff-sw`,
+Without a VA-API H.264 codec, either end falls back to the CPU tier (`gliff-sw`,
 `--video cpu`): the server maps the captured buffer and converts BGRA to
 I420 in one fused fixed-point pass (AVX2 row kernels chosen at run time,
 rows spread over rayon), OpenH264 encodes it on up to four threads, and the
@@ -50,17 +52,17 @@ video, cursor and pongs flow server→client.
 | `hypr-wl` | shared Wayland plumbing (connect, globals, output/seat tracking, calloop runner) | none |
 | `hypr-capture` | output + cursor capture into GBM dmabufs on a calloop thread | none |
 | `hypr-input` | virtual keyboard (xkb state) + virtual pointer + clipboard bridge (mime types and pipes) on calloop threads | none |
-| `gliff-vk` | Vulkan device, dmabuf import/export, split/recombine compute, H.264 encode/decode, header parser | yes, Vulkan API calls |
+| `gliff-va` | libva display, H.264 encode/decode contexts on driver-owned surfaces, dmabuf export, the H.264 header parser and writer | yes, libva calls through committed bindgen output |
+| `gliff-vk` | Vulkan device, dmabuf import/export, split/recombine compute, the pipeline that hands surfaces to `gliff-va` | yes, Vulkan API calls |
 | `gliff-sw` | CPU fallback with OpenH264 encode/decode, fused BGRA<->I420 conversion | the encoder trace level through the raw API, and the AVX2 row kernels (pointer loads and stores) |
 | `gliff-server` | ties capture+input+encoder to the protocol; `--stdio`/`--listen` | none |
 | `gliff` | GTK4/libadwaita UI, decode worker | one block: hands GTK a dmabuf fd |
 | `gliff-probe` | environment checks and the headless test client | none |
 
-`gliff-vk` wraps `ash`, whose Vulkan calls are `unsafe` because the API cannot
-check lifetimes or synchronisation. The crate exposes plain Rust types
-(`Gpu`, `Encoder`, `Decoder`, `DisplayFrame`). All three crates with `unsafe`
-document the safety requirements at each block. The Khronos validation layer
-runs clean on the probe round-trip.
+`gliff-vk` wraps `ash` and `gliff-va` wraps libva; both APIs are `unsafe`
+because they cannot check lifetimes or synchronisation. The crates expose
+plain Rust types (`Gpu`, `Encoder`, `Decoder`, `DisplayFrame`, `Surface`).
+Every crate with `unsafe` documents the safety requirements at each block.
 
 ## Key design choices
 
@@ -122,18 +124,24 @@ runs clean on the probe round-trip.
   `--low-bandwidth` drops to a single 4:2:0 stream with chroma upsampled on
   decode.
 
-- **One GPU API.** Import, colour conversion, split, encode, decode, recombine
-  and export all happen in Vulkan on one device, ordered by a timeline
-  semaphore. Buffers never cross between GPU APIs, and driver differences are
-  read from the Vulkan capability queries rather than special-cased; the same
-  code runs on any driver with Vulkan Video.
+- **Vulkan for pixels, VA-API for the codec.** Import, colour conversion,
+  split, recombine and export happen in Vulkan compute; the H.264 encode and
+  decode happen in VA-API, which every AMD and Intel generation supports with
+  driver rate control (Mesa's Intel Vulkan driver has no Vulkan Video encode
+  on its newest chips and no bitrate control at all). Every codec surface is
+  allocated by the VA-API driver, exported once as a dmabuf and imported into
+  Vulkan, never the reverse: AMD's encoder refuses external input buffers.
+  The two APIs meet at CPU waits, which the pipeline already had: the split
+  submission blocks before the encoder starts, and `vaSyncSurface` precedes
+  the recombine. gliff writes its own SPS, PPS and slice headers and hands
+  them to the driver as packed headers, so one path serves both vendors.
 
 - **Low-delay H.264.** The encoder emits IDR then P frames with one reference
   and no reordering (POC type 0), High profile, CABAC, CBR at the configured
-  bitrate, with the SPS and PPS prepended to every IDR so any keyframe is a
+  bitrate, with the SPS and PPS in front of every IDR so any keyframe is a
   random-access point. The decoder parses only what the hardware does not
-  (SPS, PPS, slice header up to the reference marking) and manages a two-slot
-  DPB with sliding-window marking.
+  (SPS, PPS, the slice header) and manages a two-slot DPB with
+  sliding-window marking.
 
 - **Latest-wins, rate-paced.** The server keeps only the most recent captured
   frame and encodes it on one commanded cadence: the pace timer and the
@@ -267,17 +275,21 @@ runs clean on the probe round-trip.
   transfers between two engines, the size cap, and a spooled directory
   tree).
 - **`gliff-probe`** is the hardware integration harness: `protocols`,
-  `outputs`, `vulkan`, `roundtrip` (synthetic BGRA → encode → decode → PSNR
+  `outputs`, `gpu` (the Vulkan device and the VA-API codec capabilities),
+  `surfaces` (a VA-API surface written by the split shader and read back
+  through the driver), `roundtrip` (synthetic BGRA → encode → decode → PSNR
   against the CPU reference), `capture`, `input`, `pipeline` (a captured
   dmabuf through the exact server and client pipelines), `serve-test` (a
   headless protocol client), and `stream-bench` (startup milestones, fps,
   latency, interval and size statistics, `--timeline`, `--csv`). Run it under
-  `VK_LAYER_KHRONOS_validation` after touching `gliff-vk`.
+  `VK_LAYER_KHRONOS_validation` after touching `gliff-vk`, and with
+  `RUST_LOG=libva=debug` to see the driver's own messages.
 - **`scripts/e2e.sh`** boots a nested Hyprland and asserts PASS across the probe
   checks, the GPU pipeline, both Dual420 and Single420 server-plus-client
   streams, the clipboard in both directions (as text and as a 1 MiB binary
   item), and a mirrored-output resize. It needs a Hyprland session and a GPU
-  with Vulkan Video, so it is not a CI unit test; run it on a target machine.
+  with the VA-API codec, so it is not a CI unit test; run it on a target
+  machine.
 - **`scripts/bench.sh`** runs a server and `stream-bench` in a nested
   Hyprland over a shaped link: `BENCH_PRESET=lan|dsl|satellite`, a
   token-bucket TCP proxy (`scripts/throttle-proxy.py`) or `tc netem` in an
@@ -287,13 +299,17 @@ runs clean on the probe round-trip.
 ## Measurements
 
 On the AMD Ryzen 9955HX iGPU (RADV, Mesa 26.2), release build, 1920x1080
-Dual420, from `gliff-probe roundtrip`:
+Dual420, from `gliff-probe roundtrip` with the Vulkan Video codec:
 
 | Stage | Time per frame |
 |---|---|
 | split + two encodes (both submitted, then waited; one encode queue) | ~8.5 ms |
 | two decodes + recombine (GPU, one fence wait) | ~5 ms |
 | CPU readback of the BGRX frame (probe only, cached host memory) | ~1.5 ms |
+
+With the VA-API codec (radeonsi) on the same stream, 2026-09-28, on an RX
+7600: split + two encodes 7 to 8.5 ms, two decodes + recombine 4.2 to 4.8 ms,
+at the same PSNR.
 
 No pixel work happens on the CPU at any resolution; the remaining cost is the
 encode hardware itself, which serialises the two streams, so a 1080p Dual420
@@ -340,8 +356,10 @@ type and files, lazily streamed).
 
 Not yet built, roughly in priority order:
 
-1. **Test on Intel ANV and NVIDIA.** Everything runs on one AMD RADV
-   machine; a second driver decides whether the per-driver freedom is real.
+1. **Test on Intel.** Everything runs on AMD machines; the Intel path
+   (Mesa ANV for compute, `intel-media-driver` for the codec) is built from
+   the sources and awaits its first run. NVIDIA has no VA-API encoder and
+   is not a target.
 2. **Optional AV1 for outputs above 4096 wide.** The VCN H.264 encoder
    stops at 4096x4096 (the kernel amdgpu codec table, reported through RADV
    as `maxCodedExtent`), so a 5K output streams at 4096x2304 today: the
@@ -385,10 +403,12 @@ items surfaced by code review.
 ## Dependencies and binaries
 
 The binaries are dynamically linked: `gliff-server`/`gliff-probe` need
-libvulkan, libgbm, libdrm, libwayland-client, libxkbcommon and libc, and the
-Vulkan loader `dlopen`s the GPU's ICD; `gliff` additionally pulls the
-full GTK4 runtime. A normal Hyprland desktop already has all of these (they are
-the PKGBUILD `depends`). The Rust side is `ash` (thin generated bindings, no C
-build step) plus the Wayland, GTK and async crates. The compute shaders are
-committed as SPIR-V, so no shader compiler is needed to build; rerun
+libvulkan, libva, libva-drm, libgbm, libdrm, libwayland-client, libxkbcommon
+and libc; the Vulkan loader `dlopen`s the GPU's ICD and libva the GPU's VA
+driver; `gliff` additionally pulls the full GTK4 runtime. A normal Hyprland
+desktop already has all of these (they are the PKGBUILD `depends`). The Rust
+side is `ash` (thin generated bindings, no C build step) and committed
+bindgen output for libva (`crates/gliff-va/bindings/gen.sh` regenerates it)
+plus the Wayland, GTK and async crates. The compute shaders are committed as
+SPIR-V, so no shader compiler is needed to build; rerun
 `crates/gliff-vk/shaders/build.sh` (needs `glslc`) after editing a shader.

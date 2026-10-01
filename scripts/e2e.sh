@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # End-to-end test for gliff. Must run inside a Hyprland session (it starts a
-# nested Hyprland as the device under test). GPU (Vulkan Video) checks run
+# nested Hyprland as the device under test). GPU (Vulkan + VA-API) checks run
 # when the machine has it; the CPU (OpenH264) checks always run.
 #
 # It exercises, and asserts PASS on:
-#   1. gliff-probe protocols / vulkan / encode-decode round-trips (GPU + CPU)
+#   1. gliff-probe protocols / gpu / surfaces / encode-decode round-trips (GPU + CPU)
 #   2. gliff-probe pipeline: capture one frame and run the whole 4:4:4 path
 #   3. server --listen --headless  + serve-test client  (Dual420 4:4:4, GPU)
 #   4. server --listen --headless --low-bandwidth + serve-test (Single420, GPU)
@@ -67,15 +67,16 @@ damage() { for i in $(seq 1 80); do hyprctl notify 1 200 0 "e2e $i" >/dev/null 2
 
 echo "== 1. probe checks =="
 $PROBE --instance "$NEST_SIG" protocols 2>/dev/null | grep -q "^PASS" || fail "protocols"
-if $PROBE vulkan 2>/dev/null | grep -q "^PASS Vulkan H.264 encode"; then
+if $PROBE gpu 2>/dev/null | grep -q "^PASS VA-API H.264 encode"; then
     HAS_GPU=1
     CLIENT_VIDEO=gpu
 else
     HAS_GPU=0
     CLIENT_VIDEO=cpu
-    echo "   no Vulkan Video on this machine; GPU checks are skipped"
+    echo "   no GPU tier on this machine; GPU checks are skipped"
 fi
 if [ "$HAS_GPU" = 1 ]; then
+    $PROBE surfaces 2>/dev/null | grep -q "^PASS Vulkan split" || fail "VA-API surface hand-off"
     $PROBE roundtrip 2>/dev/null | grep -q "^PASS min RGB PSNR" || fail "GPU codec round-trip"
 fi
 $PROBE --video cpu roundtrip 2>/dev/null | grep -q "^PASS min RGB PSNR" || fail "CPU codec round-trip"
@@ -123,7 +124,7 @@ if [ "$HAS_GPU" = 1 ]; then
     echo "== 4. server + client, Single420 (--low-bandwidth) =="
     run_server_test 9041 "Single420 stream" gpu --low-bandwidth
 else
-    echo "== 3./4. GPU server tests skipped (no Vulkan Video) =="
+    echo "== 3./4. GPU server tests skipped (no GPU tier) =="
 fi
 
 echo "== 4b. CPU tier matrix =="

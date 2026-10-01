@@ -17,16 +17,73 @@ use std::time::Duration;
 use ash::vk;
 
 use crate::compute::{Recombine, Split};
-use crate::decoder::H264Decoder;
 use crate::device::{Commands, Gpu, Timeline};
-use crate::encoder::{EncoderSettings, H264Encoder};
 use crate::image::{DmabufPlane, ExportedDmabuf, HostBuffer, Image};
 use crate::Result;
+use gliff_va::{EncoderSettings, H264Decoder, H264Encoder};
 
 pub struct EncodedFrame {
     pub main: Vec<u8>,
     pub aux: Option<Vec<u8>>,
     pub keyframe: bool,
+}
+
+/// One H.264 stream: the VA-API encoder and its input surface as the
+/// split shader sees it.
+struct Stream {
+    enc: H264Encoder,
+    /// The encoder's input surface, imported into Vulkan.
+    target: Image,
+    /// A Vulkan-owned image the shader writes when the driver refused
+    /// STORAGE on the imported surface; copied into `target` afterwards.
+    scratch: Option<Image>,
+}
+
+impl Stream {
+    fn new(gpu: &Arc<Gpu>, settings: &EncoderSettings) -> Result<Self> {
+        let enc = H264Encoder::new(&gpu.va, &gpu.va_caps, settings.clone())?;
+        let desc = enc.input().export()?;
+        let (target, scratch) = match Image::import_nv12(gpu, &desc, true) {
+            Ok(img) => (img, None),
+            Err(e) => {
+                tracing::info!(error = %e, "encoder input refuses STORAGE; the split is copied in");
+                let target = Image::import_nv12(gpu, &desc, false)?;
+                let scratch = Image::nv12(gpu, target.width, target.height)?;
+                (target, Some(scratch))
+            }
+        };
+        Ok(Self {
+            enc,
+            target,
+            scratch,
+        })
+    }
+
+    /// The image the split shader writes.
+    fn shader_output(&self) -> &Image {
+        self.scratch.as_ref().unwrap_or(&self.target)
+    }
+
+    /// Before the split: take the shader's output back from VA-API, or
+    /// ready the scratch image.
+    fn record_acquire(&self, cmd: vk::CommandBuffer) {
+        match &self.scratch {
+            None => self.target.acquire_foreign(cmd, vk::ImageLayout::GENERAL),
+            Some(s) => s.transition(cmd, vk::ImageLayout::GENERAL),
+        }
+    }
+
+    /// After the split: move a scratch image into the surface if needed,
+    /// then hand the surface to VA-API.
+    fn record_release(&self, cmd: vk::CommandBuffer) {
+        if let Some(s) = &self.scratch {
+            s.transition(cmd, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+            self.target
+                .acquire_foreign(cmd, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+            self.target.copy_nv12_from(cmd, s);
+        }
+        self.target.release_foreign(cmd);
+    }
 }
 
 /// Server side: one encoder object per session.
@@ -35,10 +92,8 @@ pub struct Encoder {
     timeline: Timeline,
     compute: Commands,
     split: Split,
-    main: H264Encoder,
-    aux: Option<H264Encoder>,
-    main_in: Image,
-    aux_in: Option<Image>,
+    main: Stream,
+    aux: Option<Stream>,
     /// Imported capture buffers, keyed by the caller's buffer id.
     imports: HashMap<u64, Image>,
     settings: EncoderSettings,
@@ -47,18 +102,16 @@ pub struct Encoder {
 impl Encoder {
     /// The largest size the device encodes, as (width, height).
     pub fn max_size(gpu: &Gpu) -> Result<(u32, u32)> {
-        H264Encoder::max_coded_extent(gpu)
+        Ok(H264Encoder::max_coded_extent(&gpu.va_caps))
     }
 
     pub fn new(gpu: &Arc<Gpu>, settings: EncoderSettings, dual: bool) -> Result<Self> {
-        let main = H264Encoder::new(gpu, settings.clone())?;
+        let main = Stream::new(gpu, &settings)?;
         let aux = if dual {
-            Some(H264Encoder::new(gpu, settings.clone())?)
+            Some(Stream::new(gpu, &settings)?)
         } else {
             None
         };
-        let main_in = main.new_input()?;
-        let aux_in = aux.as_ref().map(|a| a.new_input()).transpose()?;
         Ok(Self {
             gpu: gpu.clone(),
             timeline: Timeline::new(gpu)?,
@@ -66,8 +119,6 @@ impl Encoder {
             split: Split::new(gpu)?,
             main,
             aux,
-            main_in,
-            aux_in,
             imports: HashMap::new(),
             settings,
         })
@@ -89,9 +140,9 @@ impl Encoder {
         self.settings.bitrate = bitrate;
         self.settings.framerate = framerate;
         self.settings.vbv_ms = vbv_ms;
-        self.main.set_rate(bitrate, framerate, vbv_ms);
+        self.main.enc.set_rate(bitrate, framerate, vbv_ms);
         if let Some(a) = &mut self.aux {
-            a.set_rate(bitrate, framerate, vbv_ms);
+            a.enc.set_rate(bitrate, framerate, vbv_ms);
         }
     }
 
@@ -121,12 +172,7 @@ impl Encoder {
     /// Encode packed BGRA pixels (tests and the probe; one extra upload).
     pub fn encode_bgra(&mut self, bgra: &[u8], force_keyframe: bool) -> Result<EncodedFrame> {
         let (w, h) = (self.settings.width, self.settings.height);
-        let staging = HostBuffer::new(
-            &self.gpu,
-            bgra.len(),
-            vk::BufferUsageFlags::TRANSFER_SRC,
-            None,
-        )?;
+        let staging = HostBuffer::new(&self.gpu, bgra.len(), vk::BufferUsageFlags::TRANSFER_SRC)?;
         staging.write(0, bgra);
         let src = Image::bgra_upload(&self.gpu, w, h)?;
         self.compute
@@ -140,41 +186,36 @@ impl Encoder {
 
     fn encode_image(&mut self, src: &Image, force_keyframe: bool) -> Result<EncodedFrame> {
         let (w, h) = (self.settings.width, self.settings.height);
-        let split_done = self.timeline.advance();
-        let (split, main_in, aux_in) = (&self.split, &self.main_in, self.aux_in.as_ref());
-        self.compute.run(
-            self.timeline.semaphore,
-            None,
-            Some(split_done),
-            false,
-            |cmd| {
+        let (split, main, aux) = (&self.split, &self.main, self.aux.as_ref());
+        // The split blocks until it is done: the encoder reads the surfaces
+        // through VA-API, which knows nothing of Vulkan's fences.
+        self.compute
+            .run(self.timeline.semaphore, None, None, true, |cmd| {
                 src.transition(cmd, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-                main_in.transition(cmd, vk::ImageLayout::GENERAL);
-                if let Some(a) = aux_in {
-                    a.transition(cmd, vk::ImageLayout::GENERAL);
+                main.record_acquire(cmd);
+                if let Some(a) = aux {
+                    a.record_acquire(cmd);
                 }
-                split.record(cmd, src, main_in, aux_in, w, h)?;
-                main_in.memory_barrier(cmd);
+                let main_out = main.shader_output();
+                let aux_out = aux.map(Stream::shader_output);
+                split.record(cmd, src, main_out, aux_out, w, h)?;
+                main_out.memory_barrier(cmd);
+                main.record_release(cmd);
+                if let Some(a) = aux {
+                    a.record_release(cmd);
+                }
                 Ok(())
-            },
-        )?;
+            })?;
         // Submit both encodes, then wait: the main stream's readback overlaps
         // the aux encode on the GPU.
-        let main = self.main.submit(
-            &self.main_in,
-            &self.timeline,
-            Some(split_done),
-            force_keyframe,
-        )?;
-        let aux = match (&mut self.aux, &self.aux_in) {
-            (Some(enc), Some(input)) => {
-                Some(enc.submit(input, &self.timeline, Some(split_done), force_keyframe)?)
-            }
-            _ => None,
+        let main_pending = self.main.enc.submit(force_keyframe)?;
+        let aux_pending = match &mut self.aux {
+            Some(a) => Some(a.enc.submit(force_keyframe)?),
+            None => None,
         };
-        let main = self.main.finish(main)?;
-        let aux = match (&mut self.aux, aux) {
-            (Some(enc), Some(pending)) => Some(enc.finish(pending)?),
+        let main = self.main.enc.finish(main_pending)?;
+        let aux = match (&mut self.aux, aux_pending) {
+            (Some(a), Some(pending)) => Some(a.enc.finish(pending)?),
             _ => None,
         };
         Ok(EncodedFrame {
@@ -221,8 +262,8 @@ pub struct Decoder {
     timeline: Timeline,
     compute: Commands,
     recombine: Recombine,
-    main: H264Decoder,
-    aux: Option<H264Decoder>,
+    main: DecodeStream,
+    aux: Option<DecodeStream>,
     outputs: Vec<(Image, ExportedDmabuf)>,
     /// Counts output rings; a release from an older ring is ignored.
     ring: u64,
@@ -251,9 +292,9 @@ impl Decoder {
             timeline: Timeline::new(gpu)?,
             compute: Commands::new(gpu, gpu.families.compute, gpu.compute_queue)?,
             recombine: Recombine::new(gpu)?,
-            main: H264Decoder::new(gpu)?,
+            main: DecodeStream::new(gpu)?,
             aux: if dual {
-                Some(H264Decoder::new(gpu)?)
+                Some(DecodeStream::new(gpu)?)
             } else {
                 None
             },
@@ -329,11 +370,11 @@ impl Decoder {
         let idx = self.free_output();
         let (dst, _) = &self.outputs[idx];
         let (recombine, w, h, zoom) = (&self.recombine, self.width, self.height, self.zoom);
-        let Some(main_img) = self.main.last_output() else {
+        let Some(main_img) = self.main.last_image() else {
             return Ok(None);
         };
         let aux_img = match &self.aux {
-            Some(a) => match a.last_output() {
+            Some(a) => match a.last_image() {
                 Some(img) => Some(img),
                 None => return Ok(None),
             },
@@ -341,13 +382,17 @@ impl Decoder {
         };
         self.compute
             .run(self.timeline.semaphore, None, None, true, |cmd| {
-                main_img.transition(cmd, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+                main_img.acquire_foreign(cmd, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
                 if let Some(a) = aux_img {
-                    a.transition(cmd, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+                    a.acquire_foreign(cmd, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
                 }
                 dst.transition(cmd, vk::ImageLayout::GENERAL);
                 recombine.record(cmd, main_img, aux_img, dst, (w, h), zoom)?;
                 dst.memory_barrier(cmd);
+                main_img.release_foreign(cmd);
+                if let Some(a) = aux_img {
+                    a.release_foreign(cmd);
+                }
                 Ok(())
             })?;
         Ok(Some(self.hand_out(idx)?))
@@ -396,7 +441,6 @@ impl Decoder {
                 &self.gpu,
                 size,
                 vk::BufferUsageFlags::TRANSFER_DST,
-                None,
             )?);
         }
         let buf = self.readback.as_ref().expect("allocated above");
@@ -444,39 +488,49 @@ impl Decoder {
         let t0 = std::time::Instant::now();
         self.last_complete = false;
         let idx = self.free_output();
-        let main_done = self.timeline.advance();
-        let Some(main_img) = self.main.decode(main, &self.timeline, main_done)? else {
+        let Some(main_idx) = self.main.decode(main)? else {
             return Ok(None);
         };
         let t_main = t0.elapsed();
-        let (aux_img, wait) = match &mut self.aux {
-            Some(dec) => {
-                let aux_done = self.timeline.advance();
-                match dec.decode(aux, &self.timeline, aux_done)? {
-                    Some(img) => (Some(img), aux_done),
-                    None => return Ok(None),
-                }
-            }
-            None => (None, main_done),
+        let aux_idx = match &mut self.aux {
+            Some(dec) => match dec.decode(aux)? {
+                Some(i) => Some(i),
+                None => return Ok(None),
+            },
+            None => None,
         };
         let t_aux = t0.elapsed() - t_main;
+        // The decoders run through VA-API, which knows nothing of Vulkan's
+        // semaphores: wait for their surfaces before the recombine reads them.
+        self.main.wait(main_idx)?;
+        if let (Some(dec), Some(i)) = (&self.aux, aux_idx) {
+            dec.wait(i)?;
+        }
+        let t_wait = t0.elapsed() - t_main - t_aux;
+        let main_img = &self.main.images[main_idx];
+        let aux_img = self.aux.as_ref().zip(aux_idx).map(|(d, i)| &d.images[i]);
         let (dst, _) = &self.outputs[idx];
         let (recombine, w, h, zoom) = (&self.recombine, self.width, self.height, self.zoom);
         self.compute
-            .run(self.timeline.semaphore, Some(wait), None, true, |cmd| {
-                main_img.transition(cmd, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+            .run(self.timeline.semaphore, None, None, true, |cmd| {
+                main_img.acquire_foreign(cmd, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
                 if let Some(a) = aux_img {
-                    a.transition(cmd, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+                    a.acquire_foreign(cmd, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
                 }
                 dst.transition(cmd, vk::ImageLayout::GENERAL);
                 recombine.record(cmd, main_img, aux_img, dst, (w, h), zoom)?;
                 dst.memory_barrier(cmd);
+                main_img.release_foreign(cmd);
+                if let Some(a) = aux_img {
+                    a.release_foreign(cmd);
+                }
                 Ok(())
             })?;
         self.last_complete = true;
         tracing::debug!(
             submit_main_us = t_main.as_micros(),
             submit_aux_us = t_aux.as_micros(),
+            wait_us = t_wait.as_micros(),
             total_us = t0.elapsed().as_micros(),
             "decode + recombine"
         );
@@ -484,13 +538,52 @@ impl Decoder {
     }
 }
 
+/// One H.264 stream on the client: the VA-API decoder and its output
+/// surfaces as the recombine shader sees them.
+struct DecodeStream {
+    gpu: Arc<Gpu>,
+    dec: H264Decoder,
+    images: Vec<Image>,
+    generation: u64,
+}
+
+impl DecodeStream {
+    fn new(gpu: &Arc<Gpu>) -> Result<Self> {
+        Ok(Self {
+            gpu: gpu.clone(),
+            dec: H264Decoder::new(&gpu.va, &gpu.va_caps)?,
+            images: Vec::new(),
+            generation: 0,
+        })
+    }
+
+    /// Decode one access unit; the index names a surface in `images`.
+    fn decode(&mut self, access_unit: &[u8]) -> Result<Option<usize>> {
+        let idx = self.dec.decode(access_unit)?;
+        if self.dec.generation() != self.generation {
+            self.images = self
+                .dec
+                .surfaces()
+                .iter()
+                .map(|s| Image::import_nv12(&self.gpu, &s.export()?, false))
+                .collect::<Result<Vec<_>>>()?;
+            self.generation = self.dec.generation();
+        }
+        Ok(idx)
+    }
+
+    fn wait(&self, idx: usize) -> Result<()> {
+        Ok(self.dec.surfaces()[idx].sync()?)
+    }
+
+    fn last_image(&self) -> Option<&Image> {
+        self.dec.last_output().and_then(|i| self.images.get(i))
+    }
+}
+
 impl Drop for Decoder {
     fn drop(&mut self) {
         let _ = self.compute.wait();
-        let _ = self.main.wait();
-        if let Some(a) = &self.aux {
-            let _ = a.wait();
-        }
     }
 }
 
@@ -498,4 +591,61 @@ impl Drop for Encoder {
     fn drop(&mut self) {
         let _ = self.compute.wait();
     }
+}
+
+/// How the split shader's output reaches a VA-API surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SurfacePath {
+    /// The shader writes the imported surface directly.
+    Storage,
+    /// The shader writes a Vulkan image that is then copied into the surface.
+    Copy,
+}
+
+/// Probe helper: import an exported VA-API surface and write the 4:2:0
+/// split of `bgra` (`width` x `height`) into it, taking the storage path
+/// when the driver allows it. Returns the path used; the caller reads the
+/// surface back through VA-API to check the pixels.
+pub fn split_into_surface(
+    gpu: &Arc<Gpu>,
+    desc: &gliff_va::PrimeDescriptor,
+    bgra: &[u8],
+    width: u32,
+    height: u32,
+) -> Result<SurfacePath> {
+    let (target, path) = match Image::import_nv12(gpu, desc, true) {
+        Ok(img) => (img, SurfacePath::Storage),
+        Err(e) => {
+            tracing::info!(error = %e, "surface import with STORAGE refused; using a copy");
+            (Image::import_nv12(gpu, desc, false)?, SurfacePath::Copy)
+        }
+    };
+    let staging = HostBuffer::new(gpu, bgra.len(), vk::BufferUsageFlags::TRANSFER_SRC)?;
+    staging.write(0, bgra);
+    let src = Image::bgra_upload(gpu, width, height)?;
+    let scratch = match path {
+        SurfacePath::Storage => None,
+        SurfacePath::Copy => Some(Image::nv12(gpu, target.width, target.height)?),
+    };
+    let timeline = Timeline::new(gpu)?;
+    let compute = Commands::new(gpu, gpu.families.compute, gpu.compute_queue)?;
+    let split = Split::new(gpu)?;
+    compute.run(timeline.semaphore, None, None, true, |cmd| {
+        src.transition(cmd, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+        src.copy_rgba_from_buffer(cmd, &staging);
+        src.transition(cmd, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        let out = scratch.as_ref().unwrap_or(&target);
+        out.transition(cmd, vk::ImageLayout::GENERAL);
+        split.record(cmd, &src, out, None, width, height)?;
+        out.memory_barrier(cmd);
+        if let Some(s) = &scratch {
+            s.transition(cmd, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+            target.transition(cmd, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+            target.copy_nv12_from(cmd, s);
+        }
+        target.transition(cmd, vk::ImageLayout::GENERAL);
+        Ok(())
+    })?;
+    compute.wait()?;
+    Ok(path)
 }
