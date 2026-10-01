@@ -3,7 +3,8 @@
 //! compositor's selection offers and hands out a pipe to read one of them; in
 //! the other direction it advertises a set of mime types on behalf of the
 //! remote and hands the owner the pipe of every application that pastes.
-//! A loop guard stops a selection we set from being reported back as new.
+//! Every source we set carries [`OWN_SOURCE_MIME`], so a selection of ours is
+//! never reported back as new and never read back into itself.
 
 use std::collections::HashMap;
 use std::os::fd::{AsFd, OwnedFd};
@@ -14,6 +15,7 @@ use calloop::channel::{self, Sender};
 use nix::fcntl::OFlag;
 use nix::unistd::pipe2;
 use wayland_client::globals::GlobalListContents;
+use wayland_client::protocol::wl_callback::{self, WlCallback};
 use wayland_client::protocol::wl_registry::WlRegistry;
 use wayland_client::protocol::wl_seat::{self, WlSeat};
 use wayland_client::{delegate_noop, Connection, Dispatch, QueueHandle};
@@ -30,6 +32,11 @@ use wayland_protocols::ext::data_control::v1::client::ext_data_control_source_v1
 
 use crate::{Error, Result};
 use hypr_wl::{LoopState, Outputs, Seat, Target};
+
+/// Marks a selection as set by [`Clipboard::offer`]. It carries no data. A
+/// clipboard manager that republishes our selection keeps the marker, so its
+/// copy of the remote's item is not reported as new either.
+pub const OWN_SOURCE_MIME: &str = "application/x-hypr-input-source";
 
 #[derive(Debug)]
 pub enum ClipboardEvent {
@@ -112,11 +119,8 @@ struct State {
     offers: HashMap<ExtDataControlOfferV1, Vec<String>>,
     /// the selection's current offer, kept until the selection changes.
     current: Option<ExtDataControlOfferV1>,
-    /// our outgoing source and the mimes it advertises.
-    our_source: Option<(ExtDataControlSourceV1, Vec<String>)>,
-    /// set after we take or drop the selection: the next selection event that
-    /// matches is the compositor reporting our own change back to us.
-    expect_echo: bool,
+    our_source: Option<ExtDataControlSourceV1>,
+    echo: EchoGuard,
     quit: bool,
 }
 
@@ -162,7 +166,7 @@ fn run(
         offers: HashMap::new(),
         current: None,
         our_source: None,
-        expect_echo: false,
+        echo: EchoGuard::default(),
         quit: false,
     };
     std::mem::swap(&mut state.sink, sink);
@@ -204,27 +208,29 @@ impl LoopState for State {
 
 impl State {
     fn set_selection(&mut self, mimes: Vec<String>) {
-        if let Some((old, _)) = self.our_source.take() {
-            old.destroy();
-        }
         let src = self.manager.create_data_source(&self.qh, ());
         for m in &mimes {
             src.offer(m.clone());
         }
+        src.offer(OWN_SOURCE_MIME.to_string());
         if let Some(device) = &self.device {
             device.set_selection(Some(&src));
         }
-        self.expect_echo = true;
-        self.our_source = Some((src, mimes));
+        // The old source goes only once it is replaced: destroying the
+        // current selection's source clears the selection first.
+        if let Some(old) = self.our_source.replace(src) {
+            old.destroy();
+        }
     }
 
     fn withdraw(&mut self) {
-        if let Some((old, _)) = self.our_source.take() {
+        if let Some(old) = self.our_source.take() {
             if let Some(device) = &self.device {
                 device.set_selection(None);
             }
             old.destroy();
-            self.expect_echo = true;
+            let withdrawal = self.echo.withdrawn();
+            self.conn.display().sync(&self.qh, withdrawal);
         }
     }
 
@@ -233,11 +239,11 @@ impl State {
             .current
             .as_ref()
             .ok_or_else(|| Error::Input("no selection".into()))?;
-        let advertised = self
-            .offers
-            .get(off)
-            .is_some_and(|m| m.iter().any(|a| a == mime));
-        if !advertised {
+        let mimes = self.offers.get(off).map(Vec::as_slice).unwrap_or_default();
+        if is_own_selection(mimes) {
+            return Err(Error::Input("selection is our own".into()));
+        }
+        if !mimes.iter().any(|a| a == mime) {
             return Err(Error::Input(format!("selection has no {mime}")));
         }
         let (read_fd, write_fd) =
@@ -267,18 +273,8 @@ impl State {
             .and_then(|o| self.offers.get(o))
             .cloned()
             .unwrap_or_default();
-        let echo = std::mem::take(&mut self.expect_echo) && self.is_our_echo(&mimes);
-        if !echo {
+        if !self.echo.is_echo(&mimes) {
             (self.sink)(ClipboardEvent::Selection { mime_types: mimes });
-        }
-    }
-
-    /// The compositor reports our own source back to us as a selection whose
-    /// offer lists exactly the mimes we gave it; a withdrawal echoes as none.
-    fn is_our_echo(&self, mimes: &[String]) -> bool {
-        match &self.our_source {
-            Some((_, ours)) => same_set(ours, mimes),
-            None => mimes.is_empty(),
         }
     }
 
@@ -290,8 +286,56 @@ impl State {
     }
 }
 
-fn same_set(a: &[String], b: &[String]) -> bool {
-    a.len() == b.len() && a.iter().all(|m| b.contains(m)) && b.iter().all(|m| a.contains(m))
+fn is_own_selection(mimes: &[String]) -> bool {
+    mimes.iter().any(|m| m == OWN_SOURCE_MIME)
+}
+
+/// Tells the compositor's reports of our own changes from changes made by
+/// others: our source comes back as a selection that lists our marker, and
+/// a withdrawal as one empty selection. A withdrawal of a selection that was
+/// already cleared has no echo, so each one expires at the display sync that
+/// follows it.
+#[derive(Default)]
+struct EchoGuard {
+    withdrawn: u64,
+    settled: u64,
+}
+
+impl EchoGuard {
+    fn withdrawn(&mut self) -> u64 {
+        self.withdrawn += 1;
+        self.withdrawn
+    }
+
+    fn settle(&mut self, withdrawal: u64) {
+        self.settled = self.settled.max(withdrawal);
+    }
+
+    fn is_echo(&mut self, mimes: &[String]) -> bool {
+        if !mimes.is_empty() {
+            return is_own_selection(mimes);
+        }
+        let pending = self.settled < self.withdrawn;
+        if pending {
+            self.settled += 1;
+        }
+        pending
+    }
+}
+
+impl Dispatch<WlCallback, u64> for State {
+    fn event(
+        s: &mut Self,
+        _: &WlCallback,
+        e: wl_callback::Event,
+        withdrawal: &u64,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_callback::Event::Done { .. } = e {
+            s.echo.settle(*withdrawal);
+        }
+    }
 }
 
 impl Dispatch<WlRegistry, GlobalListContents> for State {
@@ -383,10 +427,12 @@ impl Dispatch<ExtDataControlSourceV1, ()> for State {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        let ours = s.our_source.as_ref().is_some_and(|(c, _)| c == src);
+        let ours = s.our_source.as_ref() == Some(src);
         match e {
             source::Event::Send { mime_type, fd } if ours => {
-                (s.sink)(ClipboardEvent::Paste { mime_type, fd });
+                if mime_type != OWN_SOURCE_MIME {
+                    (s.sink)(ClipboardEvent::Paste { mime_type, fd });
+                }
             }
             source::Event::Cancelled if ours => {
                 s.our_source = None;
@@ -400,18 +446,67 @@ delegate_noop!(State: ExtDataControlManagerV1);
 
 #[cfg(test)]
 mod tests {
-    use super::same_set;
+    use super::{EchoGuard, OWN_SOURCE_MIME};
+
+    fn mimes(list: &[&str]) -> Vec<String> {
+        list.iter().map(|m| m.to_string()).collect()
+    }
 
     #[test]
-    fn same_set_ignores_order_and_catches_extras() {
-        let a = vec!["text/plain".to_string(), "image/png".to_string()];
-        let b = vec!["image/png".to_string(), "text/plain".to_string()];
-        assert!(same_set(&a, &b));
-        assert!(!same_set(&a, &b[..1]));
-        assert!(!same_set(
-            &a,
-            &["image/png".to_string(), "text/html".to_string()]
-        ));
-        assert!(same_set(&[], &[]));
+    fn a_selection_with_our_marker_is_an_echo() {
+        let mut guard = EchoGuard::default();
+        let ours = mimes(&["image/png", OWN_SOURCE_MIME]);
+        assert!(guard.is_echo(&ours));
+        assert!(guard.is_echo(&ours));
+    }
+
+    #[test]
+    fn a_selection_without_our_marker_is_new() {
+        let mut guard = EchoGuard::default();
+        assert!(!guard.is_echo(&mimes(&["image/png"])));
+    }
+
+    #[test]
+    fn an_empty_selection_is_an_echo_only_after_a_withdrawal() {
+        let mut guard = EchoGuard::default();
+        assert!(!guard.is_echo(&[]));
+        guard.withdrawn();
+        assert!(guard.is_echo(&[]));
+        assert!(!guard.is_echo(&[]));
+    }
+
+    #[test]
+    fn a_withdrawal_queued_behind_our_selection_is_still_an_echo() {
+        let mut guard = EchoGuard::default();
+        guard.withdrawn();
+        assert!(guard.is_echo(&mimes(&["text/plain", OWN_SOURCE_MIME])));
+        assert!(guard.is_echo(&[]));
+    }
+
+    #[test]
+    fn a_withdrawal_without_an_echo_expires_at_its_sync() {
+        let mut guard = EchoGuard::default();
+        let withdrawal = guard.withdrawn();
+        guard.settle(withdrawal);
+        assert!(!guard.is_echo(&[]));
+    }
+
+    #[test]
+    fn a_sync_after_the_echo_leaves_a_later_withdrawal_pending() {
+        let mut guard = EchoGuard::default();
+        let first = guard.withdrawn();
+        assert!(guard.is_echo(&[]));
+        guard.withdrawn();
+        guard.settle(first);
+        assert!(guard.is_echo(&[]));
+        assert!(!guard.is_echo(&[]));
+    }
+
+    #[test]
+    fn a_new_selection_does_not_spend_a_pending_withdrawal() {
+        let mut guard = EchoGuard::default();
+        guard.withdrawn();
+        assert!(!guard.is_echo(&mimes(&["text/plain"])));
+        assert!(guard.is_echo(&[]));
     }
 }

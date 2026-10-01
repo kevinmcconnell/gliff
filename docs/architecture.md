@@ -248,9 +248,9 @@ Every crate with `unsafe` documents the safety requirements at each block.
   spool directory and hands its applications a URI list pointing there. A
   spool is removed five minutes after its offer is replaced, so an
   application can still open what it was just handed, or when the session
-  ends. A loop guard on each side (mime-set match on the server, a check for
-  our own proxy provider on the client) stops a proxy we set from being
-  offered back. A paste is a
+  ends. A loop guard on each side (a marker mime type on the server's
+  source, a check for our own proxy provider on the client) stops a proxy we
+  set from being offered back, and from being read to serve the peer. A paste is a
   job: one that outlasts a quiet second is reported every 250 ms with bytes
   done, total and rate, until it ends. The client shows a bar with a cancel
   button over the video; the server, which has no window, posts a desktop
