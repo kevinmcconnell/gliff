@@ -2,7 +2,8 @@
 
 gliff remote-desktops a Hyprland session to another Hyprland machine over SSH.
 This document covers what is built, the design choices behind it, and what is
-still pending.
+still pending. Building, running a development setup and the testing tools
+are in `docs/development.md`.
 
 ## Data flow
 
@@ -258,49 +259,6 @@ Every crate with `unsafe` documents the safety requirements at each block.
   notification with a progress bar and a Cancel action over
   `org.freedesktop.Notifications`. Cancel drops the fetch, which sends
   `Abort`. A failed paste is always reported, however short.
-
-## Testing
-
-- **`scripts/check.sh`** runs what CI runs (`cargo fmt --check`, `cargo
-  clippy --all-targets -- -D warnings`, `cargo test --workspace`); run it
-  before every push, and `scripts/check.sh --fix` to apply the rustfmt and
-  clippy fixes first. Clippy lints gated on the MSRV (`rust-version` in
-  `Cargo.toml`) switch on across the whole workspace when it is raised.
-- **Unit tests** cover the pure logic: AVC444 split/recombine losslessness,
-  single-stream subsample/upsample, BGRA↔YUV444 colour round-trip, the H.264
-  header parser against an x264 stream, framing with payloads and partial
-  writes, the rate controller and ladder against a simulated link (a fake
-  clock drives satellite, LAN and collapse scenarios), keymap building,
-  Hyprland instance discovery, and the clipboard rules and engine (mime
-  filtering, URI lists, safe paths, the send window and assembler, chunked
-  transfers between two engines, the size cap, and a spooled directory
-  tree).
-- **`gliff-probe`** is the hardware integration harness: `protocols`,
-  `outputs`, `permissions` (Hyprland settings that can block capture),
-  `gpu` (the Vulkan device and the VA-API codec capabilities),
-  `surfaces` (a VA-API surface written by the split shader and read back
-  through the driver), `roundtrip` (synthetic BGRA → encode → decode → PSNR
-  against the CPU reference), `capture`, `input`, `pipeline` (a captured
-  dmabuf through the exact server and client pipelines), `serve-test` (a
-  headless protocol client), `stream-bench` (startup milestones, fps,
-  latency, interval and size statistics, `--timeline`, `--csv`), `clipboard`
-  and `keymap` (watch what the compositor serves), `bench` (the CPU
-  reference conversion), and `all` (every non-interactive check). Run it under
-  `VK_LAYER_KHRONOS_validation` after touching `gliff-vk`, and with
-  `RUST_LOG=libva=debug` to see the driver's own messages.
-- **`scripts/e2e.sh`** boots a nested Hyprland and asserts PASS across the probe
-  checks, the capture pipeline, both Dual420 and Single420 server-plus-client
-  streams, the CPU tier matrix (cpu<->cpu and each mixed pairing), the
-  clipboard in both directions (as text, as a 1 MiB binary item and as a
-  copied directory tree), a mirrored-output resize, and a keymap sent
-  mid-session. It needs a Hyprland session, so it is not a CI unit test; run
-  it on a target machine. Without the GPU tier it skips the GPU cases and
-  still runs the CPU cases.
-- **`scripts/bench.sh`** runs a server and `stream-bench` in a nested
-  Hyprland over a shaped link: `BENCH_PRESET=lan|dsl|satellite`, a
-  token-bucket TCP proxy (`scripts/throttle-proxy.py`) or `tc netem` in an
-  unprivileged network namespace (`scripts/netem.sh`, loss and delay in both
-  directions). `BENCH_STATIC=1` drops the damage loop.
 
 ## Measurements
 

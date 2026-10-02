@@ -2,164 +2,119 @@
 
 [![CI](https://github.com/kevinmcconnell/gliff/actions/workflows/ci.yml/badge.svg)](https://github.com/kevinmcconnell/gliff/actions/workflows/ci.yml)
 
-Remote-desktop a Hyprland session from another Hyprland machine, over SSH only.
-Custom wire protocol, hardware H.264 encode and decode through VA-API,
-full-resolution 4:4:4 colour by the RDP AVC444 technique (two 4:2:0 H.264
-streams recombined on the client). The whole media path stays on the GPU: the
-captured dmabuf is imported into Vulkan, split by a compute shader straight
-into the encoder's surfaces, encoded by the VA-API driver, and on the client
-decoded by VA-API, recombined by a Vulkan compute shader and handed to GTK
-as a dmabuf.
+gliff is a remote desktop for Hyprland. It shows the Hyprland session of
+another machine in a window on yours, and all it needs between the two is
+ssh: no open ports, no accounts, no relay.
 
-Machines without a VA-API H.264 codec fall back to a CPU pipeline (OpenH264), so
-gliff runs anywhere Hyprland runs; `--video cpu` (or `GLIFF_VIDEO=cpu`)
-forces it for testing. The CPU tier streams a single 4:2:0 stream by default
-(`--full-chroma` on the server keeps 4:4:4). Server and client pick their
-tiers independently, so a hardware server can feed a software client and the
-reverse.
+Text stays sharp. Most remote desktops send video with halved colour
+resolution, which blurs coloured text; gliff sends full-resolution colour
+(4:4:4) through the H.264 hardware every GPU has. Video runs on the GPU at
+both ends, and falls back to the CPU on machines where it cannot.
 
-## Status
+![A gliff window showing a terminal on a remote machine](.github/assets/screenshot.png)
 
-Working and validated on AMD (Mesa RADV for compute, Mesa radeonsi for the
-codec):
+## What you get
 
-- Capture of a Hyprland output via `ext-image-copy-capture-v1` into GBM dmabufs.
-- Keyboard and pointer injection, with the client's xkb keymap uploaded so keys
-  map identically on both ends, and sent again when the local keyboard or
-  layout changes.
-- VA-API H.264 encode and decode on driver-owned surfaces that the Vulkan
-  compute shaders write and read in place; Dual420 4:4:4 round-trips
-  near-lossless, plus a `--low-bandwidth` single 4:2:0 stream.
-- The full server pipeline (capture -> dmabuf import -> GPU split -> two H.264
-  streams -> protocol) and a GTK4 client that decodes, recombines on the GPU,
-  displays through a dmabuf texture, forwards input, shows the remote cursor,
-  inhibits system shortcuts (release with `Shift+Esc`, set by
-  `--release-hotkey`), and auto-reconnects. Validated over localhost against a
-  nested Hyprland: connect, stream, resize, ack pacing, both chroma modes.
-- The client follows the Omarchy theme: it maps the palette in
-  `~/.local/state/omarchy/current/theme/colors.toml` onto the libadwaita
-  colour variables, picks the matching light or dark scheme, and re-applies on
-  `omarchy theme set`. Without Omarchy it is stock Adwaita and follows the
-  desktop dark/light preference.
+- Mirror any screen of the remote machine, or get a private screen that
+  exists only for your session and follows the size of your window.
+- Your keyboard layout, not the remote's: keys map the same on both ends.
+- A shared clipboard in both directions: text, images, and copied files.
+- Quality that adapts to the link, giving up frame rate before sharpness.
+- Reconnection when the link drops.
+- A window that follows your Omarchy theme.
 
-Intel GPUs take the same path through `intel-media-driver` (every generation
-from Skylake on, including Lunar Lake, Battlemage and Panther Lake, which
-have no Vulkan Video encode in Mesa). The Intel path is validated on Panther
-Lake; earlier generations are not yet run, and `docs/hardware-quirks.md`
-lists what to check. NVIDIA has no VA-API encoder, so both ends use the CPU
-tier there.
+## Requirements
 
-Design and the full picture are in `docs/architecture.md`; driver-specific
-behaviour and test gaps are in `docs/hardware-quirks.md`.
+- Hyprland on both machines, with a session running on the remote one.
+- ssh access from your machine to the remote one.
+- For GPU video: an AMD or Intel GPU with its Vulkan and VA-API drivers
+  (`vulkan-radeon` and `libva-mesa-driver`, or `vulkan-intel` and
+  `intel-media-driver`, on Arch). Without them, and on NVIDIA, gliff uses the
+  CPU and needs nothing extra.
 
-The clipboard carries any mime type (text, images, application data) and
-copied files in both directions. Nothing moves until something pastes: the
-peer only learns what is offered, then streams the item in chunks when it is
-wanted. Files are spooled to `~/.cache/gliff/clipboard` on the pasting side.
-A paste that takes more than a second shows progress and a cancel button: a
-bar in the gliff window, or a desktop notification on the server.
+## Install
 
-Not done yet: AV1 for outputs above 4096 wide (H.264 is scaled to fit today)
-and native single-stream 4:4:4.
+Install gliff on both machines: your machine runs `gliff`, the remote one
+runs `gliff-server`.
 
-## Build
+On Arch, build the package from a checkout:
 
-Prebuilt x86_64 binaries are on the [releases
-page](https://github.com/kevinmcconnell/gliff/releases): every push to `main`
-updates the `latest` pre-release, and `v*` tags make permanent releases.
-The Arch package (`makepkg -si` with the repo `PKGBUILD`) also installs a
-launcher entry and icon. From a tarball, copy the two files in `data/` to
-`~/.local/share/applications/` and
+```
+makepkg -si
+```
+
+Or take the prebuilt x86_64 binaries from the [releases
+page](https://github.com/kevinmcconnell/gliff/releases) and put `gliff`,
+`gliff-server` and `gliff-probe` on your `PATH`. The `latest` release follows
+`main`; `v*` tags are permanent releases. For a launcher entry, copy the
+`.desktop` file to `~/.local/share/applications/` and the `.svg` icon to
 `~/.local/share/icons/hicolor/scalable/apps/`.
 
-To build from source:
+To build from source, see [docs/development.md](docs/development.md).
 
-```
-cargo build --release
-```
-
-Needs Rust, a C++ toolchain (the vendored OpenH264 build; nasm speeds it up),
-and the runtime libraries in the PKGBUILD `depends`. The GPU tier needs a
-Vulkan driver for compute (Mesa RADV or ANV) and a VA-API H.264 driver on the
-same GPU (`libva-mesa-driver` on AMD, `intel-media-driver` on Intel); without
-both, gliff uses the CPU tier. The compute shaders are committed as SPIR-V
-(`crates/gliff-vk/shaders/build.sh` rebuilds them with `glslc`). Verify the
-machine first:
-
-```
-gliff-probe all                  # protocols, outputs, GPU tier, GPU + CPU round-trips
-gliff-probe pipeline             # capture one frame and run the whole 4:4:4 path
-gliff-probe --video cpu roundtrip  # the CPU (OpenH264) tier alone
-```
-
-To run under the Khronos validation layer during development:
-
-```
-VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation gliff-probe roundtrip
-```
-
-## Run (ssh, the real path)
+## Use
 
 ```
 gliff user@host
 ```
 
-This mirrors the remote's focused screen: it spawns
-`ssh -T user@host gliff-server --stdio --output auto`. The machine sits in an
-address bar in the title bar: type another one and press Enter to switch to
-it, or pick one of the six most recently used from the drop-down that appears
-while it has focus. They are kept in `~/.config/gliff/config.toml`. A bare
-`gliff` opens the window with the address bar focused. Other modes:
+This mirrors the screen that has focus on the remote machine. To pick a
+screen, or to get a private one:
 
 ```
 gliff --output DP-1 user@host   # mirror a named remote screen
-gliff --headless user@host      # a private remote screen sized and
-                                       # scaled to this window (resizes live)
+gliff --headless user@host      # a private remote screen, sized and
+                                # scaled to this window
 ```
 
-A mirrored screen keeps its own size and scale and is letterboxed in the
-window; a headless one follows the window. The ssh session
-must see the user's `WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR`; if `gliff-server` is not
-on PATH over ssh, pass `--server-bin /path/to/gliff-server`.
+A mirrored screen keeps its own size and is fitted into the window. A private
+screen follows the window as you resize it, and is removed when you
+disconnect.
 
-## Run (development, localhost)
+The address bar in the title bar holds the machine. Type another one and
+press Enter to switch to it, or pick one of the six you used last from the
+drop-down. A bare `gliff` opens the window with the address bar ready.
 
-Start a nested Hyprland, then:
+**Keyboard.** Click the picture to send everything to the remote machine,
+window-manager shortcuts included. Press `Shift+Esc` to get your own
+shortcuts back. `--release-hotkey` changes that key (`ctrl+alt+q`,
+`double-escape`, or `none`).
+
+**Clipboard.** Copy on one machine and paste on the other. Nothing is sent
+until you paste. A paste that takes more than a second shows its progress
+with a cancel button. Pasted files are kept in `~/.cache/gliff/clipboard`.
+
+**Slow links.** gliff measures the link and lowers the frame rate, then the
+colour detail, then the resolution, and raises them again when there is
+room. Two flags change the video, and you pass them to the server through
+`--server-bin`: `--low-bandwidth` sends 4:2:0 colour from the start, and
+`--full-chroma` keeps 4:4:4 on a server that encodes on the CPU.
 
 ```
-gliff-server --listen 127.0.0.1:9000 --headless
-gliff --connect 127.0.0.1:9000
+gliff --server-bin 'gliff-server --low-bandwidth' user@host
 ```
 
-## Testing
+## If something does not work
 
-```
-cargo test --workspace     # pure-logic unit tests, no GPU needed
-cargo fmt --all --check    # formatting (rustfmt defaults)
-./scripts/e2e.sh           # full stack against a nested Hyprland (needs a GPU)
-```
+- Run `gliff-probe all` on each machine. It checks the compositor, the GPU
+  drivers and both video paths, and prints PASS or FAIL for each.
+- If ssh cannot find `gliff-server`, give its path:
+  `gliff --server-bin /path/to/gliff-server user@host`.
+- The server needs the remote user's running Hyprland session. If the ssh
+  session does not have `XDG_RUNTIME_DIR` or `WAYLAND_DISPLAY`, set them
+  through `--server-bin 'env XDG_RUNTIME_DIR=/run/user/1000 gliff-server'`.
+- To rule out a driver problem, force the CPU on your end with
+  `gliff --video cpu user@host`.
+- Screens wider than 4096 pixels are streamed at a reduced size and scaled
+  back up.
 
-`scripts/e2e.sh` must run inside a Hyprland session; it boots a nested Hyprland
-and asserts the probe checks, the 4:4:4 capture pipeline, and both Dual420 and
-Single420 server-plus-client streams, including continued decoding after a
-mirrored output changes size. It also runs the CPU tier matrix (cpu<->cpu and
-each mixed pairing); on a machine without the GPU tier the GPU cases are
-skipped and the CPU cases still run.
+## More
 
-## Layout
+- [docs/architecture.md](docs/architecture.md): how it works, the design
+  choices, measurements, and what is not built yet.
+- [docs/hardware-quirks.md](docs/hardware-quirks.md): what each GPU driver
+  and Hyprland do, and what is tested where.
+- [docs/development.md](docs/development.md): building, running on one
+  machine, and the tests.
 
-- `crates/gliff-proto` wire types, framing, and the CPU reference for colour
-  conversion and the AVC444 4:4:4 split/recombine that the shaders must match.
-- `crates/gliff-transport` framed IO, ssh spawning.
-- `crates/hypr-ipc`, `crates/hypr-wl` Hyprland IPC and shared Wayland plumbing.
-- `crates/hypr-capture` output + cursor capture into dmabufs.
-- `crates/hypr-input` keyboard and pointer injection.
-- `crates/gliff-va` the VA-API codec: H.264 encode/decode on driver-owned
-  surfaces, the header parser and writer.
-- `crates/gliff-vk` the Vulkan media pipeline: device, dmabuf import/export,
-  split and recombine compute shaders, the hand-off of surfaces to `gliff-va`.
-- `crates/gliff-sw` the CPU fallback pipeline: OpenH264 encode/decode around
-  the `gliff-proto` colour and chroma reference code. One `unsafe` block sets
-  the OpenH264 trace level through its raw API.
-- `crates/gliff` the GTK client. One `unsafe` block gives GTK a dmabuf fd.
-- `crates/gliff-server`, `crates/gliff-probe`.
+gliff is released under the MIT license.

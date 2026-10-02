@@ -5,4 +5,5 @@ Run `scripts/check.sh` before every push or PR. It runs the CI checks
 is a CI failure. `scripts/e2e.sh` covers the hardware paths and needs a
 Hyprland session; the GPU cases need Vulkan compute and a VA-API H.264
 codec. Run it before merging changes to the video pipeline. See
-`docs/architecture.md` for the design and the testing tools.
+`docs/architecture.md` for the design and `docs/development.md` for the
+build and the testing tools.
