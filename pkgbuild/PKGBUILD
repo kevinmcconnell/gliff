@@ -1,6 +1,6 @@
 # Maintainer: Kevin McConnell <kevin@37signals.com>
 pkgname=gliff
-pkgver=0.1.0
+pkgver=$(sed -n 's/^version = "\(.*\)"/\1/p' "$startdir/../Cargo.toml" | head -1)
 pkgrel=1
 pkgdesc="Hyprland remote desktop over SSH (GPU H.264, 4:4:4)"
 arch=('x86_64')

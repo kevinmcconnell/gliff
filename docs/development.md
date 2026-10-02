@@ -99,11 +99,14 @@ the launcher entry and the icon from `pkgbuild/`.
 
 ## Release
 
-1. Set the version in `Cargo.toml` (`[workspace.package]`) and `pkgver` in
-   `pkgbuild/PKGBUILD`, then run `cargo build` to update `Cargo.lock`.
-2. Commit the three files as "Release gliff 0.2.0".
-3. Tag the commit `v0.2.0` and push the tag.
-4. `gh release create v0.2.0 --title "gliff 0.2.0" --generate-notes`
+The version is set in one place, `[workspace.package]` in `Cargo.toml`;
+`pkgbuild/PKGBUILD` reads it from there.
 
-The Omarchy Package Repository watches the tags and opens the pull request
-that updates its recipe.
+1. Set the version in `Cargo.toml`, then run `cargo build` to update
+   `Cargo.lock`.
+2. Commit the two files as "Release gliff 0.2.0".
+3. Tag the commit `v0.2.0` and push the commit and the tag.
+
+CI checks that the tag matches the version, runs the checks, and publishes
+the GitHub release. The Omarchy Package Repository watches the tags and
+opens the pull request that updates its recipe.
