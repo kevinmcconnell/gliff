@@ -38,8 +38,14 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 /// A message plus optional trailing payload, sent from the UI to the worker.
 type OutSender = UnboundedSender<clipboard::ToWorker>;
 
+const APP_NAME: &str = "gliff";
+
 #[derive(Parser, Clone)]
-#[command(name = "gliff", about = "Remote-desktop a Hyprland session over ssh")]
+#[command(
+    name = APP_NAME,
+    version,
+    about = "Remote-desktop a Hyprland session over ssh"
+)]
 struct Cli {
     /// `user@host` to ssh to and spawn gliff-server. Without it the window
     /// opens with the address bar focused, offering the machines used most
@@ -136,15 +142,15 @@ fn main() -> glib::ExitCode {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     let cli = Cli::parse();
-    let app = adw::Application::builder()
-        .application_id("com.github.omacom.Gliff")
-        .build();
+    // GTK uses the program name as the Wayland app ID.
+    glib::set_prgname(Some(APP_NAME));
+    let app = adw::Application::builder().build();
     // The theme is per display, so it is set up once. The monitor lives in
     // this closure for the app's lifetime; dropping it would stop theme
     // updates.
     let theme_monitor = RefCell::new(None);
     app.connect_startup(move |_| {
-        gtk::Window::set_default_icon_name("com.github.omacom.Gliff");
+        gtk::Window::set_default_icon_name(APP_NAME);
         *theme_monitor.borrow_mut() = theme::follow_omarchy_theme();
     });
     app.connect_activate(move |app| build_ui(app, &cli));

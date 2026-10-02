@@ -22,7 +22,11 @@ use hypr_input::{keys, Input, InputConfig, InputEvent};
 use hypr_wl::Target;
 
 #[derive(Parser)]
-#[command(name = "gliff-probe", about = "Check that this machine can run gliff")]
+#[command(
+    name = "gliff-probe",
+    version,
+    about = "Check that this machine can run gliff"
+)]
 struct Cli {
     /// Wayland socket name (defaults to WAYLAND_DISPLAY, then the Hyprland instance)
     #[arg(long, global = true)]
