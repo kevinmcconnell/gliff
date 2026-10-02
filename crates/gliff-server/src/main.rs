@@ -52,9 +52,9 @@ struct Cli {
     /// server adapts below it when the link shows queueing.
     #[arg(long)]
     bitrate: Option<u32>,
-    /// Video pipeline: `gpu` (Vulkan Video, falling back to the CPU when
-    /// unavailable) or `cpu` (force OpenH264 on the CPU). Overrides the
-    /// GLIFF_VIDEO environment variable.
+    /// Video pipeline: `gpu` (Vulkan compute + VA-API, falling back to the
+    /// CPU when unavailable) or `cpu` (force OpenH264 on the CPU). Overrides
+    /// the GLIFF_VIDEO environment variable.
     #[arg(long, value_parser = ["gpu", "cpu"])]
     video: Option<String>,
     /// Keep dual-stream 4:4:4 colour on the CPU pipeline, which defaults to

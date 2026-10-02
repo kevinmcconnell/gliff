@@ -88,9 +88,12 @@ jobs:
 
           - `gliff`: GTK >= 4.14, libadwaita >= 1.0, glibc >= 2.39.
           - `gliff-server`, `gliff-probe`: glibc >= 2.34, libxkbcommon, libgbm, libdrm.
+          - All three: libva >= 2.20 (libva and libva-drm).
 
-          Video runs on the GPU with a Vulkan loader and a driver with Vulkan
-          Video; without one, gliff falls back to a CPU (OpenH264) pipeline.
+          Video runs on the GPU with a Vulkan driver for compute and a VA-API
+          H.264 driver on the same GPU (`libva-mesa-driver` on AMD,
+          `intel-media-driver` on Intel); without both, gliff falls back to a
+          CPU (OpenH264) pipeline.
 
           The launcher entry and icon are included: copy `com.github.omacom.Gliff.desktop`
           to `~/.local/share/applications/` and `com.github.omacom.Gliff.svg` to

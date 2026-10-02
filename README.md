@@ -44,10 +44,10 @@ codec):
 
 Intel GPUs take the same path through `intel-media-driver` (every generation
 from Skylake on, including Lunar Lake, Battlemage and Panther Lake, which
-have no Vulkan Video encode in Mesa). The Intel path is built from the Mesa
-and libva sources and awaits its first run on Intel hardware;
-`docs/hardware-quirks.md` lists what to check. NVIDIA has no VA-API encoder,
-so both ends use the CPU tier there.
+have no Vulkan Video encode in Mesa). The Intel path is validated on Panther
+Lake; earlier generations are not yet run, and `docs/hardware-quirks.md`
+lists what to check. NVIDIA has no VA-API encoder, so both ends use the CPU
+tier there.
 
 Design and the full picture are in `docs/architecture.md`; driver-specific
 behaviour and test gaps are in `docs/hardware-quirks.md`.
@@ -60,8 +60,7 @@ A paste that takes more than a second shows progress and a cancel button: a
 bar in the gliff window, or a desktop notification on the server.
 
 Not done yet: AV1 for outputs above 4096 wide (H.264 is scaled to fit today)
-and native single-stream 4:4:4; a verified ssh-from-cold-machine path; and a
-test run on Intel hardware.
+and native single-stream 4:4:4.
 
 ## Build
 
@@ -155,8 +154,10 @@ skipped and the CPU cases still run.
 - `crates/hypr-ipc`, `crates/hypr-wl` Hyprland IPC and shared Wayland plumbing.
 - `crates/hypr-capture` output + cursor capture into dmabufs.
 - `crates/hypr-input` keyboard and pointer injection.
+- `crates/gliff-va` the VA-API codec: H.264 encode/decode on driver-owned
+  surfaces, the header parser and writer.
 - `crates/gliff-vk` the Vulkan media pipeline: device, dmabuf import/export,
-  split and recombine compute shaders, H.264 encode/decode, header parser.
+  split and recombine compute shaders, the hand-off of surfaces to `gliff-va`.
 - `crates/gliff-sw` the CPU fallback pipeline: OpenH264 encode/decode around
   the `gliff-proto` colour and chroma reference code. One `unsafe` block sets
   the OpenH264 trace level through its raw API.

@@ -12,3 +12,8 @@ Injects keyboard and pointer input into Hyprland from a dedicated thread.
   a `wl_keyboard` of its own. The gliff client sends it to the server.
 - Pointer: `zwlr_virtual_pointer_v1` bound to the captured output, absolute
   motion in that output's logical coordinates, buttons, and axes.
+- Clipboard: `ext-data-control-v1`, on its own thread and connection. It
+  reports the mime types the selection offers and hands out a pipe to read
+  one; for the remote it advertises a set of mime types and hands the owner
+  the pipe of every application that pastes. No data moves through the
+  bridge itself.

@@ -1116,8 +1116,8 @@ impl Session {
     }
 }
 
-/// The selected video pipeline: Vulkan Video on the GPU, or OpenH264 on the
-/// CPU for machines without it.
+/// The selected video pipeline: Vulkan compute and VA-API on the GPU, or
+/// OpenH264 on the CPU for machines without them.
 enum VideoTier {
     Gpu(Arc<Gpu>),
     Cpu,

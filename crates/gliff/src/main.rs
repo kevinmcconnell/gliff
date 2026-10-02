@@ -65,9 +65,9 @@ struct Cli {
     /// click it again.
     #[arg(long, default_value = "shift+escape")]
     release_hotkey: String,
-    /// Video pipeline: `gpu` (Vulkan Video, falling back to the CPU when
-    /// unavailable) or `cpu` (force OpenH264 on the CPU). Overrides the
-    /// GLIFF_VIDEO environment variable.
+    /// Video pipeline: `gpu` (Vulkan compute + VA-API, falling back to the
+    /// CPU when unavailable) or `cpu` (force OpenH264 on the CPU). Overrides
+    /// the GLIFF_VIDEO environment variable.
     #[arg(long, value_parser = ["gpu", "cpu"])]
     video: Option<String>,
 }
