@@ -22,6 +22,7 @@ use hypr_wl::Target;
 #[derive(Parser)]
 #[command(
     name = "gliff-server",
+    version,
     about = "Serve a Hyprland session over the gliff protocol"
 )]
 struct Cli {

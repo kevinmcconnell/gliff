@@ -5,9 +5,6 @@ inputs:
   cache:
     description: Restore and save the Cargo build cache with mr boxington
     default: "true"
-  extra-packages:
-    description: Additional pacman packages to install
-    default: ""
 
 runs:
   using: composite
@@ -17,8 +14,7 @@ runs:
       run: |
         pacman -Syu --noconfirm --needed \
           rust pkgconf \
-          wayland libxkbcommon libdrm mesa gtk4 libadwaita dbus \
-          ${{ inputs.extra-packages }}
+          wayland libxkbcommon libdrm mesa gtk4 libadwaita dbus
     - name: Set up build cache
       if: inputs.cache == 'true'
       uses: jdx/mr-boxington-action@v1

@@ -363,7 +363,7 @@ The binaries are dynamically linked: `gliff-server`/`gliff-probe` need
 libvulkan, libva, libva-drm, libgbm, libdrm, libwayland-client, libxkbcommon
 and libc; the Vulkan loader `dlopen`s the GPU's ICD and libva the GPU's VA
 driver; `gliff` additionally pulls the full GTK4 runtime. A normal Hyprland
-desktop already has all of these (they are the PKGBUILD `depends`). The Rust
+desktop already has all of these (they are the `pkgbuild/PKGBUILD` `depends`). The Rust
 side is `ash` (thin generated bindings, no C build step) and committed
 bindgen output for libva (`crates/gliff-va/bindings/gen.sh` regenerates it)
 plus the Wayland, GTK and async crates. The compute shaders are committed as
