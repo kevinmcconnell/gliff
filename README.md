@@ -1,6 +1,6 @@
 # gliff
 
-[![CI](https://github.com/kevinmcconnell/gliff/actions/workflows/ci.yml/badge.svg)](https://github.com/kevinmcconnell/gliff/actions/workflows/ci.yml)
+[![CI](https://github.com/omacom/gliff/actions/workflows/ci.yml/badge.svg)](https://github.com/omacom/gliff/actions/workflows/ci.yml)
 
 gliff is a remote desktop for Hyprland. It shows the Hyprland session of
 another machine in a window on yours, and all it needs between the two is
