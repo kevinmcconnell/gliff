@@ -7,12 +7,14 @@ driver without H.264 High encode (or decode, on the client), a failure to
 create the encoder, or a failed first encode drops to the CPU tier with a
 log line, and `--video cpu` / `GLIFF_VIDEO=cpu` forces it. Driver behaviour
 differs, so this file records what we have found and where more testing is
-needed. Findings so far come from AMD:
+needed. The detailed findings come from AMD:
 
 - GPU: AMD Radeon RX 7600 (Navi 33) and Granite Ridge iGPU (Ryzen 9 9955HX).
   Drivers: Mesa RADV 26.2 for compute, Mesa `radeonsi` VA-API 26.2 (libva
   2.24) for the codec, kernel 7.2.
   Compositor: Hyprland 0.56.2.
+
+The same path also runs on Intel Panther Lake (see the Intel section).
 
 `gliff-probe gpu` prints the Vulkan device, the VA-API driver and its H.264
 capabilities; `gliff-probe surfaces` proves the hand-off between the two.
@@ -55,7 +57,7 @@ at once (`gliff-probe roundtrip --adapt`).
 
 ### Encode entrypoint and limits
 `VAEntrypointEncSlice` (the full-featured one), maximum 4096x4096 for both
-encode and decode. Larger outputs are scaled to fit as before.
+encode and decode. Larger outputs are scaled to fit.
 
 ### Decode
 `VAEntrypointVLD` with one surface per DPB slot plus a spare; the decoder
@@ -74,14 +76,18 @@ Reading 8 MB of BGRA back through write-combined host memory took ~25 ms;
 through `HOST_CACHED` memory it takes ~1 ms. `HostBuffer` prefers cached
 memory and falls back to write-combined.
 
-## Intel (built from the sources, not yet run)
+## Intel (ANV + iHD)
 
 The Intel path uses Mesa ANV for the Vulkan compute stages and
 `intel-media-driver` (iHD) for the codec, which covers every generation from
 Skylake on, including Lunar Lake, Battlemage and Panther Lake. Vulkan Video
-is not used, so the `ANV_DEBUG` flags that used to be needed are gone. What
-the first run must confirm, in the order `gliff-probe gpu`, `surfaces`,
-`roundtrip`, `pipeline`, `scripts/e2e.sh`:
+is not used, so no `ANV_DEBUG` flags are needed.
+
+It has run on Panther Lake (Xe3): `gliff-probe gpu`, `surfaces`,
+`roundtrip` and `pipeline` pass, and so does `scripts/e2e.sh`. Earlier
+generations are not yet run. The items below are what the code expects of
+iHD, from the Mesa and libva sources; they are the first things to check, in
+that probe order, when a new generation fails:
 
 - **Entrypoint.** On Gen12 and later iHD offers `VAEntrypointEncSliceLP`
   (VDEnc) for H.264, which gliff takes when `EncSlice` is absent. CBR on it
@@ -96,12 +102,12 @@ the first run must confirm, in the order `gliff-probe gpu`, `surfaces`,
   `BAD_BITSTREAM` status fails the encode and the server falls back to CPU.
 
 ## Not yet tested anywhere
-- Intel, for every item above.
+- Intel generations before Panther Lake.
 - NVIDIA has no VA-API encoder; both ends take the CPU tier there. Decode
   through `nvidia-vaapi-driver` is untried.
 - Baseline-profile streams (the CPU tier's output) through the VA-API High
-  decode config: radeonsi accepts them (the e2e cpu-server -> gpu-client
-  case), Intel is unverified.
+  decode config: radeonsi accepts them, and so does iHD on Panther Lake
+  (the e2e cpu-server -> gpu-client case); other drivers are unverified.
 - Native 4:4:4 encode (HEVC 4:4:4 on Intel) to retire the dual-stream split.
 - Tiled capture buffers. The capture ring prefers linear modifiers and the
   dmabuf import passes the modifier through, but only linear has been run.
@@ -119,12 +125,12 @@ the first run must confirm, in the order `gliff-probe gpu`, `surfaces`,
   (`Decoder::flush`), which does not disturb later decoding.
 - **Per-decode flushing breaks the reference chain.** The `openh264`
   crate's default `Flush::Flush` ejects the reference picture of a
-  low-delay stream (dsOutOfMemory on the fourth frame of a RADV-encoded
+  low-delay stream (dsOutOfMemory on the fourth frame of a GPU-encoded
   stream); the decoder runs with `Flush::NoFlush`.
 - **CBR is soft without frame skipping.** The encoder disables
   `skip_frames` so every capture yields a frame (the AVC444 pair must stay
   in step), which OpenH264 says weakens its bitrate cap. The server's own
-  `BitrateController` adapts the target from ack timing on top.
+  `RateController` adapts the target from ack timing on top.
 
 ## Hyprland cursor capture (0.56.2, and upstream main as of 2026-09-02)
 
@@ -190,5 +196,3 @@ the request took effect.
 - **Capture dmabuf uses one buffer-object fd for all planes.** Correct for the
   single-plane XRGB/ARGB formats we select; wrong if a multi-fd planar format is
   ever chosen.
-- **ssh environment.** The `--stdio` path is built but not yet tested from a cold
-  machine; the ssh session must expose `WAYLAND_DISPLAY` and `XDG_RUNTIME_DIR`.

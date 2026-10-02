@@ -2,7 +2,8 @@
 
 gliff remote-desktops a Hyprland session to another Hyprland machine over SSH.
 This document covers what is built, the design choices behind it, and what is
-still pending.
+still pending. Building, running a development setup and the testing tools
+are in `docs/development.md`.
 
 ## Data flow
 
@@ -173,9 +174,10 @@ Every crate with `unsafe` documents the safety requirements at each block.
   after two consecutive evaluations of sustained queueing while blocked —
   one TCP loss-recovery stall never cuts. A future UDP transport feeds the
   same estimator inputs (bytes sent, acks, a blocked marker).
-  Above the controller a ladder degrades frame rate first (60, 30, 15 fps),
-  then the auxiliary chroma stream, then resolution, chosen from affordable
-  bits per pixel at the measured rate. During slow start the ladder moves
+  Above the controller a ladder of seven levels degrades frame rate first
+  (60, 30, 15 fps), then drops the auxiliary chroma stream, then falls to
+  10 fps, then halves the resolution, with 5 fps as the floor; the level is
+  chosen from affordable bits per pixel at the measured rate. During slow start the ladder moves
   freely (the seed jump), so a LAN reaches full quality in under a second
   and a slow link lands on its level at the first real measurement; after
   that, step-ups need 1.25x headroom and a hold that doubles on a flap. The
@@ -258,64 +260,22 @@ Every crate with `unsafe` documents the safety requirements at each block.
   `org.freedesktop.Notifications`. Cancel drops the fetch, which sends
   `Abort`. A failed paste is always reported, however short.
 
-## Testing
-
-- **`scripts/check.sh`** runs what CI runs (`cargo fmt --check`, `cargo
-  clippy --all-targets -- -D warnings`, `cargo test --workspace`); run it
-  before every push, and `scripts/check.sh --fix` to apply the rustfmt and
-  clippy fixes first. Clippy lints gated on the MSRV (`rust-version` in
-  `Cargo.toml`) switch on across the whole workspace when it is raised.
-- **Unit tests** cover the pure logic: AVC444 split/recombine losslessness,
-  single-stream subsample/upsample, BGRA↔YUV444 colour round-trip, the H.264
-  header parser against an x264 stream, framing with payloads and partial
-  writes, the rate controller and ladder against a simulated link (a fake
-  clock drives satellite, LAN and collapse scenarios), keymap building,
-  Hyprland instance discovery, and the clipboard rules and engine (mime
-  filtering, URI lists, safe paths, the send window and assembler, chunked
-  transfers between two engines, the size cap, and a spooled directory
-  tree).
-- **`gliff-probe`** is the hardware integration harness: `protocols`,
-  `outputs`, `gpu` (the Vulkan device and the VA-API codec capabilities),
-  `surfaces` (a VA-API surface written by the split shader and read back
-  through the driver), `roundtrip` (synthetic BGRA → encode → decode → PSNR
-  against the CPU reference), `capture`, `input`, `pipeline` (a captured
-  dmabuf through the exact server and client pipelines), `serve-test` (a
-  headless protocol client), and `stream-bench` (startup milestones, fps,
-  latency, interval and size statistics, `--timeline`, `--csv`). Run it under
-  `VK_LAYER_KHRONOS_validation` after touching `gliff-vk`, and with
-  `RUST_LOG=libva=debug` to see the driver's own messages.
-- **`scripts/e2e.sh`** boots a nested Hyprland and asserts PASS across the probe
-  checks, the GPU pipeline, both Dual420 and Single420 server-plus-client
-  streams, the clipboard in both directions (as text and as a 1 MiB binary
-  item), and a mirrored-output resize. It needs a Hyprland session and a GPU
-  with the VA-API codec, so it is not a CI unit test; run it on a target
-  machine.
-- **`scripts/bench.sh`** runs a server and `stream-bench` in a nested
-  Hyprland over a shaped link: `BENCH_PRESET=lan|dsl|satellite`, a
-  token-bucket TCP proxy (`scripts/throttle-proxy.py`) or `tc netem` in an
-  unprivileged network namespace (`scripts/netem.sh`, loss and delay in both
-  directions). `BENCH_STATIC=1` drops the damage loop.
-
 ## Measurements
 
-On the AMD Ryzen 9955HX iGPU (RADV, Mesa 26.2), release build, 1920x1080
-Dual420, from `gliff-probe roundtrip` with the Vulkan Video codec:
+On an AMD Radeon RX 7600 (RADV for compute, radeonsi for the codec, Mesa
+26.2), release build, 1920x1080 Dual420, from `gliff-probe roundtrip`,
+2026-09-28:
 
 | Stage | Time per frame |
 |---|---|
-| split + two encodes (both submitted, then waited; one encode queue) | ~8.5 ms |
-| two decodes + recombine (GPU, one fence wait) | ~5 ms |
-| CPU readback of the BGRX frame (probe only, cached host memory) | ~1.5 ms |
-
-With the VA-API codec (radeonsi) on the same stream, 2026-09-28, on an RX
-7600: split + two encodes 7 to 8.5 ms, two decodes + recombine 4.2 to 4.8 ms,
-at the same PSNR.
+| split + two encodes | 7 to 8.5 ms |
+| two decodes + recombine | 4.2 to 4.8 ms |
 
 No pixel work happens on the CPU at any resolution; the remaining cost is the
 encode hardware itself, which serialises the two streams, so a 1080p Dual420
 frame costs about two encodes' worth of time.
 
-The CPU tier on the same machine (Ryzen 7 7840U, 16 threads), Single420,
+The CPU tier on a Ryzen 7 7840U (16 threads), Single420,
 from `gliff-probe --video cpu roundtrip --single` on moving synthetic
 content, 2026-09-25:
 
@@ -349,20 +309,19 @@ Shaped-link runs (`scripts/bench.sh`, nested Hyprland, 2560x1440 headless,
 
 ## Pending and recommended improvements
 
-Built and validated on AMD: capture, input, Vulkan H.264 encode/decode,
-Dual420 and Single420, the server loop, the GTK client, keymap upload, remote
-cursor, shortcut inhibit, reconnect, and the clipboard bridge (any mime
-type and files, lazily streamed).
+Built and validated on AMD and on Intel Panther Lake: capture, input, VA-API
+H.264 encode/decode, Dual420 and Single420, the server loop, the GTK client,
+keymap upload, remote cursor, shortcut inhibit, reconnect, the clipboard
+bridge (any mime type and files, lazily streamed), and the ssh path between
+machines. Earlier Intel generations use the same path and are not yet run.
+NVIDIA has no VA-API encoder and is not a target for the GPU tier.
 
 Not yet built, roughly in priority order:
 
-1. **Test on Intel.** Everything runs on AMD machines; the Intel path
-   (Mesa ANV for compute, `intel-media-driver` for the codec) is built from
-   the sources and awaits its first run. NVIDIA has no VA-API encoder and
-   is not a target.
-2. **Optional AV1 for outputs above 4096 wide.** The VCN H.264 encoder
-   stops at 4096x4096 (the kernel amdgpu codec table, reported through RADV
-   as `maxCodedExtent`), so a 5K output streams at 4096x2304 today: the
+1. **Optional AV1 for outputs above 4096 wide.** The VCN H.264 encoder
+   stops at 4096x4096 (the kernel amdgpu codec table, reported through
+   VA-API as the maximum picture size, which `gliff-probe gpu` prints), so
+   a 5K output streams at 4096x2304 today: the
    server scales the stream to the encoder maximum and the client scales it
    back up. AV1 and HEVC on the same engine reach 8192x4352. AV1 is the
    preferred second codec: it is royalty-free, and hardware supports it for
@@ -373,14 +332,12 @@ Not yet built, roughly in priority order:
    only when both ends list it in `ClientCaps.codecs`, and the size clamp
    stays as the guard for whichever codec is chosen. A native 4:4:4 profile
    on some driver would also retire the split.
-3. **Verified ssh path** from a cold machine, including the `WAYLAND_DISPLAY` /
-   `XDG_RUNTIME_DIR` environment setup, and a systemd user unit if wanted.
-4. **First frame on a truly static screen.** The 700 ms `Recapture` rescue
+2. **First frame on a truly static screen.** The 700 ms `Recapture` rescue
    needs verifying against a locked, unchanging screen (the nested bench
    screens always produce damage); if the compositor still withholds the
    frame, the fallbacks are a `debug:damage_tracking` toggle or a 1 px
    virtual-pointer nudge.
-5. **Optional UDP media transport for high-RTT lossy links.** TCP over SSH
+3. **Optional UDP media transport for high-RTT lossy links.** TCP over SSH
    stays the default and keeps working everywhere; this is an optional
    enhancement, worth building only when such a path becomes a real use.
    The evidence and the trigger conditions are in "Why not UDP" above: on
@@ -392,7 +349,7 @@ Not yet built, roughly in priority order:
    answered with a fresh keyframe rather than a retransmit. `LinkEstimator`,
    `RateController` and the ladder already take transport-neutral inputs
    (bytes sent, acks, a blocked marker) and carry over unchanged.
-6. **Polish**: multi-output selection UI, a `--max-fps` server flag, and a
+4. **Polish**: multi-output selection UI, a `--max-fps` server flag, and a
    lazy file spool (a FUSE mount the pasting application
    reads through, so its own copy dialog shows progress, instead of
    spooling every file before the URI list is handed over).

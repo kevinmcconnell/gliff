@@ -1,5 +1,5 @@
-//! Software media pipeline: the CPU fallback for machines without Vulkan
-//! Video. BGRA conversion and the AVC444 split run as fused fixed-point
+//! Software media pipeline: the CPU fallback for machines without a VA-API
+//! H.264 codec. BGRA conversion and the AVC444 split run as fused fixed-point
 //! passes in `convert`, checked against the reference code in `gliff-proto`;
 //! H.264 encode/decode is OpenH264.
 //!
@@ -34,7 +34,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Which video pipeline to use, from `--video` or `GLIFF_VIDEO`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoMode {
-    /// Vulkan Video, falling back to the CPU when unavailable (the default).
+    /// Vulkan compute + VA-API, falling back to the CPU when unavailable
+    /// (the default).
     Gpu,
     /// Force the CPU pipeline even on a machine with a capable GPU.
     Cpu,

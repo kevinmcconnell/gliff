@@ -183,7 +183,8 @@ impl Worker {
     }
 }
 
-/// The decode pipeline: Vulkan Video on the GPU, or OpenH264 on the CPU.
+/// The decode pipeline: VA-API and Vulkan compute on the GPU, or OpenH264 on
+/// the CPU.
 enum VideoDecoder {
     Gpu(Box<Decoder>),
     Cpu(Box<gliff_sw::Decoder>),
