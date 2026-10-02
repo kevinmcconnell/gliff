@@ -28,27 +28,29 @@ both ends, and falls back to the CPU on machines where it cannot.
 - Hyprland on both machines, with a session running on the remote one.
 - ssh access from your machine to the remote one.
 - For GPU video: an AMD or Intel GPU with its Vulkan and VA-API drivers
-  (`vulkan-radeon` and `libva-mesa-driver`, or `vulkan-intel` and
-  `intel-media-driver`, on Arch). Without them, and on NVIDIA, gliff uses the
-  CPU and needs nothing extra.
+  (on Arch, `vulkan-radeon` and `mesa` for AMD, or `vulkan-intel` and
+  `intel-media-driver` for Intel). Without them, and on NVIDIA, gliff uses
+  the CPU and needs nothing extra.
 
 ## Install
 
 Install gliff on both machines: your machine runs `gliff`, the remote one
 runs `gliff-server`.
 
-On Arch, build the package from a checkout:
+Install gliff from the [Omarchy Package Repository
+(OPR)](https://github.com/omacom/omarchy-pkgs):
 
 ```
-makepkg -si
+omarchy pkg add gliff
 ```
 
-Or take the prebuilt x86_64 binaries from the [releases
-page](https://github.com/kevinmcconnell/gliff/releases) and put `gliff`,
-`gliff-server` and `gliff-probe` on your `PATH`. The `latest` release follows
-`main`; `v*` tags are permanent releases. For a launcher entry, copy the
-`.desktop` file to `~/.local/share/applications/` and the `.svg` icon to
-`~/.local/share/icons/hicolor/scalable/apps/`.
+Then open **Gliff** from the app launcher, or run `gliff` in a terminal.
+
+On Arch without the OPR, build and install the package from a checkout:
+
+```
+bin/install
+```
 
 To build from source, see [docs/development.md](docs/development.md).
 

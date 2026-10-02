@@ -11,10 +11,10 @@ cargo build --release
 ```
 
 Needs Rust, a C++ toolchain (the vendored OpenH264 build; nasm speeds it up),
-and the runtime libraries in the PKGBUILD `depends`. The GPU tier needs a
-Vulkan driver for compute (Mesa RADV or ANV) and a VA-API H.264 driver on the
-same GPU (`libva-mesa-driver` on AMD, `intel-media-driver` on Intel); without
-both, gliff uses the CPU tier. The compute shaders are committed as SPIR-V
+and the runtime libraries in the `pkgbuild/PKGBUILD` `depends`. The GPU tier
+needs a Vulkan driver for compute (Mesa RADV or ANV) and a VA-API H.264
+driver on the same GPU (`mesa` on AMD, `intel-media-driver` on Intel);
+without both, gliff uses the CPU tier. The compute shaders are committed as SPIR-V
 (`crates/gliff-vk/shaders/build.sh` rebuilds them with `glslc`), and the
 libva bindings as bindgen output (`crates/gliff-va/bindings/gen.sh`).
 
@@ -88,3 +88,22 @@ tiers independently, so every pairing can be tested on one machine.
   token-bucket TCP proxy (`scripts/throttle-proxy.py`) or `tc netem` in an
   unprivileged network namespace (`scripts/netem.sh`, loss and delay in both
   directions). `BENCH_STATIC=1` drops the damage loop.
+
+## Packaging
+
+`pkgbuild/` holds the launcher entry, the icon, and a `PKGBUILD` that builds
+the checkout; `bin/install` builds and installs that package. The package in
+the [Omarchy Package Repository](https://github.com/omacom/omarchy-pkgs) has
+its own recipe, `pkgbuilds/gliff`, which builds a release tag and installs
+the launcher entry and the icon from `pkgbuild/`.
+
+## Release
+
+1. Set the version in `Cargo.toml` (`[workspace.package]`) and `pkgver` in
+   `pkgbuild/PKGBUILD`, then run `cargo build` to update `Cargo.lock`.
+2. Commit the three files as "Release gliff 0.2.0".
+3. Tag the commit `v0.2.0` and push the tag.
+4. `gh release create v0.2.0 --title "gliff 0.2.0" --generate-notes`
+
+The Omarchy Package Repository watches the tags and opens the pull request
+that updates its recipe.
